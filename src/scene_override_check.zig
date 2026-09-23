@@ -21,17 +21,50 @@ pub fn initialPrefabAmbiguous(initial_prefab: ?[]const u8, jsonc_scene_count: us
     return initial_prefab == null and jsonc_scene_count > 1;
 }
 
-/// Does this Zig source CALL `requestedScene(`? Line comments are ignored,
-/// so a loading controller that only mentions it in a doc comment does not
-/// count. Text, not a parse: a `//` inside a string literal cuts the line
-/// early, which can only miss a call, never invent one.
+/// Does this Zig source CALL `requestedScene(`? Scans CODE only: `//`
+/// comments, string literals (`"…"`, escapes included), character literals
+/// (`'…'`) and multiline string lines (`\\…`) are skipped, so a doc comment
+/// or a log message mentioning it does not count. Zig has no block comments.
+/// Still a source-level heuristic — it cannot tell whether the call is
+/// reachable — which is fine for a warning.
 pub fn sourceReadsRequestedScene(source: []const u8) bool {
-    var lines = std.mem.splitScalar(u8, source, '\n');
-    while (lines.next()) |line| {
-        const code = if (std.mem.indexOf(u8, line, "//")) |c| line[0..c] else line;
-        if (std.mem.indexOf(u8, code, "requestedScene(") != null) return true;
+    const needle = "requestedScene(";
+    var i: usize = 0;
+    while (i < source.len) {
+        const c = source[i];
+        if (c == '/' and i + 1 < source.len and source[i + 1] == '/') {
+            i = skipToLineEnd(source, i);
+        } else if (c == '\\' and i + 1 < source.len and source[i + 1] == '\\') {
+            i = skipToLineEnd(source, i); // multiline string line
+        } else if (c == '"' or c == '\'') {
+            i = skipQuoted(source, i);
+        } else if (std.mem.startsWith(u8, source[i..], needle)) {
+            return true;
+        } else {
+            i += 1;
+        }
     }
     return false;
+}
+
+fn skipToLineEnd(source: []const u8, start: usize) usize {
+    return if (std.mem.indexOfScalarPos(u8, source, start, '\n')) |nl| nl + 1 else source.len;
+}
+
+/// Index just past the literal opened by the quote at `start`. An escape
+/// skips the next byte, so `"a\"b"` stays one literal; an unterminated
+/// literal ends at the line break, as Zig itself would reject it there.
+fn skipQuoted(source: []const u8, start: usize) usize {
+    const quote = source[start];
+    var i = start + 1;
+    while (i < source.len) : (i += 1) {
+        switch (source[i]) {
+            '\\' => i += 1,
+            '\n' => return i + 1,
+            else => if (source[i] == quote) return i + 1,
+        }
+    }
+    return source.len;
 }
 
 /// The first `.zig` file under `dir_path` (recursive) that calls
@@ -88,4 +121,25 @@ test "a requestedScene() call counts; a comment mentioning it does not" {
     ));
     try std.testing.expect(!sourceReadsRequestedScene("const x = 1; // see requestedScene()"));
     try std.testing.expect(!sourceReadsRequestedScene("pub fn tick() void {}"));
+}
+
+test "string and character literals are not calls (CodeRabbit on #752)" {
+    try std.testing.expect(!sourceReadsRequestedScene(
+        \\log.info("call requestedScene() to read it", .{});
+    ));
+    // An escaped quote does not end the literal early.
+    try std.testing.expect(!sourceReadsRequestedScene(
+        \\const s = "say \"requestedScene()\" twice";
+    ));
+    // A multiline string line is a literal too.
+    try std.testing.expect(!sourceReadsRequestedScene(
+        \\const doc =
+        \\    \\\\requestedScene() is read by the loading controller
+        \\;
+    ));
+    try std.testing.expect(!sourceReadsRequestedScene("const q = '(';"));
+    // Code after a literal on the same line is still scanned.
+    try std.testing.expect(sourceReadsRequestedScene(
+        \\log.info("{s}", .{engine.requestedScene() orelse "none"});
+    ));
 }
