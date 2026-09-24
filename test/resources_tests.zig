@@ -107,6 +107,96 @@ pub const RESOURCES = struct {
     }
 };
 
+// ── Web ASTC → PNG fallback (labelle-bgfx#134) ─────────────────────────────
+// A wasm ASTC swap leaves the source PNG in `ResourceDef.texture_fallback`
+// (see `generate_phases.swapAstcTexturePaths`, where the swap itself and the
+// android/no-sibling cases are tested). Here: how the full `main.zig` carries
+// it — the helper at FILE scope (where `BackendGfx` lives), the atlas line
+// calling it, and bgfx caps being up (`initWindow`) before that line runs.
+pub const WEB_ASTC_FALLBACK = struct {
+    fn expectAstGenOk(src: []const u8) !void {
+        const src_z = try std.testing.allocator.dupeZ(u8, src);
+        defer std.testing.allocator.free(src_z);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, src_z, .zig);
+        defer ast.deinit(std.testing.allocator);
+        if (ast.errors.len != 0) return error.AstGenParseError;
+        var zir = try std.zig.AstGen.generate(std.testing.allocator, ast);
+        defer zir.deinit(std.testing.allocator);
+        if (zir.hasCompileErrors()) return error.AstGenCompileError;
+    }
+
+    const helper_sig = "\nfn pickCompressedTexture(astc: []const u8, png: []const u8) []const u8 {";
+    const pick = "pickCompressedTexture(@embedFile(\"assets/tiles.astc\"), @embedFile(\"assets/tiles.png\"))";
+
+    fn genWasm(resources: []const generate.ResourceDef) ![]const u8 {
+        return generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .bgfx,
+            .platform = .wasm,
+            .ecs = .mock,
+            .resources = resources,
+        }, h.bgfx_wasm_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+    }
+
+    test "bgfx wasm main: helper once at file scope, atlas picks ASTC-or-PNG after initWindow" {
+        const main_zig = try genWasm(&.{
+            .{ .name = "tiles", .json = "assets/tiles.json", .texture = "assets/tiles.astc", .texture_fallback = "assets/tiles.png", .lazy = false },
+        });
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, main_zig, helper_sig));
+        const helper_idx = std.mem.indexOf(u8, main_zig, helper_sig).?;
+        // File scope: after the top-level `BackendGfx` import, before `main`.
+        const gfx_import_idx = std.mem.indexOf(u8, main_zig, "const BackendGfx = @import(\"backend_gfx\");").?;
+        const main_idx = std.mem.indexOf(u8, main_zig, "pub fn main() !void {").?;
+        try std.testing.expect(gfx_import_idx < helper_idx and helper_idx < main_idx);
+
+        // bgfx must be initialised (caps known) before the pick runs.
+        const init_idx = std.mem.indexOf(u8, main_zig, "window.initWindow(").?;
+        // (The wasm host has no error channel: callback-init / catch-panic style.)
+        const load_idx = std.mem.indexOf(u8, main_zig, "g.loadAtlasFromMemory(\"tiles\", @embedFile(\"assets/tiles.json\"), " ++ pick ++ ", \".png\") catch @panic(\"failed to load atlas: tiles\");").?;
+        try std.testing.expect(init_idx < load_idx);
+
+        try expectAstGenOk(main_zig);
+    }
+
+    test "sokol callback init routes the fallback through the helper too" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .sokol,
+            .platform = .wasm,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "tiles", .json = "assets/tiles.json", .texture = "assets/tiles.astc", .texture_fallback = "assets/tiles.png", .lazy = true },
+            },
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, main_zig, helper_sig));
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.registerAtlasFromMemory(\"tiles\", @embedFile(\"assets/tiles.json\"), " ++ pick ++ ", \".png\") catch @panic(\"failed to load atlas: tiles\");") != null);
+    }
+
+    test "no fallback anywhere → no helper; the main is byte-identical to a plain-PNG build" {
+        // The swap leaves `texture_fallback` null off wasm and without an
+        // `.astc` sibling. The resource_registry slot must then stay empty.
+        const main_zig = try genWasm(&.{
+            .{ .name = "tiles", .json = "assets/tiles.json", .texture = "assets/tiles.astc", .lazy = false },
+        });
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pickCompressedTexture") == null);
+
+        const no_resources = try genWasm(&.{});
+        defer std.testing.allocator.free(no_resources);
+        // Same prelude up to the first generated line after the (empty) slot.
+        const marker = "const AllHookPayloads";
+        const a = std.mem.indexOf(u8, main_zig, marker).?;
+        const b = std.mem.indexOf(u8, no_resources, marker).?;
+        try std.testing.expectEqualStrings(no_resources[0..b], main_zig[0..a]);
+    }
+};
+
 pub const RESOURCE_EMISSION = struct {
     test "atlas emission stays on the legacy loadAtlasFromMemory path" {
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,

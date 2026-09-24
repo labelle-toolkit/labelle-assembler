@@ -132,6 +132,11 @@ fn repath(a: std.mem.Allocator, pack_name: []const u8, path: []const u8) ![]cons
 /// Rewritten paths are allocated in the merged arena (same lifetime as the
 /// paths they replace). No-op when no sibling exists: the resource keeps its
 /// `.png` (the additive fallback contract).
+///
+/// `png_fallback` (true only for a `.wasm` target, labelle-bgfx#134): an
+/// `.astc` swap also records the repathed source `.png` in
+/// `texture_fallback`, so the generated code can pick the PNG on a browser
+/// whose GPU cannot sample ASTC. Both files ride the wholesale `assets/` copy.
 pub fn preferCompressedPackTextures(
     parent_allocator: std.mem.Allocator,
     io: std.Io,
@@ -140,6 +145,7 @@ pub fn preferCompressedPackTextures(
     pack_entries: []const PackEntry,
     game_dir: []const u8,
     astc_enabled: bool,
+    png_fallback: bool,
 ) !void {
     const a = merged.arena.allocator();
     var idx: usize = game_resource_count;
@@ -158,6 +164,9 @@ pub fn preferCompressedPackTextures(
                 const abs = try std.fs.path.join(parent_allocator, &.{ src_dir, sib_rel });
                 defer parent_allocator.free(abs);
                 std.Io.Dir.cwd().access(io, abs, .{}) catch continue;
+                if (png_fallback and std.mem.eql(u8, ext, ".astc")) {
+                    merged.resources[idx].texture_fallback = merged.resources[idx].texture;
+                }
                 merged.resources[idx].texture = try repath(a, e.plugin.name, sib_rel);
                 break;
             }
@@ -905,7 +914,7 @@ test "preferCompressedPackTextures: probes the pack SOURCE dir, astc wins, png f
     var merged = try mergePackResources(allocator, &game, &.{entry});
     defer merged.deinit();
 
-    try preferCompressedPackTextures(allocator, tio, &merged, game.len, &.{entry}, "/nonexistent-game-dir", true);
+    try preferCompressedPackTextures(allocator, tio, &merged, game.len, &.{entry}, "/nonexistent-game-dir", true, false);
 
     // Game entry untouched; sibling-backed pack atlas swapped; no-sibling
     // atlas keeps its .png (the additive fallback).
@@ -916,8 +925,76 @@ test "preferCompressedPackTextures: probes the pack SOURCE dir, astc wins, png f
     // With compression off, .astc is NOT preferred (rgba-only probe).
     var merged2 = try mergePackResources(allocator, &game, &.{entry});
     defer merged2.deinit();
-    try preferCompressedPackTextures(allocator, tio, &merged2, game.len, &.{entry}, "/nonexistent-game-dir", false);
+    try preferCompressedPackTextures(allocator, tio, &merged2, game.len, &.{entry}, "/nonexistent-game-dir", false, false);
     try testing.expectEqualStrings("packs/terrain/assets/tiles.png", merged2.resources[1].texture);
+}
+
+test "preferCompressedPackTextures: wasm keeps the pack PNG as texture_fallback (labelle-bgfx#134)" {
+    const allocator = testing.allocator;
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(tio, "elsewhere/terrain/assets");
+    try writeTestFile(tmp.dir, "elsewhere/terrain/assets/tiles.png", "PNGDATA");
+    try writeTestFile(tmp.dir, "elsewhere/terrain/assets/tiles.astc", "ASTCDATA");
+    try writeTestFile(tmp.dir, "elsewhere/terrain/assets/props.png", "PNGDATA");
+    try writeTestFile(tmp.dir, "elsewhere/terrain/assets/props.rgba", "RGBADATA");
+
+    const src_path = try tmp.dir.realPathFileAlloc(tio, "elsewhere/terrain", allocator);
+    defer allocator.free(src_path);
+
+    const manifest = plugin_manifest.PackManifest{
+        .name = "terrain",
+        .manifest_version = 1,
+        .convention_dirs = .copy_and_scan,
+        .resources = &.{
+            .{ .name = "tiles", .json = "assets/tiles.json", .texture = "assets/tiles.png" },
+            .{ .name = "props", .json = "assets/props.json", .texture = "assets/props.png" },
+        },
+        .allocator = allocator,
+    };
+    var entry = PackEntry{ .plugin = .{ .name = "terrain" }, .manifest = manifest };
+    entry.src_dir = src_path;
+
+    // Web target: the ASTC swap records the repathed PNG; an `.rgba` swap
+    // does NOT (every backend decodes it, no browser caps involved).
+    var web = try mergePackResources(allocator, &.{}, &.{entry});
+    defer web.deinit();
+    try preferCompressedPackTextures(allocator, tio, &web, 0, &.{entry}, "/nonexistent-game-dir", true, true);
+    try testing.expectEqualStrings("packs/terrain/assets/tiles.astc", web.resources[0].texture);
+    try testing.expectEqualStrings("packs/terrain/assets/tiles.png", web.resources[0].texture_fallback.?);
+    try testing.expectEqualStrings("packs/terrain/assets/props.rgba", web.resources[1].texture);
+    try testing.expect(web.resources[1].texture_fallback == null);
+
+    // The emitted pack line picks between both repathed files.
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try resource_loader.emitResourceLoad(&aw.writer, web.resources[0], .try_style);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "pickCompressedTexture(@embedFile(\"packs/terrain/assets/tiles.astc\"), @embedFile(\"packs/terrain/assets/tiles.png\"))") != null);
+
+    // Any other target (android here): swapped, but no fallback kept.
+    var apk = try mergePackResources(allocator, &.{}, &.{entry});
+    defer apk.deinit();
+    try preferCompressedPackTextures(allocator, tio, &apk, 0, &.{entry}, "/nonexistent-game-dir", true, false);
+    try testing.expectEqualStrings("packs/terrain/assets/tiles.astc", apk.resources[0].texture);
+    try testing.expect(apk.resources[0].texture_fallback == null);
+}
+
+test "mergePackResources: a pack-authored texture_fallback is never carried (labelle-bgfx#134)" {
+    // The merge builds each entry field by field, so the derived field can't
+    // be smuggled in through a pack manifest either.
+    const manifest = plugin_manifest.PackManifest{
+        .name = "terrain",
+        .manifest_version = 1,
+        .convention_dirs = .copy_and_scan,
+        .resources = &.{.{ .name = "tiles", .json = "assets/tiles.json", .texture = "assets/tiles.png", .texture_fallback = "assets/evil.png" }},
+        .allocator = testing.allocator,
+    };
+    const entries = [_]PackEntry{.{ .plugin = .{ .name = "terrain" }, .manifest = manifest }};
+    var merged = try mergePackResources(testing.allocator, &.{}, &entries);
+    defer merged.deinit();
+    try testing.expect(merged.resources[0].texture_fallback == null);
 }
 
 test "processOnePack: copies assets, namespaces atlas + prefab, validates" {
