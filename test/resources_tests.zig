@@ -178,6 +178,53 @@ pub const WEB_ASTC_FALLBACK = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.registerAtlasFromMemory(\"tiles\", @embedFile(\"assets/tiles.json\"), " ++ pick ++ ", \".png\") catch @panic(\"failed to load atlas: tiles\");") != null);
     }
 
+    /// 32x32 PNG header — all `expandGridResources` reads (signature + IHDR).
+    const png_32x32 = [_]u8{ 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, 'I', 'H', 'D', 'R', 0, 0, 0, 32, 0, 0, 0, 32, 8, 6, 0, 0, 0 };
+
+    fn gridGenerate(game_abs: []const u8, out_abs: []const u8, fallback: ?[]const u8) !void {
+        return generate.generate(std.testing.allocator, .{
+            .name = "grid-game",
+            .ecs = .mock,
+            .platform = .wasm,
+            .resources = &.{.{
+                .name = "tiles",
+                .image = "assets/tiles.png",
+                .grid = .{ .tile_width = 16, .tile_height = 16 },
+                .texture_fallback = fallback,
+            }},
+        }, out_abs, game_abs, .{ .is_tests_target = false });
+    }
+
+    fn dirIsEmpty(dir: std.Io.Dir) !bool {
+        var it = dir.iterate();
+        return (try it.next(std.testing.io)) == null;
+    }
+
+    test "an authored .texture_fallback is rejected before generate writes anything (codex P2 on #758)" {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(std.testing.io, "game/assets");
+        try tmp.dir.createDirPath(std.testing.io, "out");
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "game/assets/tiles.png", .data = &png_32x32 });
+        const game_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "game", std.testing.allocator);
+        defer std.testing.allocator.free(game_abs);
+        const out_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "out", std.testing.allocator);
+        defer std.testing.allocator.free(out_abs);
+        var out = try tmp.dir.openDir(std.testing.io, "out", .{ .iterate = true });
+        defer out.close(std.testing.io);
+
+        // A valid `.image` + `.grid` resource: grid expansion WOULD write a
+        // `__grid_*.json` into the target. The rejection must beat it.
+        try std.testing.expectError(error.InternalResourceField, gridGenerate(game_abs, out_abs, "assets/tiles.png"));
+        try std.testing.expect(try dirIsEmpty(out));
+
+        // Control: the same project without the field gets past that point and
+        // DOES write to the target (whatever later fails for lack of an engine
+        // template), so the emptiness above is the rejection's doing.
+        gridGenerate(game_abs, out_abs, null) catch {};
+        try std.testing.expect(!try dirIsEmpty(out));
+    }
+
     test "no fallback anywhere → no helper; the main is byte-identical to a plain-PNG build" {
         // The swap leaves `texture_fallback` null off wasm and without an
         // `.astc` sibling. The resource_registry slot must then stay empty.

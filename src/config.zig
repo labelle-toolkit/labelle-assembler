@@ -673,8 +673,8 @@ pub const ResourceDef = struct {
     /// picks at runtime (`pickCompressedTexture`, see `resource_loader`).
     /// Always null off wasm, so an Android APK never carries the PNG.
     ///
-    /// The typed ZON parse would accept the key, so `swapAstcTexturePaths`
-    /// rejects a game resource that arrives with it set
+    /// The typed ZON parse would accept the key, so `generate` rejects (first thing,
+    /// `rejectInternalResourceFields`) a game resource that arrives with it set
     /// (`error.InternalResourceField`); the pack merge never copies it.
     texture_fallback: ?[]const u8 = null,
 

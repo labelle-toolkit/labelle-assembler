@@ -327,6 +327,11 @@ pub fn generate(
     defer allocator.free(mutable_resources);
     cfg.resources = mutable_resources;
 
+    // Refuse an authored `.texture_fallback` (labelle-bgfx#134) before ANY
+    // phase can write to the target — grid expansion writes `__grid_*.json`
+    // long before the wasm ASTC swap that derives the field.
+    try generate_phases.rejectInternalResourceFields(mutable_resources);
+
     // ── Editor-preview activation (labelle-studio Play mode) ─────────────
     // The studio spawns `labelle build --platform=wasm` with
     // `LABELLE_EDITOR_PREVIEW=1` in the environment; the env propagates

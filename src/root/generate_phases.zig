@@ -487,6 +487,28 @@ fn gridFailDims(name: []const u8, err: anyerror, dims: PngDims, grid: config.Gri
     return err;
 }
 
+/// Refuse a resource that arrives with `texture_fallback` already set
+/// (labelle-bgfx#134). The field is derived by `swapAstcTexturePaths` on wasm,
+/// never authored, but the strict typed parse still accepts the key (it is a
+/// `ResourceDef` field). Runs FIRST in `generate`, on every platform, before
+/// any phase that writes to the target dir: a rejected project must leave the
+/// output untouched, and grid expansion (which writes `__grid_*.json`) runs
+/// long before the ASTC swap.
+pub fn rejectInternalResourceFields(resources: []const ResourceDef) !void {
+    for (resources) |res| {
+        if (res.texture_fallback != null) {
+            if (!builtin.is_test) {
+                std.log.err(
+                    "labelle-assembler: resource '{s}' sets `.texture_fallback`, which is assembler-internal " ++
+                        "(derived from the `.astc` swap on wasm). Remove it from project.labelle.",
+                    .{res.name},
+                );
+            }
+            return error.InternalResourceField;
+        }
+    }
+}
+
 /// Swap `.texture = "...png"` to the pre-converted `.astc` sibling when the
 /// target platform opts into ASTC (`asset_compression`) and `labelle astc`
 /// produced one (labelle-gfx#269 / #340). Done BEFORE the `.rgba` swap so ASTC
@@ -510,21 +532,6 @@ pub fn swapAstcTexturePaths(
     errdefer {
         for (astc_path_allocs.items) |s| allocator.free(s);
         astc_path_allocs.deinit(allocator);
-    }
-    // `texture_fallback` is derived below, never authored. The strict typed
-    // parse still accepts the key (it is a `ResourceDef` field), so refuse it
-    // here — on every platform, so a project can't depend on it silently.
-    for (mutable_resources) |res| {
-        if (res.texture_fallback != null) {
-            if (!builtin.is_test) {
-                std.log.err(
-                    "labelle-assembler: resource '{s}' sets `.texture_fallback`, which is assembler-internal " ++
-                        "(derived from the `.astc` swap on wasm). Remove it from project.labelle.",
-                    .{res.name},
-                );
-            }
-            return error.InternalResourceField;
-        }
     }
     const keep_png_fallback = cfg.platform == .wasm;
     if (cfg.asset_compression.formatFor(cfg.platform) == .astc) {
@@ -2459,18 +2466,15 @@ test "wasm without an .astc sibling: plain PNG as before, no helper (labelle-bgf
     try testing.expect(std.mem.indexOf(u8, src, "try g.loadAtlasFromMemory(\"tiles\", @embedFile(\"assets/tiles.json\"), @embedFile(\"assets/tiles.png\"), \".png\");") != null);
 }
 
-test "swapAstcTexturePaths: an authored texture_fallback is rejected (labelle-bgfx#134)" {
-    // The field is derived; the strict typed parse still accepts the key, so
-    // the swap refuses it on every platform (here: one with no ASTC at all).
-    var resources = [_]ResourceDef{.{
+test "rejectInternalResourceFields: an authored texture_fallback is rejected (labelle-bgfx#134)" {
+    // The field is derived; the strict typed parse still accepts the key.
+    const authored = [_]ResourceDef{.{
         .name = "tiles",
         .json = "assets/tiles.json",
         .texture = "assets/tiles.png",
         .texture_fallback = "assets/other.png",
     }};
-    const cfg: ProjectConfig = .{ .name = "g", .platform = .desktop };
-    try testing.expectError(
-        error.InternalResourceField,
-        swapAstcTexturePaths(testing.allocator, testing.io, cfg, &resources, "/nonexistent-game-dir"),
-    );
+    try testing.expectError(error.InternalResourceField, rejectInternalResourceFields(&authored));
+    const clean = [_]ResourceDef{.{ .name = "tiles", .json = "assets/tiles.json", .texture = "assets/tiles.png" }};
+    try rejectInternalResourceFields(&clean);
 }
