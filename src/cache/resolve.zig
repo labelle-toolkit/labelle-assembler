@@ -64,7 +64,9 @@ pub fn resolveAssemblerPackage(allocator: std.mem.Allocator, assembler_version: 
         const local_path = config.localVersionPath(assembler_version);
         const joined = try std.fs.path.join(allocator, &.{ local_path, subpath });
         defer allocator.free(joined);
-        return resolveLocalPath(allocator, joined, project_dir);
+        // Name the pin as written in the missing-path hint, not the joined
+        // bundled subpath — an absolute pin replaces `local_path` (#757 review).
+        return resolveLocalPathPinned(allocator, joined, local_path, project_dir);
     }
 
     // #685: the bundled packages have the same defect — populateAssemblerCache
@@ -119,6 +121,13 @@ pub fn resolvePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, pro
 /// picked up correctly during parallel-agent workflows. See
 /// resolveProjectRoot and pathEscapesProject.
 fn resolveLocalPath(allocator: std.mem.Allocator, local_path: []const u8, project_dir: ?[]const u8) ![]const u8 {
+    return resolveLocalPathPinned(allocator, local_path, local_path, project_dir);
+}
+
+/// `resolveLocalPath` for a `local_path` derived from a pin (e.g. a
+/// bundled subpath joined onto `local:<assembler>`): `pin` is the path as
+/// written in project.labelle, used only for the missing-path message.
+fn resolveLocalPathPinned(allocator: std.mem.Allocator, local_path: []const u8, pin: []const u8, project_dir: ?[]const u8) ![]const u8 {
     const anchored = try anchorLocalPath(allocator, local_path, project_dir);
     defer anchored.deinit(allocator);
     const resolve_path = anchored.path;
@@ -128,7 +137,7 @@ fn resolveLocalPath(allocator: std.mem.Allocator, local_path: []const u8, projec
     const resolved = std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), resolve_path, allocator) catch {
         // #756: from a worktree, say the relative path was anchored at the
         // main checkout and how to point at a package worktree instead.
-        const msg = try local_hint.missingLocalPathMessage(allocator, local_path, resolve_path, project_dir, anchored.root);
+        const msg = try local_hint.missingLocalPathMessage(allocator, pin, resolve_path, project_dir, anchored.root);
         defer allocator.free(msg);
         std.log.warn("{s}", .{msg});
         return try allocator.dupe(u8, resolve_path);
