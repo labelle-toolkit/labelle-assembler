@@ -665,6 +665,19 @@ pub const ResourceDef = struct {
     /// with labelle-cli's `ResourceDef.astc_block`.
     astc_block: ?AstcBlockSize = null,
 
+    /// DERIVED, assembler-internal — never authored (labelle-bgfx#134).
+    /// On a `.wasm` target the ASTC swap (`swapAstcTexturePaths` /
+    /// `preferCompressedPackTextures`) records the atlas's ORIGINAL `.png`
+    /// here when it points `.texture` at the `.astc` sibling: browser ASTC
+    /// support depends on the GPU, so the generated code embeds both and
+    /// picks at runtime (`pickCompressedTexture`, see `resource_loader`).
+    /// Always null off wasm, so an Android APK never carries the PNG.
+    ///
+    /// The typed ZON parse would accept the key, so `swapAstcTexturePaths`
+    /// rejects a game resource that arrives with it set
+    /// (`error.InternalResourceField`); the pack merge never copies it.
+    texture_fallback: ?[]const u8 = null,
+
     /// Classify which kind of asset this resource declares, based on
     /// which path fields are populated. Returns `.invalid` for empty
     /// or multi-kind entries — call `validate()` for the structured

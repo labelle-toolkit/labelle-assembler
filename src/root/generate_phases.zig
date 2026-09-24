@@ -494,6 +494,11 @@ fn gridFailDims(name: []const u8, err: anyerror, dims: PngDims, grid: config.Gri
 /// the owned list of allocated `.astc` rel-paths — the swapped `res.texture`
 /// slices point INTO it, so the CALLER holds the cleanup `defer` (the paths
 /// must outlive this call for the rest of `generate`).
+///
+/// On a `.wasm` target the swapped resource also keeps its source PNG in
+/// `texture_fallback` (labelle-bgfx#134): a browser's GPU may lack ASTC, so
+/// the generated code embeds both and picks at runtime. Every other platform
+/// leaves it null — the Android APK must not grow by the PNG.
 pub fn swapAstcTexturePaths(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -506,6 +511,22 @@ pub fn swapAstcTexturePaths(
         for (astc_path_allocs.items) |s| allocator.free(s);
         astc_path_allocs.deinit(allocator);
     }
+    // `texture_fallback` is derived below, never authored. The strict typed
+    // parse still accepts the key (it is a `ResourceDef` field), so refuse it
+    // here — on every platform, so a project can't depend on it silently.
+    for (mutable_resources) |res| {
+        if (res.texture_fallback != null) {
+            if (!builtin.is_test) {
+                std.log.err(
+                    "labelle-assembler: resource '{s}' sets `.texture_fallback`, which is assembler-internal " ++
+                        "(derived from the `.astc` swap on wasm). Remove it from project.labelle.",
+                    .{res.name},
+                );
+            }
+            return error.InternalResourceField;
+        }
+    }
+    const keep_png_fallback = cfg.platform == .wasm;
     if (cfg.asset_compression.formatFor(cfg.platform) == .astc) {
         for (mutable_resources) |*res| {
             if (res.texture.len == 0) continue;
@@ -523,6 +544,7 @@ pub fn swapAstcTexturePaths(
                 continue;
             };
             try astc_path_allocs.append(allocator, astc_rel);
+            if (keep_png_fallback) res.texture_fallback = res.texture;
             res.texture = astc_rel;
         }
     }
@@ -2315,4 +2337,140 @@ test "swapRgbaTexturePaths: an uppercase `.PNG` gets the same sibling preference
         allocs.deinit(allocator);
     }
     try testing.expectEqualStrings("assets/tiles.rgba", resources[0].texture);
+}
+
+// ── labelle-bgfx#134: web keeps a PNG fallback beside the ASTC ─────────────
+
+const resource_loader = @import("../codegen/blocks/resource_loader.zig");
+
+/// Front-end check (parse + AstGen) over a generated snippet. Does not
+/// resolve `@import`/`@embedFile`, so no backend or asset file is needed.
+fn expectAstGenOk(src: []const u8) !void {
+    const src_z = try testing.allocator.dupeZ(u8, src);
+    defer testing.allocator.free(src_z);
+    var ast = try std.zig.Ast.parse(testing.allocator, src_z, .zig);
+    defer ast.deinit(testing.allocator);
+    if (ast.errors.len != 0) return error.AstGenParseError;
+    var zir = try std.zig.AstGen.generate(testing.allocator, ast);
+    defer zir.deinit(testing.allocator);
+    if (zir.hasCompileErrors()) return error.AstGenCompileError;
+}
+
+/// Run the ASTC swap over one `assets/tiles` atlas for `platform`, then emit
+/// the file-scope picker + both load styles the way `main.zig` would. The
+/// caller owns the returned source.
+fn swapAndEmitTiles(platform: config.Platform, with_sibling: bool) ![]u8 {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "assets/tiles.png", "png");
+    if (with_sibling) try writeTestFile(tmp.dir, "assets/tiles.astc", "astc");
+    const game_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(game_dir);
+
+    var resources = [_]ResourceDef{.{ .name = "tiles", .json = "assets/tiles.json", .texture = "assets/tiles.png" }};
+    const cfg: ProjectConfig = .{
+        .name = "g",
+        .asset_compression = .{ .android = .astc, .web = .astc },
+        .platform = platform,
+    };
+    var allocs = try swapAstcTexturePaths(allocator, testing.io, cfg, &resources, game_dir);
+    defer {
+        for (allocs.items) |s| allocator.free(s);
+        allocs.deinit(allocator);
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    try resource_loader.writeCompressedTexturePicker(&aw.writer, &resources);
+    try aw.writer.writeAll("fn setup(g: *G) !void {\n");
+    try resource_loader.emitResourceLoad(&aw.writer, resources[0], .try_style);
+    try aw.writer.writeAll("}\nfn init(g: *G) void {\n");
+    try resource_loader.emitResourceLoad(&aw.writer, resources[0], .catch_panic_style);
+    try aw.writer.writeAll("}\n");
+    return aw.toOwnedSlice();
+}
+
+/// Stand-ins for the generated file's `BackendGfx` / `Game` so the emitted
+/// snippet is a self-contained unit for `expectAstGenOk`. The backend here
+/// deliberately LACKS `compressedSupported` — the `@hasDecl` gate must still
+/// compile (a pre-#146 bgfx, or any non-bgfx backend).
+const astc_unit_prelude =
+    \\const BackendGfx = struct {};
+    \\const G = struct {
+    \\    fn loadAtlasFromMemory(_: *G, _: []const u8, _: []const u8, _: []const u8, _: []const u8) !void {}
+    \\};
+    \\
+;
+
+test "swapAstcTexturePaths: wasm keeps the source PNG as texture_fallback (labelle-bgfx#134)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "assets/tiles.png", "png");
+    try writeTestFile(tmp.dir, "assets/tiles.astc", "astc");
+    const game_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(game_dir);
+
+    var resources = [_]ResourceDef{.{ .name = "tiles", .json = "assets/tiles.json", .texture = "assets/tiles.png" }};
+    const cfg: ProjectConfig = .{ .name = "g", .asset_compression = .{ .web = .astc }, .platform = .wasm };
+    var allocs = try swapAstcTexturePaths(allocator, testing.io, cfg, &resources, game_dir);
+    defer {
+        for (allocs.items) |s| allocator.free(s);
+        allocs.deinit(allocator);
+    }
+    try testing.expectEqualStrings("assets/tiles.astc", resources[0].texture);
+    try testing.expectEqualStrings("assets/tiles.png", resources[0].texture_fallback.?);
+}
+
+test "wasm + astc + sibling: both files embedded behind pickCompressedTexture (labelle-bgfx#134)" {
+    const src = try swapAndEmitTiles(.wasm, true);
+    defer testing.allocator.free(src);
+
+    // The helper is emitted exactly once, gated on `@hasDecl`.
+    const helper = "fn pickCompressedTexture(astc: []const u8, png: []const u8) []const u8 {";
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, helper));
+    try testing.expect(std.mem.indexOf(u8, src, "if (comptime @hasDecl(BackendGfx, \"compressedSupported\"))") != null);
+    // Both load styles route the texture through the picker, ASTC first.
+    const pick = "pickCompressedTexture(@embedFile(\"assets/tiles.astc\"), @embedFile(\"assets/tiles.png\"))";
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, pick));
+    try testing.expect(std.mem.indexOf(u8, src, "try g.loadAtlasFromMemory(\"tiles\", @embedFile(\"assets/tiles.json\"), " ++ pick ++ ", \".png\");") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "g.loadAtlasFromMemory(\"tiles\", @embedFile(\"assets/tiles.json\"), " ++ pick ++ ", \".png\") catch @panic(\"failed to load atlas: tiles\");") != null);
+
+    const unit = try std.mem.concat(testing.allocator, u8, &.{ astc_unit_prelude, src });
+    defer testing.allocator.free(unit);
+    try expectAstGenOk(unit);
+}
+
+test "android + astc: no PNG fallback, no helper — the APK does not grow (labelle-bgfx#134)" {
+    const src = try swapAndEmitTiles(.android, true);
+    defer testing.allocator.free(src);
+
+    try testing.expect(std.mem.indexOf(u8, src, "pickCompressedTexture") == null);
+    try testing.expect(std.mem.indexOf(u8, src, "assets/tiles.png") == null);
+    try testing.expect(std.mem.indexOf(u8, src, "try g.loadAtlasFromMemory(\"tiles\", @embedFile(\"assets/tiles.json\"), @embedFile(\"assets/tiles.astc\"), \".png\");") != null);
+}
+
+test "wasm without an .astc sibling: plain PNG as before, no helper (labelle-bgfx#134)" {
+    const src = try swapAndEmitTiles(.wasm, false);
+    defer testing.allocator.free(src);
+
+    try testing.expect(std.mem.indexOf(u8, src, "pickCompressedTexture") == null);
+    try testing.expect(std.mem.indexOf(u8, src, "try g.loadAtlasFromMemory(\"tiles\", @embedFile(\"assets/tiles.json\"), @embedFile(\"assets/tiles.png\"), \".png\");") != null);
+}
+
+test "swapAstcTexturePaths: an authored texture_fallback is rejected (labelle-bgfx#134)" {
+    // The field is derived; the strict typed parse still accepts the key, so
+    // the swap refuses it on every platform (here: one with no ASTC at all).
+    var resources = [_]ResourceDef{.{
+        .name = "tiles",
+        .json = "assets/tiles.json",
+        .texture = "assets/tiles.png",
+        .texture_fallback = "assets/other.png",
+    }};
+    const cfg: ProjectConfig = .{ .name = "g", .platform = .desktop };
+    try testing.expectError(
+        error.InternalResourceField,
+        swapAstcTexturePaths(testing.allocator, testing.io, cfg, &resources, "/nonexistent-game-dir"),
+    );
 }

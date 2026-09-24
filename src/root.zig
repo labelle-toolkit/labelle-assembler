@@ -669,6 +669,8 @@ pub fn generate(
         resource_entries.items,
         game_dir,
         cfg.asset_compression.formatFor(cfg.platform) == .astc,
+        // labelle-bgfx#134: keep the PNG beside the ASTC on web only.
+        cfg.platform == .wasm,
     );
 
     // ── Generation token, advanced BEFORE any output changes (#724) ──────

@@ -32,6 +32,7 @@ const scan = @import("scan.zig");
 const validate = @import("validate.zig");
 const context = @import("context.zig");
 const hooks_block = @import("blocks/hooks.zig");
+const resource_loader = @import("blocks/resource_loader.zig");
 const manifest_v2 = @import("manifest_v2.zig");
 
 /// Manifest-driven run-loop splice (pluggable-backends RFC, assembler#378).
@@ -393,11 +394,16 @@ pub fn generateMainZigWithAnimations(
 
     // Resource registry block — resources are now loaded at runtime via
     // @embedFile + loadAtlasFromMemory, so the comptime registry is empty.
-    // The block is kept as an empty string for template compatibility.
+    // The slot is file-scope, so it now carries the wasm-only
+    // `pickCompressedTexture` helper (labelle-bgfx#134) — and stays an empty
+    // string whenever no resource has a PNG fallback (every non-wasm build).
     {
-        const empty = try allocator.dupe(u8, "");
-        allocs.appendAssumeCapacity(empty);
-        try data.scalars.put("resource_registry_block", empty);
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, _: *[256]u8) !void {
+                try resource_loader.writeCompressedTexturePicker(w, c.cfg.resources);
+            }
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("resource_registry_block", b);
     }
 
     // AllHookPayloads block — merge engine payloads with game events

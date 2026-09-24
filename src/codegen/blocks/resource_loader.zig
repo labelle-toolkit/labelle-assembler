@@ -88,6 +88,24 @@ pub fn emitResourceLoad(w: anytype, res: ResourceDef, style: LoadStyle) !void {
     switch (res.kind()) {
         .atlas => {
             const fn_name = if (is_lazy) "registerAtlasFromMemory" else "loadAtlasFromMemory";
+            // labelle-bgfx#134: a wasm ASTC swap keeps the source PNG in
+            // `texture_fallback`; embed both and let `pickCompressedTexture`
+            // (emitted once at file scope by `writeCompressedTexturePicker`)
+            // choose per the running browser's GPU. Null everywhere else, so
+            // the plain single-`@embedFile` line stays byte-identical.
+            if (res.texture_fallback) |png| {
+                switch (style) {
+                    .try_style => try w.print(
+                        "    try g.{s}(\"{s}\", @embedFile(\"{s}\"), pickCompressedTexture(@embedFile(\"{s}\"), @embedFile(\"{s}\")), \".png\");\n",
+                        .{ fn_name, res.name, res.json, res.texture, png },
+                    ),
+                    .catch_panic_style => try w.print(
+                        "    g.{s}(\"{s}\", @embedFile(\"{s}\"), pickCompressedTexture(@embedFile(\"{s}\"), @embedFile(\"{s}\")), \".png\") catch @panic(\"failed to load atlas: {s}\");\n",
+                        .{ fn_name, res.name, res.json, res.texture, png, res.name },
+                    ),
+                }
+                return;
+            }
             switch (style) {
                 .try_style => try w.print(
                     "    try g.{s}(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\");\n",
@@ -198,6 +216,39 @@ pub fn emitResourceLoad(w: anytype, res: ResourceDef, style: LoadStyle) !void {
         },
         .invalid => return error.InvalidResourceDef,
     }
+}
+
+/// Emit the file-scope `pickCompressedTexture` helper the atlas arm above
+/// calls for a resource with a `texture_fallback` (labelle-bgfx#134). Writes
+/// NOTHING unless at least one resource has one — i.e. only on a wasm target
+/// with an ASTC-swapped atlas — so every other build stays byte-identical.
+///
+/// File scope (the engine template's `resource_registry_block` slot) because
+/// the atlas loads land in two different function bodies (loop setup, sokol
+/// init callback); `BackendGfx` is the engine template's top-level
+/// `@import("backend_gfx")`. The `@hasDecl` gate keeps it compiling against a
+/// backend without `compressedSupported` (anything before labelle-bgfx#146,
+/// and non-bgfx backends): those always get the PNG, which every backend
+/// decodes. The backend's check reads renderer caps, so it is only valid after
+/// bgfx init — the generated main calls `window.initWindow` before any atlas
+/// line, and the sokol callback host loads atlases from its init callback.
+pub fn writeCompressedTexturePicker(w: anytype, resources: []const ResourceDef) !void {
+    for (resources) |res| {
+        if (res.texture_fallback != null) break;
+    } else return;
+    try w.writeAll(
+        \\/// labelle-bgfx#134: use the atlas's ASTC when this browser/GPU samples it
+        \\/// natively, else its PNG. The backend's `compressedSupported` needs bgfx
+        \\/// initialised; older backends without it always get the PNG.
+        \\fn pickCompressedTexture(astc: []const u8, png: []const u8) []const u8 {
+        \\    if (comptime @hasDecl(BackendGfx, "compressedSupported")) {
+        \\        if (BackendGfx.compressedSupported(astc)) return astc;
+        \\    }
+        \\    return png;
+        \\}
+        \\
+        \\
+    );
 }
 
 /// Mixin factory for `Codegen` (labelle-assembler#183, mixin conversion).
