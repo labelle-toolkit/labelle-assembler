@@ -93,6 +93,7 @@ test {
     _ = local_slots;
 
     _ = resolve;
+    _ = @import("cache/local_hint.zig");
     _ = disk;
     _ = fetch;
 }

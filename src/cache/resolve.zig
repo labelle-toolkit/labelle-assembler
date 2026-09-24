@@ -12,6 +12,7 @@ const builtin = @import("builtin");
 const config = @import("../config.zig");
 const env = @import("env.zig");
 const local = @import("local.zig");
+const local_hint = @import("local_hint.zig");
 
 /// Resolve a framework package (core, engine, gfx) to its cached path.
 /// Returns an absolute path like: ~/.labelle/packages/core/0.3.0
@@ -63,7 +64,9 @@ pub fn resolveAssemblerPackage(allocator: std.mem.Allocator, assembler_version: 
         const local_path = config.localVersionPath(assembler_version);
         const joined = try std.fs.path.join(allocator, &.{ local_path, subpath });
         defer allocator.free(joined);
-        return resolveLocalPath(allocator, joined, project_dir);
+        // Name the pin as written in the missing-path hint, not the joined
+        // bundled subpath — an absolute pin replaces `local_path` (#757 review).
+        return resolveLocalPathPinned(allocator, joined, local_path, project_dir);
     }
 
     // #685: the bundled packages have the same defect — populateAssemblerCache
@@ -118,26 +121,58 @@ pub fn resolvePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, pro
 /// picked up correctly during parallel-agent workflows. See
 /// resolveProjectRoot and pathEscapesProject.
 fn resolveLocalPath(allocator: std.mem.Allocator, local_path: []const u8, project_dir: ?[]const u8) ![]const u8 {
-    const resolve_path = if (std.fs.path.isAbsolute(local_path))
-        try allocator.dupe(u8, local_path)
-    else if (project_dir) |pd| blk: {
-        const base = if (pathEscapesProject(local_path))
-            try resolveProjectRoot(allocator, pd)
-        else
-            try allocator.dupe(u8, pd);
-        defer allocator.free(base);
-        break :blk try std.fs.path.join(allocator, &.{ base, local_path });
-    } else try allocator.dupe(u8, local_path);
-    defer allocator.free(resolve_path);
+    return resolveLocalPathPinned(allocator, local_path, local_path, project_dir);
+}
+
+/// `resolveLocalPath` for a `local_path` derived from a pin (e.g. a
+/// bundled subpath joined onto `local:<assembler>`): `pin` is the path as
+/// written in project.labelle, used only for the missing-path message.
+fn resolveLocalPathPinned(allocator: std.mem.Allocator, local_path: []const u8, pin: []const u8, project_dir: ?[]const u8) ![]const u8 {
+    const anchored = try anchorLocalPath(allocator, local_path, project_dir);
+    defer anchored.deinit(allocator);
+    const resolve_path = anchored.path;
 
     // realPathFileAlloc returns [:0]u8 — dupe to plain []u8 so callers
     // can `allocator.free` without the sentinel-byte size mismatch.
     const resolved = std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), resolve_path, allocator) catch {
-        std.log.warn("labelle: local path '{s}' does not exist", .{resolve_path});
+        // #756: from a worktree, say the relative path was anchored at the
+        // main checkout and how to point at a package worktree instead.
+        const msg = try local_hint.missingLocalPathMessage(allocator, pin, resolve_path, project_dir, anchored.root);
+        defer allocator.free(msg);
+        std.log.warn("{s}", .{msg});
         return try allocator.dupe(u8, resolve_path);
     };
     defer allocator.free(resolved);
     return try allocator.dupe(u8, resolved);
+}
+
+/// A `local:` path joined against its anchor directory.
+const AnchoredLocalPath = struct {
+    /// The path to check on disk (not yet canonicalized).
+    path: []u8,
+    /// The directory a sibling-style (`..`-leading) relative path was
+    /// joined against — the main checkout when `project_dir` is a
+    /// worktree, else `project_dir` itself. Null when the path was not
+    /// re-anchored (absolute, project-internal, or no `project_dir`).
+    root: ?[]u8,
+
+    fn deinit(self: AnchoredLocalPath, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        if (self.root) |r| allocator.free(r);
+    }
+};
+
+/// The join half of `resolveLocalPath`, split out so the anchor directory
+/// is available for the missing-path message (#756).
+fn anchorLocalPath(allocator: std.mem.Allocator, local_path: []const u8, project_dir: ?[]const u8) !AnchoredLocalPath {
+    if (std.fs.path.isAbsolute(local_path)) return .{ .path = try allocator.dupe(u8, local_path), .root = null };
+    const pd = project_dir orelse return .{ .path = try allocator.dupe(u8, local_path), .root = null };
+    if (!pathEscapesProject(local_path)) {
+        return .{ .path = try std.fs.path.join(allocator, &.{ pd, local_path }), .root = null };
+    }
+    const root = try resolveProjectRoot(allocator, pd);
+    errdefer allocator.free(root);
+    return .{ .path = try std.fs.path.join(allocator, &.{ root, local_path }), .root = root };
 }
 
 /// Whether `path`'s first component is `..` — i.e. the path walks out of
@@ -709,6 +744,47 @@ test "resolveLocalPath: escaping path (starts with `..`) anchors at main checkou
     defer alloc.free(resolved);
 
     try std.testing.expectEqualStrings(sibling_abs, resolved);
+}
+
+test "anchorLocalPath: missing sibling from a worktree names the main checkout (#756)" {
+    // End-to-end for the #756 message: a real worktree layout, the real
+    // anchoring, and the message resolveLocalPath logs when it's missing.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "main/.git/worktrees/wt");
+    try tmp.dir.createDirPath(std.testing.io, "wt");
+
+    const main_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main", alloc);
+    defer alloc.free(main_abs);
+    const wt_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "wt", alloc);
+    defer alloc.free(wt_abs);
+
+    const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
+    defer alloc.free(linkfile);
+    const f = try tmp.dir.createFile(std.testing.io, "wt/.git", .{});
+    defer f.close(std.testing.io);
+    try f.writeStreamingAll(std.testing.io, linkfile);
+
+    // Worktree + relative sibling: anchored at main, hint shown.
+    const anchored = try anchorLocalPath(alloc, "../missing", wt_abs);
+    defer anchored.deinit(alloc);
+    try std.testing.expectEqualStrings(main_abs, anchored.root.?);
+    const msg = try local_hint.missingLocalPathMessage(alloc, "../missing", anchored.path, wt_abs, anchored.root);
+    defer alloc.free(msg);
+    const main_part = try std.fmt.allocPrint(alloc, "('{s}'), not this worktree ('{s}')", .{ main_abs, wt_abs });
+    defer alloc.free(main_part);
+    try std.testing.expect(std.mem.indexOf(u8, msg, main_part) != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "pin it with an absolute path") != null);
+
+    // Same sibling from the main checkout: root == project_dir, no hint.
+    const from_main = try anchorLocalPath(alloc, "../missing", main_abs);
+    defer from_main.deinit(alloc);
+    const plain = try local_hint.missingLocalPathMessage(alloc, "../missing", from_main.path, main_abs, from_main.root);
+    defer alloc.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "not this worktree") == null);
 }
 
 test "toMainCheckoutPath: worktree path inside project_dir maps to main checkout" {
