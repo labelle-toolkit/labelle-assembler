@@ -2349,6 +2349,7 @@ test "swapRgbaTexturePaths: an uppercase `.PNG` gets the same sibling preference
 // ── labelle-bgfx#134: web keeps a PNG fallback beside the ASTC ─────────────
 
 const resource_loader = @import("../codegen/blocks/resource_loader.zig");
+const root = @import("../root.zig");
 
 /// Front-end check (parse + AstGen) over a generated snippet. Does not
 /// resolve `@import`/`@embedFile`, so no backend or asset file is needed.
@@ -2477,4 +2478,58 @@ test "rejectInternalResourceFields: an authored texture_fallback is rejected (la
     try testing.expectError(error.InternalResourceField, rejectInternalResourceFields(&authored));
     const clean = [_]ResourceDef{.{ .name = "tiles", .json = "assets/tiles.json", .texture = "assets/tiles.png" }};
     try rejectInternalResourceFields(&clean);
+}
+
+test "generate rejects an authored texture_fallback before writing anything (codex P2 on #758)" {
+    const allocator = testing.allocator;
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // 32x32 PNG header: signature + IHDR, all `expandGridResources` reads.
+    const png_32x32 = [_]u8{ 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, 'I', 'H', 'D', 'R', 0, 0, 0, 32, 0, 0, 0, 32, 8, 6, 0, 0, 0 };
+    try writeTestFile(tmp.dir, "game/assets/tiles.png", &png_32x32);
+    try tmp.dir.createDirPath(tio, "out");
+    try tmp.dir.createDirPath(tio, "control");
+    const game_abs = try tmp.dir.realPathFileAlloc(tio, "game", allocator);
+    defer allocator.free(game_abs);
+    const out_abs = try tmp.dir.realPathFileAlloc(tio, "out", allocator);
+    defer allocator.free(out_abs);
+    const control_abs = try tmp.dir.realPathFileAlloc(tio, "control", allocator);
+    defer allocator.free(control_abs);
+
+    // A valid `.image` + `.grid` resource: grid expansion writes a
+    // `__grid_tiles.json` for it into the target.
+    const grid_res: ResourceDef = .{
+        .name = "tiles",
+        .image = "assets/tiles.png",
+        .grid = .{ .tile_width = 16, .tile_height = 16 },
+    };
+
+    // Control — the input WOULD write: run the first writing phase on the
+    // same resource directly (the real `generate` can fail earlier on a clean
+    // machine for unrelated reasons, e.g. an unresolvable backend package).
+    var control_res = [_]ResourceDef{grid_res};
+    var control_allocs = try expandGridResources(allocator, tio, &control_res, game_abs, control_abs);
+    defer {
+        for (control_allocs.items) |s| allocator.free(s);
+        control_allocs.deinit(allocator);
+    }
+    var control_dir = try tmp.dir.openDir(tio, "control", .{});
+    defer control_dir.close(tio);
+    try control_dir.access(tio, "__grid_tiles.json", .{});
+
+    // The real `generate` with the authored field fails with the rejection
+    // (not some other early error) and the output dir stays empty.
+    var authored = grid_res;
+    authored.texture_fallback = "assets/tiles.png";
+    try testing.expectError(error.InternalResourceField, root.generate(allocator, .{
+        .name = "grid-game",
+        .ecs = .mock,
+        .platform = .wasm,
+        .resources = &.{authored},
+    }, out_abs, game_abs, .{ .is_tests_target = false }));
+    var out = try tmp.dir.openDir(tio, "out", .{ .iterate = true });
+    defer out.close(tio);
+    var it = out.iterate();
+    try testing.expect((try it.next(tio)) == null);
 }
