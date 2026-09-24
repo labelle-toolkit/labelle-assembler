@@ -11,7 +11,7 @@ pub const Descriptor = struct {
     targets: []const Target,
     parameters: []const Parameter = &.{},
     textures: []const Texture = &.{},
-    blend: enum { alpha, additive } = .alpha,
+    blend: enum { alpha, additive, modulate2x } = .alpha,
 };
 /// The shaderc that compiles game materials, and the GLSL profile it takes.
 ///
@@ -301,6 +301,15 @@ test "material schema validates shapes and generates caller-owned textures and e
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "fog.essl.bin") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "fog.mtl.bin") == null);
     try std.testing.expectError(error.InvalidParameterDefaults, parse(a, "{\"version\":1,\"fragment\":\"f.sc\",\"targets\":[\"spv\"],\"parameters\":[{\"name\":\"u_x\",\"kind\":\"vec4\",\"defaults\":[1]}]}"));
+}
+test "material schema accepts the modulate2x blend and emits it" {
+    const a = std.testing.allocator;
+    const p = try parse(a, "{\"version\":1,\"fragment\":\"light.sc\",\"targets\":[\"essl\"],\"blend\":\"modulate2x\"}");
+    defer p.deinit();
+    var out = std.Io.Writer.Allocating.init(a);
+    defer out.deinit();
+    try render(&out.writer, "light", p.value);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), ".blend = .modulate2x") != null);
 }
 test "shaderc platform follows the real target for the ambiguous metal/essl pairs (#740)" {
     // The two pairs the fixed mapping got wrong.
