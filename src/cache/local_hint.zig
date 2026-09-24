@@ -5,8 +5,10 @@
 /// `resolveProjectRoot` in resolve.zig). That is by design — the same pin
 /// then works from every worktree — but when the anchored path is missing,
 /// a bare "does not exist" reads like a broken pin. This module formats the
-/// message so it names the path as written, the main checkout it resolved
-/// from, the worktree it was built from, and the fix (an absolute pin).
+/// message so it names the path that was checked, the pin as written, the
+/// main checkout it resolved from, the worktree it was built from, and the
+/// fix (an absolute pin). Only `..`-leading pins re-anchor; the wording
+/// says so, since project-internal relative pins stay in the worktree.
 ///
 /// Pure string formatting: no filesystem access, so every case is
 /// unit-testable without a git layout.
@@ -26,8 +28,10 @@ pub fn anchoredFromWorktree(written: []const u8, project_dir: ?[]const u8, proje
 
 /// Message for a `local:` path that does not exist. Caller owns the result.
 ///
-/// - `written`: the path as it appears in the pin (e.g. `../imgui-alpha`).
-/// - `resolved`: the path that was actually checked.
+/// - `written`: the pin as it appears in project.labelle (e.g.
+///   `../imgui-alpha`) — for a bundled assembler package, the assembler
+///   pin, not the joined subpath.
+/// - `resolved`: the path that was actually checked (the message subject).
 /// - `project_dir`: the project the build runs from (maybe a worktree).
 /// - `project_root`: the directory `written` was joined against when it
 ///   was re-anchored at the main checkout; null when it was not.
@@ -45,11 +49,11 @@ pub fn missingLocalPathMessage(
     }
     return std.fmt.allocPrint(
         allocator,
-        "labelle: local path '{s}' does not exist (resolved to '{s}').\n" ++
-            "         Relative local: paths resolve from the main checkout\n" ++
+        "labelle: local path '{s}' does not exist.\n" ++
+            "         The pin '{s}' starts with '..', so it resolves from the main checkout\n" ++
             "         ('{s}'), not this worktree ('{s}').\n" ++
             "         To use a package worktree, pin it with an absolute path.",
-        .{ written, resolved, project_root.?, project_dir.? },
+        .{ resolved, written, project_root.?, project_dir.? },
     );
 }
 
@@ -67,8 +71,8 @@ test "missingLocalPathMessage: relative path missing from a worktree explains th
     defer alloc.free(msg);
 
     try std.testing.expectEqualStrings(
-        "labelle: local path '../imgui-alpha' does not exist (resolved to '/src/fp/../imgui-alpha').\n" ++
-            "         Relative local: paths resolve from the main checkout\n" ++
+        "labelle: local path '/src/fp/../imgui-alpha' does not exist.\n" ++
+            "         The pin '../imgui-alpha' starts with '..', so it resolves from the main checkout\n" ++
             "         ('/src/fp'), not this worktree ('/src/.worktrees/fp-perf').\n" ++
             "         To use a package worktree, pin it with an absolute path.",
         msg,
@@ -116,4 +120,20 @@ test "missingLocalPathMessage: project-internal path (not re-anchored) keeps the
     );
     defer alloc.free(msg);
     try std.testing.expectEqualStrings("labelle: local path '/src/.worktrees/fp-perf/libs/foo' does not exist", msg);
+}
+
+test "missingLocalPathMessage: bundled subpath is the subject, the assembler pin is named separately" {
+    const alloc = std.testing.allocator;
+    // resolveAssemblerPackage checks `<pin>/<subpath>`; the missing thing
+    // is that joined path, and the pin to replace is the assembler one.
+    const msg = try missingLocalPathMessage(
+        alloc,
+        "../labelle-assembler",
+        "/src/fp/../labelle-assembler/backends/fictional",
+        "/src/.worktrees/fp-perf",
+        "/src/fp",
+    );
+    defer alloc.free(msg);
+    try std.testing.expect(std.mem.startsWith(u8, msg, "labelle: local path '/src/fp/../labelle-assembler/backends/fictional' does not exist.\n"));
+    try std.testing.expect(std.mem.indexOf(u8, msg, "The pin '../labelle-assembler' starts with '..'") != null);
 }
