@@ -59,11 +59,14 @@ pub const toolchain_api142: Toolchain = .{
     .glsl_profile = "120",
     .api = "142",
 };
-/// bgfx API 161: labelle-bgfx >= 0.24.0. Container v12. Same zbgfx pin as
-/// labelle-bgfx v0.24.0 (labelle-toolkit/zbgfx#1 merge).
+/// bgfx API 161: labelle-bgfx >= 0.24.0. Container v12. The same zbgfx pin
+/// as labelle-bgfx (labelle-toolkit/zbgfx#2: API 161 plus the web ASTC
+/// format-table fix, labelle-bgfx#147). The shader compiler doesn't use
+/// that table, so compiled materials are unchanged; the pin moves to keep
+/// one zbgfx commit across the toolkit.
 pub const toolchain_api161: Toolchain = .{
-    .url = "https://github.com/labelle-toolkit/zbgfx/archive/ba2786f11b8042afc2f90e10b2a6432bd24befae.tar.gz",
-    .hash = "zbgfx-0.12.0-Sm4IxMnIDAdzAesVbziV41cUrt0j8cBIG8xGe7UL1fpY",
+    .url = "https://github.com/labelle-toolkit/zbgfx/archive/eb71fd4b0339cbad09c755eea52091c3105ac719.tar.gz",
+    .hash = "zbgfx-0.12.0-Sm4IxN_KDAf834PtToJwIjR0-zzWnYOjJWZAtPUwhAHZ",
     .glsl_profile = "330",
     .api = "161",
 };
