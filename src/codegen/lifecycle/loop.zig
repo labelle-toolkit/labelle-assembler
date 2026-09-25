@@ -53,6 +53,23 @@ pub fn emitWindowIcon(w: anytype, cfg: ProjectConfig) !void {
     try w.print("    if (comptime @hasDecl(window, \"setWindowIconPng\")) window.setWindowIconPng(@embedFile(\"{s}\"));\n\n", .{app_icon.iconEmbedPath(cfg)});
 }
 
+/// Emit the boot-time device-language hand-off (RFC-I18N section 8): the
+/// backend's `window.systemLocale` feeds the generated i18n module's
+/// `applySystemLocale`, which keeps LABELLE_LOCALE on top and falls back to
+/// `.i18n.default` for a language the build doesn't ship. Gated on the
+/// backend DECL, so backends without `systemLocale` build unchanged. Shared
+/// by the loop and callback setup builders — both run after the backend is
+/// up (desktop: after initWindow; Android: from the init callback, once the
+/// activity config is live). Standalone so it is unit-testable in isolation.
+pub fn emitSystemLocale(w: anytype) !void {
+    try w.writeAll("    // Device language (RFC-I18N section 8): boot in the OS/browser locale when\n");
+    try w.writeAll("    // the build ships it. Folds away on backends without the decl.\n");
+    try w.writeAll("    if (comptime @hasDecl(window, \"systemLocale\")) {\n");
+    try w.writeAll("        var locale_buf: [64]u8 = undefined;\n");
+    try w.writeAll("        if (window.systemLocale(&locale_buf)) |tag| _ = @import(\"i18n\").applySystemLocale(tag);\n");
+    try w.writeAll("    }\n\n");
+}
+
 pub fn Mixin(comptime Self: type) type {
     return struct {
         pub fn buildSetupCode(self: *Self) ![]const u8 {
@@ -75,6 +92,10 @@ pub fn Mixin(comptime Self: type) type {
             // never analysed, so the icon bytes are not even embedded there.
             // The path is the assembler-staged icon (`app_icon.iconEmbedPath`).
             if (cfg.platform == .desktop) try emitWindowIcon(w, cfg);
+
+            // Before GuiBackend.init / scene load, so the first frame
+            // (and any setup-time lookup) is already in the device language.
+            if (self.i18n) try emitSystemLocale(w);
 
             if (cfg.resolved_gui) |gui| {
                 if (gui.lifecycle.init) {

@@ -99,6 +99,13 @@ pub threadlocal var plugin_events_force_kept: []const scan.PluginEvent = &.{};
 /// tilemap registrations emitted.
 pub threadlocal var tilemap_registrations: []const tilemap_scan.Registration = &.{};
 
+/// True when the i18n phase emitted the `i18n` module (the project has a
+/// `locales/` dir). Gates the boot-time device-language hand-off
+/// (`emitSystemLocale`). Same scoped-threadlocal pattern as
+/// `tilemap_registrations`; false (the default) → locale-less project,
+/// byte-identical main.zig.
+pub threadlocal var i18n_enabled: bool = false;
+
 /// Scripting splice (labelle-assembler#593). Non-null when THE scripting
 /// plugin is attached with `.params.language` (see
 /// `scripting_splice.detect`): drives the `registerScript` registrations,
@@ -299,6 +306,10 @@ pub fn generateMainZigWithAnimations(
         // site (tests, preview, tilemap-free projects), so those emit no
         // tilemap registrations.
         .tilemap_registrations = tilemap_registrations,
+        // i18n device-language hand-off — read from the module-level var
+        // set by root.zig. False for every existing call site (tests,
+        // preview, locale-less projects), so those emit byte-identical output.
+        .i18n = i18n_enabled,
         // Scripting splice (labelle-assembler#593) — read from the
         // module-level var set by root.zig. Null for every existing call
         // site (tests, preview, script-less projects), so those emit
