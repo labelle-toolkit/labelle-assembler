@@ -2695,6 +2695,17 @@ pub fn generate(
         );
         defer allocator.free(main_zig_content);
         try scanner.writeFile(target_dir, "main.zig", main_zig_content);
+        const apk_assets = @import("codegen/blocks/apk_assets.zig");
+        if (apk_assets.enabled(cfg)) {
+            try scanner.writeFile(target_dir, "apk_assets.zig", apk_assets.runtime_source);
+            const asset_manifest = try apk_assets.manifest(allocator, cfg.resources);
+            defer allocator.free(asset_manifest);
+            try scanner.writeFile(target_dir, "apk_assets.json", asset_manifest);
+        } else {
+            // Overwrite the contract when a target is regenerated with the
+            // option disabled; stale manifests must not duplicate embedded data.
+            try scanner.writeFile(target_dir, "apk_assets.json", "{\"version\":1,\"compression\":\"deflate\",\"files\":[]}\n");
+        }
 
         // Hook-route sidecar (labelle-assembler#724, child of the hooks
         // epic labelle-engine#854). `<game>/.labelle/hook_routes.json`:

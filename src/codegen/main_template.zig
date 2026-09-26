@@ -400,7 +400,9 @@ pub fn generateMainZigWithAnimations(
     {
         const b = try block(allocator, &allocs, struct {
             fn emit(c: *Codegen, w: anytype, _: *[256]u8) !void {
-                try resource_loader.writeCompressedTexturePicker(w, c.cfg.resources);
+                if (@import("blocks/apk_assets.zig").enabled(c.cfg)) {
+                    try w.writeAll("const ApkAssets = @import(\"apk_assets.zig\").Runtime(engine, @import(\"labelle-core\").android_backend);\n");
+                } else try resource_loader.writeCompressedTexturePicker(w, c.cfg.resources);
             }
         }.emit, &ctx, &ident_buf);
         try data.scalars.put("resource_registry_block", b);

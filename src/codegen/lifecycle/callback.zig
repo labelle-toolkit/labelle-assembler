@@ -37,6 +37,7 @@ const std = @import("std");
 const config = @import("../../config.zig");
 const scan = @import("../scan.zig");
 const asset_wiring = @import("../blocks/asset_wiring.zig");
+const apk_assets = @import("../blocks/apk_assets.zig");
 const resource_loader = @import("../blocks/resource_loader.zig");
 const tilemap_assets = @import("../blocks/tilemap_assets.zig");
 const post_fx_block = @import("../blocks/post_fx.zig");
@@ -120,7 +121,7 @@ pub fn Mixin(comptime Self: type) type {
                     // at startup. Must match the fallback in buildSetupCode.
                     // The sokol-callback host has no error channel to unwind
                     // into, so we use `.catch_panic_style` instead of `try`.
-                    try emitResourceLoad(w, res, .catch_panic_style);
+                    if (apk_assets.enabled(cfg)) try apk_assets.emit(w, res, .catch_panic_style) else try emitResourceLoad(w, res, .catch_panic_style);
                 }
                 try w.writeByte('\n');
             }

@@ -376,6 +376,9 @@ pub const I18nConfig = struct {
 };
 
 pub const AndroidConfig = struct {
+    /// Requires a packager that consumes apk_assets.json and deflates its files.
+    /// Opt-in until labelle-android packaging supports that contract.
+    load_assets_from_apk: bool = false,
     app_name: []const u8 = "",
     package_name: []const u8 = "", // e.g. "com.labelle.mygame"
     min_sdk_version: u32 = 28, // Android 9 (Pie) — NativeActivity + GLES3

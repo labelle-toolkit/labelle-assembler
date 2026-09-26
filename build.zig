@@ -310,7 +310,15 @@ pub fn build(b: *std.Build) void {
     // them without further build.zig churn. flow_codegen is cheap to
     // attach (pure-Zig sub-package, no native deps) so the blanket
     // import isn't an unwanted runtime cost.
+    const apk_reader_test = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/codegen/blocks/apk_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const apk_reader_run = b.addRunArtifact(apk_reader_test);
+    test_step.dependOn(&apk_reader_run.step);
     const test_files = [_][]const u8{
+        "test/apk_assets_tests.zig",
         // BDD test suites previously concentrated in test/tests.zig
         // (3768 lines). Split by domain via #184. Shared fixtures live
         // in test/helpers.zig.
@@ -456,6 +464,11 @@ pub fn build(b: *std.Build) void {
         const run_test = b.addRunArtifact(t);
         test_step.dependOn(&run_test.step);
         if (std.mem.eql(u8, test_file, "test/build_zig_tests.zig") or std.mem.eql(u8, test_file, "test/build_zig_zon_tests.zig")) material_test_step.dependOn(&run_test.step);
+        if (std.mem.eql(u8, test_file, "test/apk_assets_tests.zig")) {
+            const apk_step = b.step("test-apk-assets", "Test Android APK resource generation");
+            apk_step.dependOn(&run_test.step);
+            apk_step.dependOn(&apk_reader_run.step);
+        }
         if (std.mem.eql(u8, test_file, "test/animation_assets_tests.zig")) {
             b.step("test-animation", "Test JSONC animation asset wiring").dependOn(&run_test.step);
         }
