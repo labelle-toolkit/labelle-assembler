@@ -23,6 +23,7 @@ const std = @import("std");
 const config = @import("../../config.zig");
 const scan = @import("../scan.zig");
 const asset_wiring = @import("../blocks/asset_wiring.zig");
+const apk_assets = @import("../blocks/apk_assets.zig");
 const resource_loader = @import("../blocks/resource_loader.zig");
 const tilemap_assets = @import("../blocks/tilemap_assets.zig");
 const post_fx_block = @import("../blocks/post_fx.zig");
@@ -150,7 +151,7 @@ pub fn Mixin(comptime Self: type) type {
                     // `lazy_inference.resolveLazyDefaults` — a defaulted +
                     // unreferenced resource stays eager so legacy projects keep
                     // decoding their atlases at startup.
-                    try emitResourceLoad(w, res, .try_style);
+                    if (apk_assets.enabled(cfg)) try apk_assets.emit(w, res, .try_style) else try emitResourceLoad(w, res, .try_style);
                 }
                 try w.writeByte('\n');
             }

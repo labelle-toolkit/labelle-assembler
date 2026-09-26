@@ -124,3 +124,5 @@ pub const generateGameLayers = main_template.generateGameLayers;
 pub const generateResourceRegistry = main_template.generateResourceRegistry;
 
 pub const generateMainZigWithAnimations = main_template.generateMainZigWithAnimations;
+
+pub const apk_assets = @import("codegen/blocks/apk_assets.zig");
