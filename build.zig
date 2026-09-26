@@ -310,6 +310,20 @@ pub fn build(b: *std.Build) void {
     // them without further build.zig churn. flow_codegen is cheap to
     // attach (pure-Zig sub-package, no native deps) so the blanket
     // import isn't an unwanted runtime cost.
+    const apk_abi_target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .android });
+    const apk_abi_module = b.createModule(.{
+        .root_source_file = b.path("test/fixtures/apk_runtime_compile.zig"),
+        .target = apk_abi_target,
+        .optimize = optimize,
+        .pic = true,
+    });
+    apk_abi_module.addImport("apk", b.createModule(.{
+        .root_source_file = b.path("src/codegen/blocks/apk_runtime.zig"),
+        .target = apk_abi_target,
+        .optimize = optimize,
+    }));
+    const apk_abi = b.addObject(.{ .name = "apk-runtime-abi", .root_module = apk_abi_module });
+    test_step.dependOn(&apk_abi.step);
     const apk_reader_test = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/codegen/blocks/apk_runtime.zig"),
         .target = target,
@@ -468,6 +482,7 @@ pub fn build(b: *std.Build) void {
             const apk_step = b.step("test-apk-assets", "Test Android APK resource generation");
             apk_step.dependOn(&run_test.step);
             apk_step.dependOn(&apk_reader_run.step);
+            apk_step.dependOn(&apk_abi.step);
         }
         if (std.mem.eql(u8, test_file, "test/animation_assets_tests.zig")) {
             b.step("test-animation", "Test JSONC animation asset wiring").dependOn(&run_test.step);
