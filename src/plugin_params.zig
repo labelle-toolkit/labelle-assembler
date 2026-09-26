@@ -435,6 +435,7 @@ fn parseTyped(gpa: std.mem.Allocator, source: [:0]const u8) !config.ProjectConfi
     // The typed ProjectConfig parse is comptime-heavy; the quota is
     // per-function-scope, so it has to live with the parse call itself.
     @setEvalBranchQuota(10000);
+    try @import("provider_settings.zig").validateProject(gpa, source);
     var diag: std.zon.parse.Diagnostics = .{};
     defer diag.deinit(gpa);
     return std.zon.parse.fromSliceAlloc(config.ProjectConfig, gpa, source, &diag, .{}) catch |err| {
@@ -1796,4 +1797,19 @@ test "stagedName agrees with the build.zig emitter's b.path spelling" {
     const name = try stagedName(testing.allocator, "pathfinder");
     defer testing.allocator.free(name);
     try testing.expectEqualStrings("plugin_pathfinder_params.zig", name);
+}
+
+test "provider settings: real project parser preserves mapping through params extraction" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source = ".{ .name = \"game\", .plugins = .{ .{ .name = \"fixture\", .repo = \"local:../fixture\", .params = .{ .count = 3 } } }, .provider_config = .{ .{ .package = \"fixture\", .file = \"providers/tool.json\" } } }";
+    const cfg = try parseProjectConfig(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 1), cfg.provider_config.len);
+    try std.testing.expectEqualStrings("providers/tool.json", cfg.provider_config[0].file);
+    const typo = try std.mem.replaceOwned(u8, arena.allocator(), source, ".file =", ".filename =");
+    try std.testing.expectError(error.ParseZon, parseProjectConfig(arena.allocator(), try arena.allocator().dupeZ(u8, typo)));
+    const bad = try std.mem.replaceOwned(u8, arena.allocator(), source, "providers/tool.json", "../tool.json");
+    try std.testing.expectError(error.InvalidProviderConfigPath, parseProjectConfig(arena.allocator(), try arena.allocator().dupeZ(u8, bad)));
+    const missing = try parseProjectConfig(arena.allocator(), ".{ .name = \"game\" }");
+    try std.testing.expectEqual(@as(usize, 0), missing.provider_config.len);
 }

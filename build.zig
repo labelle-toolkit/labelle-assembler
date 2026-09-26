@@ -167,6 +167,8 @@ pub fn build(b: *std.Build) void {
     src_tests.root_module.addImport("flow_codegen", flow_codegen_module);
     src_tests.root_module.link_libc = true; // see assembler_exe comment above
     test_step.dependOn(&b.addRunArtifact(src_tests).step);
+    const provider_settings_tests = b.addTest(.{ .root_module = src_tests.root_module, .filters = &.{ "provider settings:", "parseProjectConfig:", "loadFromDir:", "loadPack" } });
+    b.step("test-provider-config", "Test shared provider settings and plugin v2 parsing").dependOn(&b.addRunArtifact(provider_settings_tests).step);
 
     // Subcommand tests — `src/main.zig` is the binary's root and reaches
     // the subcommand modules (`init_cmd`, `cache_cmd`) that `src/root.zig`
