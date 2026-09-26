@@ -15,7 +15,9 @@ const common = @import("common.zig");
 const language_policy = @import("../language_policy.zig");
 const plugin_params = @import("../plugin_params.zig");
 
-const SUPPORTED_MANIFEST_VERSION = common.SUPPORTED_MANIFEST_VERSION;
+// v2 adds CLI-owned provider commands/hooks; runtime declarations keep their
+// existing meaning. Pack manifests retain their independent v1 version gate.
+const SUPPORTED_MANIFEST_VERSION = common.SUPPORTED_PLUGIN_MANIFEST_VERSION;
 const RESERVED_DIR_NAMES = common.RESERVED_DIR_NAMES;
 const isReservedDirName = common.isReservedDirName;
 const isSafeDirName = common.isSafeDirName;
@@ -433,7 +435,7 @@ pub fn loadFromDir(
     // same way as an unknown future version.
     if (parsed.manifest_version < 1 or parsed.manifest_version > SUPPORTED_MANIFEST_VERSION) {
         std.debug.print(
-            "labelle: plugin '{s}' has manifest_version {d}\n  but this labelle-cli release supports manifest_version 1..{d}\n  fix the plugin.labelle manifest or upgrade/downgrade labelle-cli\n",
+            "labelle: plugin '{s}' has manifest_version {d}\n  but this labelle-assembler release supports manifest_version 1..{d}\n  fix the plugin.labelle manifest or upgrade/downgrade labelle-assembler\n",
             .{ expected_name, parsed.manifest_version, SUPPORTED_MANIFEST_VERSION },
         );
         return error.PluginManifestUnknownVersion;
@@ -1005,6 +1007,25 @@ test "loadFromDir: parses a valid manifest" {
     try testing.expectEqualStrings("state_machines", manifest.convention_dirs[0].name);
     try testing.expectEqualStrings(".zig", manifest.convention_dirs[0].extension.?);
     try testing.expectEqual(ConventionDirMode.copy_and_scan, manifest.convention_dirs[0].mode);
+}
+
+test "provider settings: plugin v2 keeps runtime declarations and leaves commands to CLI" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeManifestFile(tmp.dir,
+        \\.{ .name = "fixture", .manifest_version = 2,
+        \\   .command_contract = ">=1.0.0 <2.0.0", .namespace = "probe",
+        \\   .commands = .{ .{ .name = "inspect", .build_step = "tool", .executable = "bin/tool", .help = "Inspect" } },
+        \\   .convention_dirs = .{ .{ .name = "custom_data", .mode = .copy_only } },
+        \\}
+    );
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    var loaded = (try loadFromDir(testing.allocator, dir, "fixture")).?;
+    defer loaded.deinit();
+    try testing.expectEqual(@as(u8, 2), loaded.manifest_version);
+    try testing.expectEqualStrings("custom_data", loaded.convention_dirs[0].name);
+    try testing.expectEqual(@as(u8, 1), common.SUPPORTED_MANIFEST_VERSION);
 }
 
 test "loadFromDir: errors on name mismatch" {

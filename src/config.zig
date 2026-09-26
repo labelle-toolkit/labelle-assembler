@@ -1348,6 +1348,8 @@ pub const ProjectConfig = struct {
     /// When true, embed scene files into the binary via @embedFile (for release builds).
     /// Plugins — each declares its repo and version. Empty = no plugin deps.
     plugins: []const PluginDep = &.{},
+    /// Provider-owned JSON settings; shared with the CLI project schema.
+    provider_config: []const @import("provider_settings.zig").Entry = &.{},
 
     /// Game states for the state machine. Scripts in `scripts/<state>/` only run
     /// when that state is active. First element is the initial state.
