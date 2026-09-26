@@ -1028,6 +1028,39 @@ test "provider settings: plugin v2 keeps runtime declarations and leaves command
     try testing.expectEqual(@as(u8, 1), common.SUPPORTED_MANIFEST_VERSION);
 }
 
+test "provider settings: plugin v2 manifests with CLI hooks and targets still load (labelle-cli#406 phase 3a)" {
+    // labelle-cli RFC #406 phase 3a adds two CLI-only record shapes to
+    // plugin.labelle: `.hooks` (lifecycle hook records with enum-literal
+    // `.step`/`.when` and a nested `.after_hooks` tuple) and `.targets` (a
+    // tuple of strings). The assembler never reads either; both must ride
+    // the manifest-wide `ignore_unknown_fields` parse in loadFromDir with
+    // no schema change, leaving the runtime declarations intact.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeManifestFile(tmp.dir,
+        \\.{ .name = "fixture", .manifest_version = 2,
+        \\   .command_contract = ">=1.0.0 <2.0.0", .namespace = "probe",
+        \\   .commands = .{ .{ .name = "inspect", .build_step = "tool", .executable = "bin/tool", .help = "Inspect" } },
+        \\   .hooks = .{ .{ .id = "bundle", .step = .bundle, .target = "probe-target", .when = .replace, .build_step = "hook", .executable = "bin/hook", .after_hooks = .{} } },
+        \\   .targets = .{ "probe-target" },
+        \\   .convention_dirs = .{ .{ .name = "custom_data", .mode = .copy_only } },
+        \\}
+    );
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    var loaded = (try loadFromDir(testing.allocator, dir, "fixture")).?;
+    defer loaded.deinit();
+    try testing.expectEqual(@as(u8, 2), loaded.manifest_version);
+    try testing.expectEqualStrings("fixture", loaded.name);
+    try testing.expectEqual(@as(usize, 1), loaded.convention_dirs.len);
+    try testing.expectEqualStrings("custom_data", loaded.convention_dirs[0].name);
+    try testing.expectEqual(ConventionDirMode.copy_only, loaded.convention_dirs[0].mode);
+    // The ignore-unknown mechanism must not have widened the schema: the
+    // parsed manifest carries no hooks/targets declarations.
+    try testing.expect(!@hasField(ZonManifest, "hooks"));
+    try testing.expect(!@hasField(ZonManifest, "targets"));
+}
+
 test "loadFromDir: errors on name mismatch" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
