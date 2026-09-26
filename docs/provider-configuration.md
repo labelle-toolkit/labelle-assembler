@@ -8,10 +8,13 @@
 },
 ```
 
-Each row has exactly `package` and `file`. Package identities must be declared
-in `.plugins` and unique in the mapping. Files use project-relative paths with
-forward slashes; absolute/drive paths, backslashes, `..` and empty components
-are rejected. The mapping defaults to an empty list.
+Each row has exactly `package` and `file`. A package identity is a non-empty
+string that exactly matches a plugin `.name` declared in `.plugins`, and must be
+unique in the mapping. There is no separate character grammar: any name the
+plugin scanner accepts (including digit-leading ones such as `3d_renderer`) is
+valid here once declared; an undeclared name is rejected. Files use
+project-relative paths with forward slashes; absolute/drive paths, backslashes,
+`..` and empty components are rejected. The mapping defaults to an empty list.
 
 The assembler validates the mapping structure in its normal project parser,
 including projects whose plugin `.params` bags require extraction. It does not

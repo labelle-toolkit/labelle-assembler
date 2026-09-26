@@ -72,6 +72,7 @@
 
 const std = @import("std");
 const config = @import("config.zig");
+const provider_settings = @import("provider_settings.zig");
 
 // ============================================================================
 // Types
@@ -432,21 +433,56 @@ fn extractParamsBags(gpa: std.mem.Allocator, source: [:0]const u8) !?ExtractedBa
 /// parser's owned unexpected-field note is never freed (a std.zon quirk
 /// already noted in `config.zig`'s `PluginDep` tests).
 fn parseTyped(gpa: std.mem.Allocator, source: [:0]const u8) !config.ProjectConfig {
+    var diag: std.zon.parse.Diagnostics = .{};
+    defer diag.deinit(gpa);
+    return parseTypedDiag(gpa, source, &diag) catch |err| switch (err) {
+        error.ParseZon => {
+            // `warn`, not `err`: this is the DETAIL of a failure the command
+            // layer reports as an error (naming the file and the error). Logging
+            // it at `.err` here would also fail every test that deliberately
+            // parses a malformed config — Zig's test runner fails any test that
+            // logs an error.
+            std.log.warn("project.labelle: {f}", .{&diag});
+            return err;
+        },
+        else => return err,
+    };
+}
+
+/// The parse behind `parseTyped`, taking the caller's `Diagnostics` so a
+/// test can assert the typed parser's location/message actually lands there
+/// (#761 review). `parseTyped` is its only production caller.
+///
+/// The shared provider rules (`provider_settings.validateProject`) run
+/// BEFORE the typed parse: their intermediates are `zon.parse.free`-safe,
+/// unlike a parsed `ProjectConfig`, whose static defaults (e.g.
+/// `.states = &.{"running"}`) cannot be released on a later rejection. A
+/// `ParseZon` from that pass is deliberately NOT reported here: the same
+/// defect — malformed ZON anywhere in the file, or a type/unknown-field
+/// error inside `.provider_config` — fails the strict typed parse below,
+/// which owns the diagnostic (`line:col: error: …`) the command layer
+/// shows. Short-circuiting on it is what threw that diagnostic away.
+fn parseTypedDiag(
+    gpa: std.mem.Allocator,
+    source: [:0]const u8,
+    diag: *std.zon.parse.Diagnostics,
+) !config.ProjectConfig {
     // The typed ProjectConfig parse is comptime-heavy; the quota is
     // per-function-scope, so it has to live with the parse call itself.
     @setEvalBranchQuota(10000);
-    try @import("provider_settings.zig").validateProject(gpa, source);
-    var diag: std.zon.parse.Diagnostics = .{};
-    defer diag.deinit(gpa);
-    return std.zon.parse.fromSliceAlloc(config.ProjectConfig, gpa, source, &diag, .{}) catch |err| {
-        // `warn`, not `err`: this is the DETAIL of a failure the command
-        // layer reports as an error (naming the file and the error). Logging
-        // it at `.err` here would also fail every test that deliberately
-        // parses a malformed config — Zig's test runner fails any test that
-        // logs an error.
-        std.log.warn("project.labelle: {f}", .{&diag});
-        return err;
+    provider_settings.validateProject(gpa, source) catch |err| switch (err) {
+        error.ParseZon => {},
+        else => return err,
     };
+    const cfg = try std.zon.parse.fromSliceAlloc(config.ProjectConfig, gpa, source, diag, .{});
+    // Defensive: the pre-pass only ever drops a ParseZon the typed parse
+    // reproduces, so a source that reaches here has already passed the
+    // cross-field rules. Re-checking on the parsed rows (no allocation)
+    // guarantees that a source the pre-pass could not read never sneaks
+    // past validation. This is not expected to fire; if it ever does, `cfg`
+    // is not released (see the static-defaults note above).
+    try provider_settings.validate(cfg.provider_config, cfg.plugins);
+    return cfg;
 }
 
 /// Parse a `project.labelle` source into a `ProjectConfig`, tolerating
@@ -1463,6 +1499,39 @@ test "parseProjectConfig: a syntax error defers to the typed parser's own diagno
         \\.{ .name = "broken" .plugins = .{} }
     ;
     try testing.expectError(error.ParseZon, parseProjectConfig(testing.allocator, src));
+}
+
+test "parseProjectConfig: a malformed source still reaches the typed parser's diagnostic (#761 review)" {
+    // Both shapes make the pre-parse provider pass return a bare ParseZon:
+    // an unknown field INSIDE `.provider_config`, and broken ZON syntax
+    // elsewhere in the file. Before the fix `validateProject` short-circuited
+    // `parseTyped`, so the typed parse never ran and its Diagnostics stayed
+    // EMPTY — the command layer showed only the generic read failure. The
+    // mechanism under test is therefore "the typed parse ran and populated
+    // `diag`", not merely the error value (which was ParseZon both ways).
+    const cases = [_]struct { src: [:0]const u8, want: []const u8 }{
+        .{
+            .src = ".{ .name = \"g\", .plugins = .{ .{ .name = \"fixture\" } }, .provider_config = .{ .{ .package = \"fixture\", .file = \"p.json\", .typo = true } } }",
+            .want = "typo",
+        },
+        .{
+            .src = ".{ .name = \"broken\" .plugins = .{} }",
+            .want = ": error: ",
+        },
+    };
+    for (cases) |case| {
+        var diag: std.zon.parse.Diagnostics = .{};
+        defer diag.deinit(testing.allocator);
+        try testing.expectError(error.ParseZon, parseTypedDiag(testing.allocator, case.src, &diag));
+        const rendered = try std.fmt.allocPrint(testing.allocator, "{f}", .{&diag});
+        defer testing.allocator.free(rendered);
+        // `Diagnostics.format` renders `line:col: error: message` per error.
+        try testing.expect(std.mem.startsWith(u8, rendered, "1:"));
+        try testing.expect(std.mem.indexOf(u8, rendered, ": error: ") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, case.want) != null);
+        // And the public entry still reports the same failure for the source.
+        try testing.expectError(error.ParseZon, parseProjectConfig(testing.allocator, case.src));
+    }
 }
 
 // ── layer 2: schema parse ────────────────────────────────────────────

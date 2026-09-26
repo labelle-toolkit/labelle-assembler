@@ -19,10 +19,7 @@ pub fn validateProject(a: std.mem.Allocator, source: [:0]const u8) !void {
 
 pub fn validate(entries: []const Entry, plugins: anytype) !void {
     for (entries, 0..) |entry, i| {
-        if (entry.package.len == 0 or !std.ascii.isLower(entry.package[0])) return error.InvalidProviderConfigPackage;
-        for (entry.package) |c| {
-            if (!std.ascii.isLower(c) and !std.ascii.isDigit(c) and c != '-' and c != '_') return error.InvalidProviderConfigPackage;
-        }
+        if (entry.package.len == 0) return error.InvalidProviderConfigPackage;
         if (entry.file.len == 0 or entry.file[0] == '/' or std.mem.indexOfAny(u8, entry.file, "\\:\x00") != null)
             return error.InvalidProviderConfigPath;
         var parts = std.mem.splitScalar(u8, entry.file, '/');
@@ -74,6 +71,13 @@ test "provider settings: strict mapping, declarations and portable paths" {
     try std.testing.expectError(error.ParseZon, parse(a, ".{ .provider_config = .{ .{ .package = \"fixture\", .file = \"x\", .typo = true } } }"));
     try std.testing.expectError(error.DuplicateProviderConfig, validate(&.{ entries[0], entries[0] }, &plugins));
     try std.testing.expectError(error.UndeclaredProviderConfig, validate(entries, plugins[0..0]));
+    // The package rule is exact match against a declared plugin, nothing
+    // narrower: a digit-leading name the scanner accepts (sanitize.zig) is
+    // valid once declared, and only its absence from `.plugins` rejects it.
+    const digit_led = [_]Entry{.{ .package = "3d_renderer", .file = "providers/renderer.json" }};
+    try validate(&digit_led, &[_]struct { name: []const u8 }{.{ .name = "3d_renderer" }});
+    try std.testing.expectError(error.UndeclaredProviderConfig, validate(&digit_led, &plugins));
+    try std.testing.expectError(error.InvalidProviderConfigPackage, validate(&.{.{ .package = "", .file = "providers/x.json" }}, &plugins));
     for ([_][]const u8{ "", "../escape.json", "/absolute", "C:/absolute", "a\\b.json", "a//b.json" }) |path| {
         try std.testing.expectError(error.InvalidProviderConfigPath, validate(&.{.{ .package = "fixture", .file = path }}, &plugins));
     }
