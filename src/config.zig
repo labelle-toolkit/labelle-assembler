@@ -1504,7 +1504,13 @@ pub const ProjectConfig = struct {
             //
             // 0.7.0 adds only the Android launch-intent `LABELLE_*` extras
             // (labelle-sokol#26); same core/gfx pins as 0.6.x.
-            .sokol => .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.7.0" },
+            //
+            // 0.8.0 adopts labelle-android v0.2.0 (shared AAudio + launch
+            // intent) and the `android` provider flow; its build hook links ONE
+            // `labelle_android` when the project lists the `android` plugin
+            // (cli#405 D11). Same core (1.32.0) / gfx (1.28.1) pins as 0.7.0,
+            // so no `version_floors` entry. Needs assembler >= 0.116.1.
+            .sokol => .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.8.0" },
         };
     }
 
