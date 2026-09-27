@@ -120,7 +120,7 @@ pub fn createDepsLinks(
     // `resolveBundledPackage` call (#688 review). Probing the slot through
     // the same resolver the deps use keeps the two in step.
     {
-        const asm_ver = cfg.assembler_version orelse cfg.labelle_version;
+        const asm_ver = config.assemblerPackageVersion(cfg.assembler_version);
         if (!config.isLocalVersion(asm_ver)) {
             const bundled = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, "backends");
             defer allocator.free(bundled);
@@ -716,9 +716,9 @@ test "rewriteZonPaths: rewrites relative path deps" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io,"project/libs/needs_machine");
-    try tmp.dir.createDirPath(std.testing.io,"project/.labelle/deps/labelle-needs_machine");
-    try tmp.dir.createDirPath(std.testing.io,"labelle-fsm");
+    try tmp.dir.createDirPath(std.testing.io, "project/libs/needs_machine");
+    try tmp.dir.createDirPath(std.testing.io, "project/.labelle/deps/labelle-needs_machine");
+    try tmp.dir.createDirPath(std.testing.io, "labelle-fsm");
 
     const zon_content =
         \\.{
@@ -761,8 +761,8 @@ test "rewriteZonPaths: skips files without .path deps" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io,"src");
-    try tmp.dir.createDirPath(std.testing.io,"dest");
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.createDirPath(std.testing.io, "dest");
 
     const zon_content =
         \\.{
@@ -803,7 +803,7 @@ test "hardlinkTree: errors on missing source" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io,"dest_parent");
+    try tmp.dir.createDirPath(std.testing.io, "dest_parent");
     const dest_parent = try tmp.dir.realPathFileAlloc(std.testing.io, "dest_parent", alloc);
     defer alloc.free(dest_parent);
 

@@ -220,8 +220,21 @@ pub const GFX_VERSION = @import("build_options").gfx_version;
 
 /// This assembler binary's own version — stamped into `assembler_version`
 /// of a freshly scaffolded project.labelle by the `init` subcommand.
-/// Defaults to the package version (build.zig.zon) via build options.
+/// Release builds stamp the tag via build options; other builds use 0.0.0-dev.
 pub const ASSEMBLER_VERSION = @import("build_options").assembler_version;
+
+/// Bundled adapter sources belong to the assembler release, not the CLI.
+/// Keep explicit release/local pins; unpinned projects use this binary's stamp.
+pub fn assemblerPackageVersion(pin: ?[]const u8) []const u8 {
+    return pin orelse ASSEMBLER_VERSION;
+}
+
+test "assembler package selection is independent of the CLI version" {
+    const cfg = ProjectConfig{ .name = "clean-home", .labelle_version = "1.61.2" };
+    try std.testing.expectEqualStrings(ASSEMBLER_VERSION, assemblerPackageVersion(cfg.assembler_version));
+    try std.testing.expectEqualStrings("0.116.0", assemblerPackageVersion("0.116.0"));
+    try std.testing.expectEqualStrings("local:../assembler", assemblerPackageVersion("local:../assembler"));
+}
 
 /// A plugin dependency declared in project.labelle.
 /// Plugins are external packages with a repo URL and version tag.

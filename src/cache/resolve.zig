@@ -83,12 +83,11 @@ pub fn resolveAssemblerPackage(allocator: std.mem.Allocator, assembler_version: 
 
 /// Resolve a bundled package (backend/ecs/gui) from the assembler cache slot.
 ///
-/// `cli_version` is accepted as the fallback version key for callers that
-/// don't have `assembler_version` set yet — in production both versions ship
-/// together, and during monorepo dev users can point each at a different
-/// sibling repo via `local:` paths.
+/// `cli_version` is retained for source compatibility with callers; CLI and
+/// assembler releases are independent and cannot share a source-cache key.
 pub fn resolveBundledPackage(allocator: std.mem.Allocator, cli_version: []const u8, assembler_version: ?[]const u8, project_dir: ?[]const u8, subpath: []const u8) ![]const u8 {
-    const asm_ver = assembler_version orelse cli_version;
+    _ = cli_version;
+    const asm_ver = config.assemblerPackageVersion(assembler_version);
     return resolveAssemblerPackage(allocator, asm_ver, project_dir, subpath);
 }
 
@@ -469,10 +468,8 @@ pub fn validateCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) ![
     }
 
     // Assembler-bundled packages (backends, ecs, gui).
-    // Mirrors ensureCache in labelle-cli: asm_ver = assembler_version orelse
-    // labelle_version. When the two differ (e.g. pinned assembler version),
-    // we must probe the slot keyed by asm_ver, not labelle_version.
-    const asm_ver = cfg.assembler_version orelse cfg.labelle_version;
+    // Use the same assembler release selection as install and dependency linking.
+    const asm_ver = config.assemblerPackageVersion(cfg.assembler_version);
     if (!try isAssemblerCached(allocator, asm_ver)) {
         try missing.append(allocator, try std.fmt.allocPrint(allocator, "assembler {s}", .{asm_ver}));
     }

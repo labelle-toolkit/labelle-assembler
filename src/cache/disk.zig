@@ -499,7 +499,7 @@ pub fn purgeLegacyLocalSlots(allocator: std.mem.Allocator, cfg: config.ProjectCo
     // The assembler slot is a real directory whose backends/ecs/gui SUBDIRS
     // were symlinked out of the monorepo. Drop the whole slot when any of
     // them is a link, so the release is re-fetched intact.
-    const asm_ver = cfg.assembler_version orelse cfg.labelle_version;
+    const asm_ver = config.assemblerPackageVersion(cfg.assembler_version);
     if (!config.isLocalVersion(asm_ver)) blk: {
         const slot = std.fs.path.join(allocator, &.{ packages_dir, "assembler", asm_ver }) catch break :blk;
         defer allocator.free(slot);
