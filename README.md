@@ -47,6 +47,13 @@ The binary is written to `zig-out/bin/labelle-assembler`.
 | `--platform <name>` | Override target platform (`desktop`, `wasm`, `ios`, `android`) |
 | `--backend <name>` | Override graphics backend (`raylib`, `sokol`, `sdl`, `bgfx`, `wgpu`, `null`) |
 
+A `project.labelle` with no `.backend` (and no `.backend_package`) builds
+with **bgfx** on desktop, the same default `labelle-assembler init`
+scaffolds. Before v0.117.0 the implicit default was raylib; a project that
+relied on it must now declare `.backend = .raylib`. The bgfx default
+needs `.core_version` >= 2.1.0, and `generate` refuses an older core with a
+diagnostic that names the floor.
+
 The `null` backend is a headless test/CI backend with no graphics, audio,
 input, or window subsystem — every backend module is a no-op stub. The
 generated `main()` runs the engine's tick loop for `LABELLE_NULL_FRAMES`

@@ -74,13 +74,21 @@ pub fn build(b: *std.Build) void {
     // 0.21.0 → 2.0.0 floor and its "scaffold core default pairs with the
     // builtin bgfx provider" test asserts the pairing; `checkTrioFloors`
     // asserts the trio.
+    //
+    // core 2.1.0 / gfx 2.2.0 / engine 3.4.1 (2026-09-27, `init` defaults to
+    // bgfx): the builtin `.bgfx` provider moved to labelle-bgfx 0.30.0,
+    // whose material path switches over core's `Blend.modulate2x` — a tag
+    // only core >= 2.1.0 declares (bgfx >= 0.26.0 pins core 2.1.0). gfx
+    // 2.2.0 and engine 3.4.1 are the latest releases on the 2.x line; their
+    // build.zig.zon pins (gfx → core 2.0.0, engine → gfx 2.0.0) sit below
+    // this set, which the trio floors allow.
     // Bump all three together when moving the engine default (their
     // build.zig.zon pins/floors must agree — read them from the tags), and
     // keep `src/init_cmd.zig`'s "scaffold pins a MUTUALLY COMPATIBLE trio"
     // test satisfied — it encodes the floors below as assertions.
-    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "2.0.0";
-    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "3.0.1";
-    const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "2.0.0";
+    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "2.1.0";
+    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "3.4.1";
+    const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "2.2.0";
     // Version this assembler binary stamps into a freshly scaffolded
     // project.labelle's `assembler_version` field.
     //

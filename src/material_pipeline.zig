@@ -21,7 +21,7 @@ pub const schema = @import("material_schema.zig");
 /// `.raylib` default is rejected; declare `.backend = .bgfx` alongside the
 /// package. There is no material capability in the provider manifest yet.
 pub fn requireBackend(cfg: config.ProjectConfig) error{UnsupportedMaterialBackend}!void {
-    switch (cfg.backend) {
+    switch (cfg.effectiveBackend()) {
         .bgfx, .null => {},
         else => return error.UnsupportedMaterialBackend,
     }
@@ -67,7 +67,7 @@ pub fn toolchain(cfg: config.ProjectConfig) schema.Toolchain {
     return if (new) schema.toolchain_api161 else schema.toolchain_api142;
 }
 pub fn contractViolation(cfg: config.ProjectConfig) error{UnparsableVersionPin}!?ContractViolation {
-    if (cfg.backend != .bgfx) return null;
+    if (cfg.effectiveBackend() != .bgfx) return null;
     if (cfg.effectiveBackendPackage()) |bp| {
         // The 0.21.0 floor is a fact about the OFFICIAL labelle-bgfx release
         // train only. A custom provider (`.backend_package` on another repo)

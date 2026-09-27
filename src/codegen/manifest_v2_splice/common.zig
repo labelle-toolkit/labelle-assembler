@@ -299,9 +299,13 @@ test "depOptionValue: gamepad_enabled routes through effectiveGamepad (assembler
 
 test "depOptionValue: closed predicate set matches the v1 paramValue predicates" {
     const base_cfg = ProjectConfig{ .name = "g" };
-    // Default backend is raylib; absent `.gamepad` resolves to .auto →
-    // gamepad_enabled true; hidapi false; no gui → false.
-    try testing.expectEqualStrings("true", depOptionValue(.gamepad_enabled, base_cfg));
+    // Default backend is bgfx (an absent `.backend` since 2026-09-27); an
+    // absent `.gamepad` on bgfx resolves to .none → gamepad_enabled false;
+    // hidapi false; no gui → false.
+    try testing.expectEqual(config.Backend.bgfx, base_cfg.effectiveBackend());
+    try testing.expectEqualStrings("false", depOptionValue(.gamepad_enabled, base_cfg));
+    // An explicit raylib keeps the historical `.auto` → true.
+    try testing.expectEqualStrings("true", depOptionValue(.gamepad_enabled, ProjectConfig{ .name = "g", .backend = .raylib }));
     try testing.expectEqualStrings("false", depOptionValue(.gamepad_hidapi, base_cfg));
     try testing.expectEqualStrings("false", depOptionValue(.gui_is_imgui, base_cfg));
     try testing.expectEqualStrings("true", depOptionValue(.true_literal, base_cfg));
