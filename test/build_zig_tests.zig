@@ -177,8 +177,11 @@ pub const MANIFEST_V2_ANDROID_GOLDEN = struct {
         try std.testing.expect(std.mem.indexOf(u8, out, "sokol_clib.root_module.pic = true;") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "lib.root_module.linkSystemLibrary(\"GLESv3\", .{})") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "lib.root_module.link_libc = true;") != null);
-        // APK packaging delegated to the shared packager (byte-identical section).
-        try std.testing.expect(std.mem.indexOf(u8, out, "Package and sign Android APK") != null);
+        // No generated APK packaging: the labelle-android provider packages
+        // (labelle-cli#405), so there is no `zig build package` step.
+        try std.testing.expect(std.mem.indexOf(u8, out, "Package and sign Android APK") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.step(\"package\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "apksigner") == null);
         // The enum-path inline NDK detection is GONE from the generated build.zig —
         // it lives in the hook now (the documented enum-vs-v2 boundary).
         try std.testing.expect(std.mem.indexOf(u8, out, "fn getAndroidNdkSysroot(") == null);
@@ -1044,7 +1047,8 @@ pub const BUILD_ZIG = struct {
     test "bgfx android builds a NativeActivity shared library, not a glfw exe" {
         // Drives the v2 bgfx-Android codegen (the enum path is gone). The bgfx v2
         // fixture ships the android platform entry (`android_app` extra module
-        // aliased to `backend_app`, the NDK system libs, apk packaging).
+        // aliased to `backend_app`, the NDK system libs, the `.apk` recipe —
+        // a no-op since labelle-cli#405).
         const build_zig = try h.genBgfxV2BuildZig(std.testing.allocator, .{
             .name = "test-game",
             .platform = .android,
@@ -1070,8 +1074,10 @@ pub const BUILD_ZIG = struct {
 
         // Desktop-only zglfw must NOT appear — it doesn't build for Android.
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "glfw_artifact") == null);
-        // And the APK packaging step is wired in.
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "Package and sign Android APK") != null);
+        // And NO APK packaging step: the labelle-android provider packages
+        // (labelle-cli#405).
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.step(\"package\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "apksigner") == null);
     }
 
     test "external backend named ONLY by string (no matching tag) still needs a manifest (#386)" {
@@ -1973,8 +1979,11 @@ pub const MANIFEST_V2_BGFX_ANDROID_GOLDEN = struct {
         try std.testing.expect(std.mem.indexOf(u8, out, "lib.root_module.linkSystemLibrary(\"aaudio\", .{})") != null);
         // NO glfw on android (zglfw is desktop-only, #303).
         try std.testing.expect(std.mem.indexOf(u8, out, "artifact(\"glfw\")") == null);
-        // APK packaging delegated to the shared packager (byte-identical section).
-        try std.testing.expect(std.mem.indexOf(u8, out, "Package and sign Android APK") != null);
+        // No generated APK packaging: the labelle-android provider packages
+        // (labelle-cli#405), so there is no `zig build package` step.
+        try std.testing.expect(std.mem.indexOf(u8, out, "Package and sign Android APK") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.step(\"package\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "apksigner") == null);
         // The enum-path inline NDK detection is GONE — it lives in the hook now.
         try std.testing.expect(std.mem.indexOf(u8, out, "fn getAndroidNdkSysroot(") == null);
     }

@@ -1447,7 +1447,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             }
         }
 
-        // Packaging: v2 delegates the `.apk` recipe to the shared packager.
+        // Packaging: v2 delegates the `.apk` recipe to the shared packager,
+        // which emits nothing for it — the labelle-android provider packages
+        // the APK (labelle-cli#405).
         try manifest_v2_splice.renderPackageV2(manifest, cfg.platform, w);
         try tpl.writeSection(build_zig_tmpl, "android_footer", w);
 
