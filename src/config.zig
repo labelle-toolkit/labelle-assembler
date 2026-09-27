@@ -332,8 +332,9 @@ pub const PluginDep = struct {
 
 /// Screen-orientation policy for the mobile platforms.
 ///
-/// The CLI maps these onto `android:screenOrientation` / the iOS
-/// `UISupportedInterfaceOrientations` plist array; this enum only has to
+/// The CLI maps these onto the iOS `UISupportedInterfaceOrientations` plist
+/// array (Android orientation moved to `providers/android.json`, owned by the
+/// labelle-android provider — labelle-cli#405); this enum only has to
 /// *parse* — `project.labelle` is parsed strictly, so a value the CLI knows
 /// and the assembler doesn't fails at generate time before the CLI ever sees
 /// it. Both copies must move together (labelle-cli#341/#342).
@@ -375,45 +376,26 @@ pub const I18nConfig = struct {
     strict: bool = false,
 };
 
+/// The project.labelle `.android` block: ONLY the keys the assembler's
+/// codegen reads (labelle-cli#405, plan decision D4). Every APK-packaging key
+/// (`package_name`, `app_name`, `min_sdk_version`, `orientation`,
+/// `debuggable`, `version_name`, signing, …) lives in `providers/android.json`,
+/// owned by the labelle-android provider; a strict parse that meets one fails
+/// with a "move it" hint (`android_moved_keys.zig`).
 pub const AndroidConfig = struct {
+    /// Load resources from APK assets on acquisition (#763).
     /// Requires a packager that consumes apk_assets.json and deflates its files.
     /// Opt-in until labelle-android packaging supports that contract.
     load_assets_from_apk: bool = false,
-    app_name: []const u8 = "",
-    package_name: []const u8 = "", // e.g. "com.labelle.mygame"
-    min_sdk_version: u32 = 28, // Android 9 (Pie) — NativeActivity + GLES3
+    /// The NDK link level of the generated `build.zig`
+    /// (`manifest_v2_splice/android.zig`). The provider reads its own
+    /// `target_sdk_version` for the APK manifest.
     target_sdk_version: u32 = 34, // Android 14
-    orientation: Orientation = .all,
-    /// Launch the game fullscreen with the status bar and title bar
-    /// hidden, via the built-in `Theme.NoTitleBar.Fullscreen` Android
-    /// framework theme (no custom APK resources required).
-    ///
-    /// Scope: this covers the **status bar** and title bar only. It does
-    /// NOT hide the Android **navigation bar** (the on-screen
-    /// back/home/recents buttons) — true immersive-sticky nav-bar hiding
-    /// requires runtime native code (JNI `WindowInsetsController` calls)
-    /// and is a planned follow-up.
+    /// Launch the game fullscreen. The assembler emits
+    /// `engine.android.enableImmersiveMode()` into the generated `main.zig`
+    /// (`lifecycle/callback.zig`, `lifecycle/render.zig`); the labelle-android
+    /// provider reads the same key for the fullscreen theme.
     immersive_mode: bool = false,
-    /// Build the APK `android:debuggable` (labelle-assembler#737).
-    ///
-    /// OPT-IN, off by default — a shipping build must never carry it. Its only
-    /// purpose is on-device VERIFICATION: an activity launched normally inherits
-    /// zygote's environment, so the `LABELLE_*` knobs the desktop path already
-    /// honours (`LABELLE_FIXED_DT`, `LABELLE_SCREENSHOT_PATH`) cannot reach the
-    /// process at all. The platform's `wrap.<package>` property CAN give the
-    /// process a real environment, but it is honoured only for a debuggable app.
-    ///
-    /// With this set, `adb shell setprop wrap.<package> 'LABELLE_FIXED_DT=… '`
-    /// pins the simulation timestep and `LABELLE_SCREENSHOT_PATH` makes the
-    /// engine-owned capture path write a frame the harness can `adb pull` —
-    /// which is what makes two captures at the same simulated time byte-identical.
-    /// Without it, on-device checking falls back to `adb screencap` at wall-clock
-    /// times: a display colour transform on some devices, and ~1s of latency.
-    ///
-    /// The flag only reaches the generated `AndroidManifest.xml` (labelle-cli);
-    /// the generated `main.zig` reads the env vars unconditionally, because on a
-    /// non-debuggable APK they are simply never set.
-    debuggable: bool = false,
 };
 
 pub const LayerSpace = enum { world, screen, screen_fill };
@@ -1793,25 +1775,39 @@ test "effectiveGamepad: bgfx defaults to .none, other backends to .auto, explici
     }
 }
 
-test "AndroidConfig.debuggable is off by default and parses from the android block (#737)" {
-    // Off by default: a shipping APK must never carry `android:debuggable`.
-    try std.testing.expect(!(AndroidConfig{}).debuggable);
+test "AndroidConfig: exactly the three codegen keys parse, with their defaults (labelle-cli#405)" {
     const alloc = std.testing.allocator;
-    const on = try std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, ".{ .package_name = \"com.labelle.t\", .debuggable = true }", null, .{});
-    defer std.zon.parse.free(alloc, on);
-    try std.testing.expect(on.debuggable);
-    // Projects that never mention it keep the release shape.
-    const off = try std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, ".{ .package_name = \"com.labelle.t\" }", null, .{});
-    defer std.zon.parse.free(alloc, off);
-    try std.testing.expect(!off.debuggable);
+    try std.testing.expectEqual(@as(usize, 3), @typeInfo(AndroidConfig).@"struct".fields.len);
+    const d: AndroidConfig = .{};
+    try std.testing.expect(!d.immersive_mode);
+    try std.testing.expect(!d.load_assets_from_apk);
+    try std.testing.expectEqual(@as(u32, 34), d.target_sdk_version);
+
+    const a = try std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, ".{ .immersive_mode = true, .target_sdk_version = 35, .load_assets_from_apk = true }", null, .{});
+    defer std.zon.parse.free(alloc, a);
+    try std.testing.expect(a.immersive_mode);
+    try std.testing.expect(a.load_assets_from_apk);
+    try std.testing.expectEqual(@as(u32, 35), a.target_sdk_version);
 }
 
-test "Orientation: every value parses from ZON on BOTH the android and ios blocks (labelle-cli#341)" {
+test "AndroidConfig: a removed packaging key is a strict parse error (labelle-cli#405)" {
+    const alloc = std.testing.allocator;
+    inline for (.{ "package_name = \"com.labelle.t\"", "app_name = \"G\"", "min_sdk_version = 28", "orientation = .landscape", "debuggable = true" }) |kv| {
+        var diag: std.zon.parse.Diagnostics = .{};
+        defer diag.deinit(alloc);
+        try std.testing.expectError(
+            error.ParseZon,
+            std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, ".{ ." ++ kv ++ " }", &diag, .{}),
+        );
+    }
+}
+
+test "Orientation: every value parses from ZON on the ios block (labelle-cli#341)" {
     // The assembler parses `project.labelle` strictly, so it is the gate: a
     // value the CLI's manifest emitter understands but this enum lacks fails
-    // at generate time, before the CLI is ever reached. Pin all four on both
-    // structs so the two copies of `Orientation` can't drift apart silently.
-    // Arena, not `std.zon.parse.free`: both structs carry `[]const u8` fields
+    // at generate time, before the CLI is ever reached. (Android orientation
+    // moved to providers/android.json, labelle-cli#405.)
+    // Arena, not `std.zon.parse.free`: IosConfig carries `[]const u8` fields
     // that default to a static `""`, and freeing those through the testing
     // allocator aborts on a bad free.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1824,9 +1820,6 @@ test "Orientation: every value parses from ZON on BOTH the android and ios block
         .{ "all", Orientation.all },
     }) |case| {
         const src: [:0]const u8 = ".{ .orientation = ." ++ case[0] ++ " }";
-        const android = try std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, src, null, .{});
-        try std.testing.expectEqual(case[1], android.orientation);
-
         const ios = try std.zon.parse.fromSliceAlloc(IosConfig, alloc, src, null, .{});
         try std.testing.expectEqual(case[1], ios.orientation);
     }
@@ -1834,13 +1827,12 @@ test "Orientation: every value parses from ZON on BOTH the android and ios block
 
 test "Orientation: defaults stay `.all` and an unknown value is a hard parse error" {
     const alloc = std.testing.allocator;
-    try std.testing.expectEqual(Orientation.all, (AndroidConfig{}).orientation);
     try std.testing.expectEqual(Orientation.all, (IosConfig{}).orientation);
 
     var diag: std.zon.parse.Diagnostics = .{};
     defer diag.deinit(alloc);
     try std.testing.expectError(
         error.ParseZon,
-        std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, ".{ .orientation = .sensorLandscape }", &diag, .{}),
+        std.zon.parse.fromSliceAlloc(IosConfig, alloc, ".{ .orientation = .sensorLandscape }", &diag, .{}),
     );
 }

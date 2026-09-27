@@ -73,6 +73,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const provider_settings = @import("provider_settings.zig");
+const android_moved_keys = @import("android_moved_keys.zig");
 
 // ============================================================================
 // Types
@@ -474,6 +475,10 @@ fn parseTypedDiag(
         error.ParseZon => {},
         else => return err,
     };
+    // `.android` packaging keys moved to providers/android.json
+    // (labelle-cli#405): name the key and its new home instead of the typed
+    // parse's bare "unexpected field". Malformed ZON is left to the typed parse.
+    try android_moved_keys.check(gpa, source);
     const cfg = try std.zon.parse.fromSliceAlloc(config.ProjectConfig, gpa, source, diag, .{});
     // Defensive: the pre-pass only ever drops a ParseZon the typed parse
     // reproduces, so a source that reaches here has already passed the
@@ -1881,4 +1886,48 @@ test "provider settings: real project parser preserves mapping through params ex
     try std.testing.expectError(error.InvalidProviderConfigPath, parseProjectConfig(arena.allocator(), try arena.allocator().dupeZ(u8, bad)));
     const missing = try parseProjectConfig(arena.allocator(), ".{ .name = \"game\" }");
     try std.testing.expectEqual(@as(usize, 0), missing.provider_config.len);
+}
+
+test "parseProjectConfig: a moved `.android` packaging key fails with the provider hint (labelle-cli#405)" {
+    // The mechanism under test is the moved-key pre-pass, not merely "the
+    // parse failed": the typed parse would reject these keys too, but as a
+    // bare ParseZon. A distinct error proves the hinting path ran.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const removed = [_][:0]const u8{
+        ".{ .name = \"g\", .android = .{ .package_name = \"com.labelle.g\" } }",
+        ".{ .name = \"g\", .android = .{ .app_name = \"G\" } }",
+        ".{ .name = \"g\", .android = .{ .min_sdk_version = 28 } }",
+        ".{ .name = \"g\", .android = .{ .orientation = .landscape } }",
+        ".{ .name = \"g\", .android = .{ .debuggable = true } }",
+        ".{ .name = \"g\", .android = .{ .version_name = \"1.0\" } }",
+        ".{ .name = \"g\", .android = .{ .immersive_mode = true, .signing = .{ .keystore = \"k.jks\" } } }",
+        // Also through the `.params` extraction path.
+        ".{ .name = \"g\", .plugins = .{ .{ .name = \"p\", .version = \"1.0.0\", .params = .{ .x = 1 } } }, .android = .{ .package_name = \"com.labelle.g\" } }",
+    };
+    for (removed) |src| {
+        try testing.expectError(error.AndroidKeyMovedToProvider, parseProjectConfig(arena.allocator(), src));
+    }
+}
+
+test "parseProjectConfig: the three kept `.android` codegen keys still parse (labelle-cli#405)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src: [:0]const u8 =
+        \\.{
+        \\    .name = "android-game",
+        \\    .android = .{ .immersive_mode = true, .target_sdk_version = 35, .load_assets_from_apk = true },
+        \\}
+    ;
+    const cfg = try parseProjectConfig(arena.allocator(), src);
+    const android = cfg.android.?;
+    try testing.expect(android.immersive_mode);
+    try testing.expect(android.load_assets_from_apk);
+    try testing.expectEqual(@as(u32, 35), android.target_sdk_version);
+
+    // A typo that was never a packaging key keeps the typed parse's error.
+    try testing.expectError(
+        error.ParseZon,
+        parseProjectConfig(arena.allocator(), ".{ .name = \"g\", .android = .{ .immersiv_mode = true } }"),
+    );
 }

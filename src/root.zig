@@ -90,6 +90,7 @@ test {
     _ = @import("pack_resources.zig");
     _ = @import("language_policy.zig");
     _ = @import("plugin_params.zig");
+    _ = @import("android_moved_keys.zig");
     _ = @import("scripting_splice.zig");
     _ = @import("scripting_declare.zig");
     _ = @import("scripting_transpile.zig");
