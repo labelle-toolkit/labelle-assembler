@@ -858,6 +858,16 @@ test "scaffold core default pairs with the builtin bgfx provider — #731 review
     try checkBgfxProviderFloors(config.CORE_VERSION, bgfx.version);
 }
 
+test "builtin sokol 0.8.0 carries no core floor — same core/gfx pins as 0.7.0" {
+    // labelle-sokol v0.8.0 only adds labelle-android v0.2.0; its build.zig.zon
+    // keeps core 1.32.0 / gfx 1.28.1 and its material seam is probe-gated from
+    // core 1.25.0 up, so neither the scaffold core nor an older pin is floored.
+    const sokol = config.ProjectConfig.builtinProvider(.sokol) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("0.8.0", sokol.version);
+    try std.testing.expect((try backendCoreFloorViolation("sokol", config.CORE_VERSION)) == null);
+    try std.testing.expect((try backendCoreFloorViolation("sokol", "1.32.0")) == null);
+}
+
 test "bgfx-provider floors reject the #731 pairings" {
     try checkBgfxProviderFloors("2.1.0", "0.30.0"); // the curated pairing (init defaults to bgfx)
     try checkBgfxProviderFloors("2.1.0", "0.26.0"); // the first provider on the 2.1.0 floor
