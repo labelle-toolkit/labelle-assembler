@@ -1207,7 +1207,12 @@ pub const ProjectConfig = struct {
     width: u32 = 800,
     height: u32 = 600,
     target_fps: u32 = 60,
-    backend: Backend = .raylib,
+    /// The built-in backend tag. OPTIONAL so an ABSENT `.backend` is
+    /// distinguishable from an explicit one: read it through
+    /// `effectiveBackend()`, never directly. An absent `.backend` (and no
+    /// `.backend_package`) resolves to `default_backend` — bgfx since
+    /// 2026-09-27; it was raylib before. See `effectiveBackend`.
+    backend: ?Backend = null,
     /// External graphics backend declared by NAME + package (epic #386 Phase 5,
     /// the open-config seam). When set, the backend is *external*: it is named
     /// and located through the plugin-resolution infra (the registry +
@@ -1464,7 +1469,16 @@ pub const ProjectConfig = struct {
             // `.backend_package` explicitly (<= 0.20.0) rather than ride the
             // default — and cannot own materials (`material_pipeline`
             // rejects that pairing at generate time).
-            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.22.0" },
+            //
+            // 0.30.0 (the default `init` backend since 2026-09-27): bgfx
+            // >= 0.26.0 switches exhaustively over core's material `Blend`
+            // with a `.modulate2x` arm (`materialBlendState`), a tag only
+            // core >= v2.1.0 declares, and pins core 2.1.0 in its
+            // build.zig.zon — so the scaffold trio moved to core 2.1.0 /
+            // engine 3.4.1 / gfx 2.2.0 in the same change, and
+            // `version_floors.bgfx_core_floors` carries the 0.26.0 → 2.1.0
+            // floor.
+            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.30.0" },
             .wgpu => .{ .name = "wgpu", .repo = "github.com/labelle-toolkit/labelle-wgpu", .version = "0.3.0" },
             .null => .{ .name = "null", .repo = "github.com/labelle-toolkit/labelle-null", .version = "0.3.0" },
             .sdl => .{ .name = "sdl", .repo = "github.com/labelle-toolkit/labelle-sdl", .version = "0.3.1" },
@@ -1487,7 +1501,10 @@ pub const ProjectConfig = struct {
             // v1.25.0) and everything it needs from a LATER core carries its own
             // comptime probe, so 0.6.0 compiles against old and new core alike —
             // labelle-sokol's own examples still pin core 1.24.0.
-            .sokol => .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.6.1" },
+            //
+            // 0.7.0 adds only the Android launch-intent `LABELLE_*` extras
+            // (labelle-sokol#26); same core/gfx pins as 0.6.x.
+            .sokol => .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.7.0" },
         };
     }
 
@@ -1499,7 +1516,31 @@ pub const ProjectConfig = struct {
     /// `backend_registry.resolveBackendPackage` all agree on whether a backend
     /// is external and which package it is.
     pub fn effectiveBackendPackage(self: ProjectConfig) ?PluginDep {
-        return self.backend_package orelse builtinProvider(self.backend);
+        return self.backend_package orelse builtinProvider(self.effectiveBackend());
+    }
+
+    /// The backend a project with NO `.backend` key (and no
+    /// `.backend_package`) gets: desktop + bgfx, the same default
+    /// `labelle-assembler init` scaffolds. BREAKING vs. the old implicit
+    /// raylib default — a project that relied on it must add
+    /// `.backend = .raylib`.
+    pub const default_backend: Backend = .bgfx;
+
+    /// The enum tag this config selects. THE accessor for `.backend` —
+    /// every reader goes through it:
+    ///
+    ///   * an explicit `.backend = .<tag>` wins;
+    ///   * absent, with an explicit `.backend_package`: the tag is IGNORED
+    ///     (the package names the backend, #386 Phase 5) and reads as the
+    ///     legacy `.raylib` sentinel, exactly as it did before the default
+    ///     moved — so a third-party provider's `effectiveGamepad` /
+    ///     `isEnumTagBacked` / `material_pipeline.requireBackend` behaviour
+    ///     is unchanged by the default flip;
+    ///   * absent, with no package: `default_backend` (bgfx).
+    pub fn effectiveBackend(self: ProjectConfig) Backend {
+        if (self.backend) |b| return b;
+        if (self.backend_package != null) return .raylib;
+        return default_backend;
     }
 
     /// The canonical backend NAME as a string (e.g. "bgfx").
@@ -1512,7 +1553,7 @@ pub const ProjectConfig = struct {
     /// enum tag that resolves to a provider) it's the provider name.
     pub fn backendName(self: ProjectConfig) []const u8 {
         if (self.effectiveBackendPackage()) |bp| return bp.name;
-        return @tagName(self.backend);
+        return @tagName(self.effectiveBackend());
     }
 
     /// Resolve the effective desktop gamepad source, applying the backend-aware
@@ -1561,7 +1602,7 @@ pub const ProjectConfig = struct {
     /// routes through here so they can never disagree. Never read `.gamepad`
     /// directly.
     pub fn effectiveGamepad(self: ProjectConfig) GamepadSource {
-        return self.gamepad orelse (if (self.backend == .bgfx) .none else .auto);
+        return self.gamepad orelse (if (self.effectiveBackend() == .bgfx) .none else .auto);
     }
 
     /// True when the backend resolves from a PACKAGE (external) rather than the
@@ -1593,7 +1634,7 @@ pub const ProjectConfig = struct {
     /// raylib-shaped wiring. This is the ONE remaining place the enum tag is read
     /// as an *identity*; a non-enum name never consults it.
     pub fn isEnumTagBacked(self: ProjectConfig) bool {
-        return std.mem.eql(u8, self.backendName(), @tagName(self.backend));
+        return std.mem.eql(u8, self.backendName(), @tagName(self.effectiveBackend()));
     }
 
     /// The unset-`.y_axis` build guard (RFC-Y-AXIS-CONVENTION Migration §,

@@ -1121,6 +1121,120 @@ jobs:
           cd curated/curated-check/.labelle/null_desktop
           zig build
 
+  # The DEFAULT new project, end to end. `curated-set` above proves the
+  # trio on the cheap null backend; this job proves what a bare
+  # `labelle-assembler init <name>` actually scaffolds — desktop + bgfx
+  # since 2026-09-27 — generates and COMPILES on a cold runner with the
+  # curated trio and the builtin bgfx provider. No `--backend`, no version
+  # flags: pinning anything here would test the pin, not the default.
+  curated-set-default-backend:
+    name: Curated version set, default backend (init -> generate -> bgfx desktop build)
+    runs-on: ubuntu-latest
+    # Cold toolkit fetch + a cold bgfx C++ compile + one engine compile.
+    # Same bound as `bgfx-examples-pinned`, which pays the same compile.
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout labelle-assembler
+        uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
+
+      - name: Checkout labelle-gui (flow_codegen)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-gui
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # bgfx desktop on Linux: X11/Wayland + Vulkan headers. Same list as
+      # `bgfx-examples-pinned` (which mirrors labelle-bgfx's own CI).
+      - name: Install bgfx desktop system libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev \
+            libvulkan-dev
+
+      - name: Build labelle-assembler
+        run: cd labelle-assembler && zig build
+
+      - name: Scaffold with NO flags (the default backend)
+        run: |
+          set -euo pipefail
+          mkdir -p curated && cd curated
+          "$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler" \
+            init default-check
+          echo "== stamped backend + pins =="
+          grep -E '\.backend|_version' default-check/project.labelle
+          # The default IS bgfx, and nothing names a provider package.
+          grep -qE '^    \.backend = \.bgfx,$' default-check/project.labelle \
+            || { echo "::error::a bare init did not scaffold .backend = .bgfx"; exit 1; }
+          if grep -q 'backend_package' default-check/project.labelle; then
+            echo "::error::a bare init wrote a .backend_package (desktop needs no provider)"; exit 1
+          fi
+
+      # Same reason as `curated-set`: test the assembler under review, not
+      # an old release of it.
+      - name: Resolve the assembler under test
+        run: |
+          set -euo pipefail
+          cd curated/default-check
+          sed -i "s|    .assembler_version = \".*\",|    .assembler_version = \"local:$GITHUB_WORKSPACE/labelle-assembler\",|" project.labelle
+          grep 'assembler_version' project.labelle
+
+      - name: Install packages
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler" \
+            install --project-root "$PWD/curated/default-check"
+
+      - name: Generate
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler" \
+            generate --project-root "$PWD/curated/default-check"
+          test -d curated/default-check/.labelle/bgfx_desktop \
+            || { echo "::error::generate did not produce .labelle/bgfx_desktop/"; exit 1; }
+
+      # The resolved packages match the stamped pins AND the builtin bgfx
+      # provider version — asserted against the cache SLOTS (see
+      # `curated-set` for why not the packages' own `.version` fields).
+      - name: Assert the resolved packages match the stamped pins
+        run: |
+          set -euo pipefail
+          cd curated/default-check
+          home="${LABELLE_HOME:-$HOME/.labelle}"
+          for pkg in core engine gfx; do
+            want=$(sed -n "s/.*\.${pkg}_version = \"\([^\"]*\)\".*/\1/p" project.labelle)
+            echo "${pkg}: stamped=${want}"
+            [ -d "$home/packages/${pkg}/${want}" ] \
+              || { echo "::error::${pkg} ${want} was never fetched"; exit 1; }
+            [ -d ".labelle/deps/labelle-${pkg}" ] \
+              || { echo "::error::${pkg} was not vendored into .labelle/deps/"; exit 1; }
+          done
+          BGFX_VER=$(sed -n 's/.*\.bgfx => .*\.repo = "github\.com\/labelle-toolkit\/labelle-bgfx".*\.version = "\([^"]*\)".*/\1/p' \
+            "$GITHUB_WORKSPACE/labelle-assembler/src/config.zig")
+          test -n "$BGFX_VER" || { echo "::error::could not read the builtin bgfx provider version from src/config.zig"; exit 1; }
+          echo "bgfx: builtin provider=${BGFX_VER}"
+          [ -d "$home/packages/plugins/github.com/labelle-toolkit/labelle-bgfx/${BGFX_VER}" ] \
+            || { echo "::error::bgfx ${BGFX_VER} was never fetched"; exit 1; }
+          [ -d ".labelle/deps/labelle-bgfx" ] \
+            || { echo "::error::bgfx was not vendored into .labelle/deps/"; exit 1; }
+
+      - name: Build (bgfx desktop)
+        run: |
+          set -euo pipefail
+          cd curated/default-check/.labelle/bgfx_desktop
+          zig build
+          ls -l zig-out/bin/default-check
+
   csharp-example:
     name: C# example (EMBED path) end-to-end
     runs-on: ubuntu-latest

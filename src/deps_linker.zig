@@ -24,7 +24,7 @@ pub const DepEntry = struct {
 /// assembler#533). An EXTERNAL backend is self-contained — it stages none of these
 /// sub-packages (it declares its own gamepad source in its staged zon), so the
 /// gate is OFF regardless of the enum. This is the exact predicate the
-/// `if (!cfg.isExternal()) switch (cfg.backend)` site below uses, factored out
+/// `if (!cfg.isExternal()) switch (cfg.effectiveBackend())` site below uses, factored out
 /// so it's unit-testable without disk I/O.
 ///
 /// DEFENSIVE DEAD CODE (post-#386 Phase 6c): every `Backend` tag now resolves to
@@ -35,7 +35,7 @@ pub const DepEntry = struct {
 /// (assembler#501 forbids enum growth).
 pub fn stagesSdlGamepad(cfg: ProjectConfig) bool {
     if (cfg.isExternal()) return false;
-    return switch (cfg.backend) {
+    return switch (cfg.effectiveBackend()) {
         // Route through the resolver (never read `cfg.gamepad` directly): a bgfx
         // project with an ABSENT `.gamepad` resolves to `.none` (assembler#533),
         // so it stages no SDL, while raylib/sokol keep the `.auto` default.
@@ -46,7 +46,7 @@ pub fn stagesSdlGamepad(cfg: ProjectConfig) bool {
 
 /// Whether the shared Android gamepad sub-package (`backends/android_gamepad`)
 /// is staged for `cfg`. Built-in-specific: sokol/bgfx. OFF for an external
-/// backend (self-contained). Mirrors the gated `switch (cfg.backend)` site below.
+/// backend (self-contained). Mirrors the gated `switch (cfg.effectiveBackend())` site below.
 ///
 /// DEFENSIVE DEAD CODE (post-#386 Phase 6c): every `Backend` tag now resolves to
 /// an external provider via `builtinProvider`, so `isExternal()` is true for
@@ -56,7 +56,7 @@ pub fn stagesSdlGamepad(cfg: ProjectConfig) bool {
 /// (assembler#501 forbids enum growth).
 pub fn stagesAndroidGamepad(cfg: ProjectConfig) bool {
     if (cfg.isExternal()) return false;
-    return switch (cfg.backend) {
+    return switch (cfg.effectiveBackend()) {
         .sokol, .bgfx => true,
         else => false,
     };
@@ -176,7 +176,7 @@ pub fn createDepsLinks(
         // the SDL HIDAPI source fixes that, mirroring raylib/sokol.)
         // Built-in-specific sub-package: skipped entirely for an EXTERNAL
         // backend, which is self-contained — its staged `build.zig.zon`
-        // declares whatever gamepad source it needs. (`switch (cfg.backend)` is
+        // declares whatever gamepad source it needs. (`switch (cfg.effectiveBackend())` is
         // meaningless for an external backend with no enum tag.)
         if (stagesSdlGamepad(cfg)) {
             const gp_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, "backends/sdl_gamepad");

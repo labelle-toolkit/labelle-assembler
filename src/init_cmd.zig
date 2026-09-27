@@ -756,7 +756,7 @@ test "scaffold with the default options writes `.backend = .bgfx` (golden)" {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const cfg = try std.zon.parse.fromSliceAlloc(config.ProjectConfig, arena.allocator(), src, null, .{});
-    try std.testing.expectEqual(config.Backend.bgfx, cfg.backend);
+    try std.testing.expectEqual(config.Backend.bgfx, cfg.backend.?);
     try std.testing.expect(cfg.backend_package == null);
     try std.testing.expectEqualStrings("bgfx", cfg.backendName());
 }
@@ -785,6 +785,6 @@ test "scaffold with --backend=raylib writes `.backend = .raylib`" {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const cfg = try std.zon.parse.fromSliceAlloc(config.ProjectConfig, arena.allocator(), src, null, .{});
-    try std.testing.expectEqual(config.Backend.raylib, cfg.backend);
+    try std.testing.expectEqual(config.Backend.raylib, cfg.backend.?);
     try std.testing.expect(std.mem.indexOf(u8, labelle, ".backend = .raylib,") != null);
 }

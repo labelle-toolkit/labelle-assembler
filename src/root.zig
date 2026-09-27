@@ -2844,7 +2844,7 @@ test "testsTargetConfig: never resolves gamepad .auto — tests must not link SD
     }
     // And the other overrides hold: null backend, host platform.
     const c = testsTargetConfig(.{ .name = "g", .backend = .bgfx, .platform = .android });
-    try std.testing.expectEqual(config.Backend.null, c.backend);
+    try std.testing.expectEqual(config.Backend.null, c.effectiveBackend());
     try std.testing.expectEqual(config.Platform.desktop, c.platform);
 }
 
