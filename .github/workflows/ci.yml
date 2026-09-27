@@ -74,6 +74,9 @@ jobs:
       - name: Test
         run: zig build test
 
+      - name: Clean-home install (offline archives)
+        run: python3 test/clean_home_install_e2e.py
+
       - name: zig-ecs adapter tests
         run: cd ecs/zig-ecs && zig build test
 

@@ -382,8 +382,8 @@ pub fn cmdClean(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Arg
             .{ .name = "gfx", .version = cfg.gfx_version },
             .{ .name = "cli", .version = cfg.labelle_version },
             // assembler_version is optional in project.labelle; it falls
-            // back to labelle_version, matching ensureCache's resolution.
-            .{ .name = "assembler", .version = cfg.assembler_version orelse cfg.labelle_version },
+            // back to this assembler binary, matching ensureCache's resolution.
+            .{ .name = "assembler", .version = config.assemblerPackageVersion(cfg.assembler_version) },
         };
         for (project_refs) |ref| {
             if (config.isLocalVersion(ref.version)) continue;
@@ -798,7 +798,7 @@ pub fn ensureCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) !voi
         }
     }
 
-    const asm_ver = cfg.assembler_version orelse cfg.labelle_version;
+    const asm_ver = config.assemblerPackageVersion(cfg.assembler_version);
     if (!try cache.isAssemblerCached(allocator, asm_ver)) {
         try fetchAssemblerWithFallback(allocator, asm_ver);
     }

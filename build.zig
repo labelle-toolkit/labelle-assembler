@@ -96,7 +96,7 @@ pub fn build(b: *std.Build) void {
     // A plausible-but-wrong version is worse than an obviously-fake one:
     // `0.0.0-dev` fails to resolve loudly, which is the correct outcome for
     // a scaffold produced by an unreleased binary.
-    const assembler_version: []const u8 = b.option([]const u8, "assembler_version", "Default assembler version for `init`") orelse "0.0.0-dev";
+    const assembler_version: []const u8 = b.option([]const u8, "assembler_version", "Assembler release version for scaffolding and bundled packages") orelse "0.0.0-dev";
 
     const zspec_dep = b.dependency("zspec", .{ .target = target, .optimize = optimize });
     const flow_codegen_dep = b.dependency("flow_codegen", .{ .target = target, .optimize = optimize });
