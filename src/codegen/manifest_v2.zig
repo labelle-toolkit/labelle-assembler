@@ -210,7 +210,13 @@ pub const BackendManifestV2 = struct {
 
     pub const Package = union(enum) {
         binary,
-        apk: struct { manifest: []const u8 },
+        /// Android. Generates NO packaging step (labelle-cli#405): the
+        /// labelle-android provider packages the APK. `.manifest` is still
+        /// ACCEPTED — released labelle-bgfx / labelle-sokol manifests carry
+        /// it, and rejecting it would break every pinned backend — but it is
+        /// never read. It defaults to "" so a backend can drop it
+        /// (`.package = .{ .apk = .{} }`).
+        apk: struct { manifest: []const u8 = "" },
         web: struct { shell: ?[]const u8 = null },
     };
 
@@ -430,16 +436,16 @@ pub const HookContext = struct {
 
 // ── Header-first bounded version parse (design §3/§6) ─────────────────────
 
-/// Errors the header-first parse can surface:
-///   error.BackendManifestParseError    — ZON parser rejected the file
-///   error.BackendManifestUnknownVersion — manifest_version is < 2 or
-///                                          > SUPPORTED_MANIFEST_VERSION
-///
-/// The v1/legacy build-graph manifest is no longer a codegen input (#461 removed
-/// the v1 splice + enum path), so `manifest_version < 2` — including a field-less
-/// legacy `backend.manifest.zon` that reads as version 1 — is REJECTED here.
-/// Resolve-time identity/capabilities are read separately by
-/// `manifest_splice.loadProviderManifest`, which does not go through this parse.
+// Errors the header-first parse can surface:
+//   error.BackendManifestParseError    — ZON parser rejected the file
+//   error.BackendManifestUnknownVersion — manifest_version is < 2 or
+//                                          > SUPPORTED_MANIFEST_VERSION
+//
+// The v1/legacy build-graph manifest is no longer a codegen input (#461 removed
+// the v1 splice + enum path), so `manifest_version < 2` — including a field-less
+// legacy `backend.manifest.zon` that reads as version 1 — is REJECTED here.
+// Resolve-time identity/capabilities are read separately by
+// `manifest_splice.loadProviderManifest`, which does not go through this parse.
 
 /// The lowest `manifest_version` this assembler will still drive codegen from.
 /// v1 was retired with the enum/v1 splice (#461); the build-graph manifest is
@@ -715,6 +721,33 @@ test "parseManifest: a v2 manifest parses into BackendManifestV2" {
     try testing.expectEqual(@as(u8, 2), m.manifest_version);
     try testing.expectEqualStrings("labelle.sokol", m.id.?);
     try testing.expect(m.platforms.desktop != null);
+}
+
+test "parseManifest: the .apk recipe is accepted with or without .manifest (labelle-cli#405)" {
+    // Released bgfx/sokol pins carry `.apk = .{ .manifest = ... }`; a backend
+    // that drops the (never-read) field must parse too. Neither form reaches
+    // the generated build.zig — `packager.emitPackage(.apk)` emits nothing.
+    const without = try std.mem.replaceOwned(
+        u8,
+        testing.allocator,
+        synthetic_v2,
+        ".package = .{ .apk = .{ .manifest = \"AndroidManifest.xml.tmpl\" } },",
+        ".package = .{ .apk = .{} },",
+    );
+    defer testing.allocator.free(without);
+    try testing.expect(!std.mem.eql(u8, without, synthetic_v2));
+
+    const cases = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = synthetic_v2, .want = "AndroidManifest.xml.tmpl" },
+        .{ .src = without, .want = "" },
+    };
+    for (cases) |case| {
+        const z = try dupeZ(case.src);
+        defer testing.allocator.free(z);
+        const m = try parseManifest(testing.allocator, z);
+        defer std.zon.parse.free(testing.allocator, m);
+        try testing.expectEqualStrings(case.want, m.platforms.android.?.package.apk.manifest);
+    }
 }
 
 test "parseManifest: rejects manifest_version > SUPPORTED with a clear error" {

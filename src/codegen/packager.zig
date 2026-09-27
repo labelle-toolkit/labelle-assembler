@@ -4,8 +4,18 @@
 //! This module is the ONE place that knows how to emit a platform's *packaging*
 //! step. It is driven by a v2 manifest's `BackendManifestV2.Package` recipe
 //! (`.platforms[p].package`): `.binary` (desktop — no packaging), `.apk`
-//! (Android — the apk-staging copy + `zip` + `apksigner` shell-outs), and
-//! `.web` (wasm — the emcc install/run step wiring).
+//! (Android — no generated packaging either, see below), and `.web` (wasm —
+//! the emcc install/run step wiring).
+//!
+//! ## `.apk` emits nothing (labelle-cli#405)
+//!
+//! Android packaging moved out of the generated `build.zig` into the
+//! labelle-android provider (`providers/android.json`), which stages, zips and
+//! signs the APK itself. The former `templates/package_apk.txt` fixture (the
+//! generated `zig build package` step) is gone. The `.apk = .{ .manifest }`
+//! recipe is still ACCEPTED in backend manifests — released labelle-bgfx /
+//! labelle-sokol pins still carry it, and rejecting it would break every pinned
+//! backend — but it is ignored.
 //!
 //! ## Why it exists — the packaging text, factored out
 //!
@@ -16,29 +26,21 @@
 //!
 //! ## The packager OWNS the packaging text (#461)
 //!
-//! The packaging text is held here as packager-OWNED fixtures (`@embedFile` of
-//! `templates/package_apk.txt` / `templates/package_web.txt`). These were captured
-//! byte-identical to the former enum `.android_package` / `.wasm_footer` template
-//! sections (validated by the golden cells `bgfx_v2_android.build.zig` /
-//! `sokol_wasm_v2.build.zig`); those enum sections were deleted with the rest of
-//! the v1/enum path (#461), so these fixtures are now the SOLE source of truth.
+//! The packaging text is held here as a packager-OWNED fixture (`@embedFile` of
+//! `templates/package_web.txt`). It was captured byte-identical to the former
+//! enum `.wasm_footer` template section (validated by the golden cell
+//! `sokol_wasm_v2.build.zig`); that enum section was deleted with the rest of
+//! the v1/enum path (#461), so this fixture is now the SOLE source of truth.
 //!
 //! Note on the `.web` fixture: it carries not only the emcc install/run step but
 //! also the trailing build-function close and the `overrideImport` helper def that
 //! sat after `.wasm_footer` in the old template — the `renderWasmFooterV2` +
-//! packager split reproduces exactly the same bytes. (The `.apk` fixture carries
-//! only the packaging block, ending before the footer.)
+//! packager split reproduces exactly the same bytes.
 
 const std = @import("std");
 const manifest_v2 = @import("manifest_v2.zig");
 
 const Package = manifest_v2.BackendManifestV2.Package;
-
-/// The Android apk packaging text (apk-staging copy + `zip` + `apksigner`). The
-/// canonical source of the packaging block since the enum `.android_package`
-/// section was deleted (#461); the golden cell `bgfx_v2_android.build.zig` locks
-/// its output.
-pub const apk_package_zig = @embedFile("../templates/package_apk.txt");
 
 /// The wasm/web packaging text (emcc install/run + build-fn close + the
 /// `overrideImport` helper def). Canonical since the enum `.wasm_footer` section
@@ -49,27 +51,27 @@ pub const web_package_zig = @embedFile("../templates/package_web.txt");
 ///
 ///   - `.binary` — desktop: NO packaging step (the exe is installed directly).
 ///     A no-op, so a desktop `PlatformEntry` can call this unconditionally.
-///   - `.apk`    — Android: the apk-staging copy + `zip` + `apksigner` block.
+///   - `.apk`    — Android: NO packaging step either. The labelle-android
+///     provider packages the APK (labelle-cli#405); the recipe's `.manifest`
+///     is accepted for released backend pins but ignored.
 ///   - `.web`    — wasm: the emcc install/run wiring (+ trailing helpers, see
 ///     the module doc).
 ///
 /// Byte-identical to the corresponding enum-path template section (design §7).
 ///
 /// The recipe payload fields (`apk.manifest`, `web.shell`) are accepted but not
-/// yet consumed — the current sections do not parameterize on them (the apk
-/// manifest is staged elsewhere; the wasm shell is null on the enum path). They
-/// become live when PR 5/7 wire the Android/wasm platform entries; keeping the
-/// recipe in the signature now means those PRs need no signature change.
+/// consumed — the web section does not parameterize on its shell, and the apk
+/// recipe emits nothing at all.
 pub fn emitPackage(package: Package, w: anytype) !void {
     switch (package) {
         .binary => {}, // desktop — nothing to package
-        .apk => try w.writeAll(apk_package_zig),
+        .apk => {}, // Android — the labelle-android provider packages (cli#405)
         .web => try w.writeAll(web_package_zig),
     }
 }
 
 // ============================================================================
-// Tests — the packager owns its apk/web fixtures (the enum sections are gone, #461)
+// Tests — the packager owns its web fixture (the enum sections are gone, #461)
 // ============================================================================
 
 const testing = std.testing;
@@ -81,10 +83,23 @@ fn emitToOwned(package: Package) ![]u8 {
     return aw.toOwnedSlice();
 }
 
-test "emitPackage(.apk) emits the apk fixture verbatim" {
+test "emitPackage(.apk) emits no package step (labelle-cli#405)" {
+    // The labelle-android provider packages the APK; the generated build.zig
+    // must not grow a `zig build package` step (or any apksigner/zip wiring).
     const out = try emitToOwned(.{ .apk = .{ .manifest = "AndroidManifest.xml.tmpl" } });
     defer testing.allocator.free(out);
-    try testing.expectEqualStrings(apk_package_zig, out);
+    try testing.expectEqual(@as(usize, 0), out.len);
+}
+
+test "emitPackage(.apk) accepts but ignores any .manifest value (released backend pins)" {
+    // Released bgfx/sokol manifests still carry `.apk = .{ .manifest = ... }`
+    // (sokol ships no such template file at all). The value must never be
+    // read, so an arbitrary or empty path changes nothing.
+    inline for (.{ "AndroidManifest.xml.tmpl", "does/not/exist.tmpl", "" }) |manifest| {
+        const out = try emitToOwned(.{ .apk = .{ .manifest = manifest } });
+        defer testing.allocator.free(out);
+        try testing.expectEqual(@as(usize, 0), out.len);
+    }
 }
 
 test "emitPackage(.web) emits the web fixture verbatim" {
