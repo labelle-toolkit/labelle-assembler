@@ -8,6 +8,14 @@ const std = @import("std");
 const config = @import("config.zig");
 const cache = @import("cache.zig");
 
+/// Logs a resolution failure for the user. Silent under `zig test`: the
+/// test runner fails any test that logs at error level, and the error-path
+/// tests below assert the returned error instead (same pattern as
+/// component_collisions.zig).
+fn logErr(comptime fmt: []const u8, args: anytype) void {
+    if (!@import("builtin").is_test) std.log.err(fmt, args);
+}
+
 /// Resolve the GUI plugin reference in the config.
 /// Reads gui.labelle from the plugin directory, validates the bridge for
 /// the selected backend, and populates cfg.resolved_gui.
@@ -112,14 +120,14 @@ fn resolvePluginDir(allocator: std.mem.Allocator, ref: config.GuiPlugin, cfg: co
                 return cache.resolvePlugin(allocator, plugin, project_dir);
             }
         }
-        std.log.err("labelle: GUI references plugin '{s}', but no plugin with that name is declared in .plugins", .{name});
+        logErr("labelle: GUI references plugin '{s}', but no plugin with that name is declared in .plugins", .{name});
         return error.GuiPluginNotFound;
     }
     if (ref.package) |package| {
         // Package reference — resolve from the package cache, fetching
         // into ~/.labelle/packages/plugins/{package}/{version} if absent.
         const version = ref.version orelse {
-            std.log.err("labelle: GUI plugin '.package = \"{s}\"' requires a '.version'", .{package});
+            logErr("labelle: GUI plugin '.package = \"{s}\"' requires a '.version'", .{package});
             return error.GuiPluginMissingVersion;
         };
 
@@ -132,7 +140,7 @@ fn resolvePluginDir(allocator: std.mem.Allocator, ref: config.GuiPlugin, cfg: co
         if (!cache.dirExists(dir)) {
             std.log.info("labelle: fetching GUI plugin package {s} {s}", .{ package, version });
             cache.fetchGuiPackage(allocator, package, version) catch |err| {
-                std.log.err("labelle: could not fetch GUI plugin package '{s}' {s}: {s}", .{ package, version, @errorName(err) });
+                logErr("labelle: could not fetch GUI plugin package '{s}' {s}: {s}", .{ package, version, @errorName(err) });
                 return error.GuiPluginFetchFailed;
             };
         }
@@ -169,7 +177,7 @@ fn resolvePluginDir(allocator: std.mem.Allocator, ref: config.GuiPlugin, cfg: co
             // comment for the `.url`+`hash` contract). When null the
             // plugin is fetched unpinned and fetchGuiUrl warns.
             cache.fetchGuiUrl(allocator, url, slot, clone_ref, ref.hash) catch |err| {
-                std.log.err("labelle: could not fetch GUI plugin from '{s}': {s}", .{ url, @errorName(err) });
+                logErr("labelle: could not fetch GUI plugin from '{s}': {s}", .{ url, @errorName(err) });
                 return error.GuiPluginFetchFailed;
             };
         } else if (ref.hash) |sha| {
@@ -188,7 +196,7 @@ fn resolvePluginDir(allocator: std.mem.Allocator, ref: config.GuiPlugin, cfg: co
         return dir;
     }
     // Malformed GuiPlugin — none of the four reference fields is set.
-    std.log.err("labelle: GUI plugin reference must set one of .path, .plugin, .package, or .url", .{});
+    logErr("labelle: GUI plugin reference must set one of .path, .plugin, .package, or .url", .{});
     return error.GuiPluginResolutionNotSupported;
 }
 

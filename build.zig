@@ -243,14 +243,11 @@ pub fn build(b: *std.Build) void {
 
     // ── `test-cache`: the local-slot cache machinery, alone ─────────────
     //
-    // The Windows CI job runs THIS, not `test`. `zig build test` on Windows
-    // is red for ~33 pre-existing failures across the scripting-splice,
-    // panel-validate and pack-check suites (path-separator handling), which
-    // a Windows job added for #688 neither caused nor should be expected to
-    // fix — see the tracking issue linked from that PR. A job that is red
-    // for unrelated reasons guards nothing, so this step narrows to the
-    // modules the cache work touches: `cache.local`, `cache.disk` and
-    // `cache_cmd`.
+    // A narrow, fast subset: the modules the cache work touches
+    // (`cache.local`, `cache.disk`, `cache_cmd`). The Windows CI job used to
+    // run only this step while `zig build test` was red on Windows; since
+    // #699 it runs the full `test` (see the windows job in ci.yml), so this
+    // step is now a local convenience.
     //
     // `cache.resolve` is deliberately NOT in the filter: two of its
     // worktree-path tests are among the pre-existing Windows failures, and
