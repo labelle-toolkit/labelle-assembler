@@ -216,7 +216,9 @@ pub const MAIN_ZIG = struct {
         defer std.testing.allocator.free(main_zig);
 
         // The UI-thread hide is registered with the shell.
-        const reg = "android_app.setImmersiveCallback(&engine.android.applyImmersiveUiThread);";
+        // No `android` plugin in this config, so the snippet takes the
+        // engine fallback (`immersive.zig`); the registration shape is the same.
+        const reg = "android_app.setImmersiveCallback(&labelle_immersive.apply);";
         const reg_idx = std.mem.indexOf(u8, main_zig, reg);
         try std.testing.expect(reg_idx != null);
 

@@ -31,6 +31,7 @@ const tpl = @import("../../template.zig");
 const config = @import("../../config.zig");
 const preview = @import("../preview.zig");
 const manifest_v2 = @import("../manifest_v2.zig");
+const immersive = @import("immersive.zig");
 
 /// Which preview-mode wiring a callback lifecycle emits (assembler#501). The
 /// three callback branches used to hard-code this; it is now a computed value.
@@ -638,20 +639,12 @@ pub fn Mixin(comptime Self: type) type {
                 // bgfx-on-Android registration seam (#310 Stage 4) + immersive
                 // hook — only the bgfx_shell android shape emits them. The bgfx
                 // shell chains `onWindowFocusChanged` (a UI-thread framework
-                // callback) and invokes the engine's UI-thread system-bar hide;
-                // the hook-based `enableImmersiveMode()` can't work under
-                // native_app_glue. See backends/bgfx/src/android_app.zig.
+                // callback) and invokes labelle-android's UI-thread system-bar
+                // hide (`immersive.zig`); the hook-based `enable` can't work
+                // under native_app_glue. See backends/bgfx/src/android_app.zig.
                 const android_backend_register: []const u8 = if (shape.android == .bgfx_shell) BGFX_ANDROID_BACKEND_REGISTER else "";
-                const immersive_register: []const u8 = if (shape.android == .bgfx_shell and (if (cfg.android) |a| a.immersive_mode else false))
-                    "    // Android immersive mode (project.labelle `.android.immersive_mode`):\n" ++
-                    "    // register the engine's UI-thread system-bar hide with the bgfx shell.\n" ++
-                    "    // The shell chains onWindowFocusChanged (a UI-thread framework callback)\n" ++
-                    "    // and invokes this on launch + every focus regain, so the bars hide at\n" ++
-                    "    // launch and re-hide after a swipe / returning from the shade. The\n" ++
-                    "    // hook-based enableImmersiveMode() can't work under native_app_glue.\n" ++
-                    "    // See labelle-engine src/android.zig (applyImmersiveUiThread) and\n" ++
-                    "    // backends/bgfx/src/android_app.zig (setImmersiveCallback / focusHook).\n" ++
-                    "    android_app.setImmersiveCallback(&engine.android.applyImmersiveUiThread);\n"
+                const immersive_register: []const u8 = if (shape.android == .bgfx_shell)
+                    immersive.snippet(cfg, .bgfx_callback)
                 else
                     "";
 
