@@ -784,12 +784,26 @@ pub fn isSemverVersion(version: []const u8) bool {
 /// appending `.0`, and this does the same rather than inventing a second
 /// convention.
 ///
+/// A pre-release or build-suffixed pin (`0.31.0-rc.1`, `2.0.0+ci.5` — a
+/// fetchable tag since #783, see `isTagVersion`) is judged as its
+/// `MAJOR.MINOR.PATCH`: the suffix is dropped. For build metadata that is
+/// the spec (it does not affect precedence). For a pre-release it is the
+/// gates' deliberate choice: as a floor's SUBJECT it can only fire a floor
+/// early (conservative); as a REQUIREMENT, `2.1.0-rc.1` passes a
+/// `>= 2.1.0` floor (permissive, like every other dev pin) while
+/// `2.0.0-rc.1` still fails it.
+///
 /// A dotted string that is still unparsable after padding (`1.2.3.4`, which
 /// `isSemverVersion` also admits) returns `error.UnparsableVersionPin` with
 /// the offending value named — a readable failure instead of the
 /// `catch unreachable` crash this used to take (#683 review).
 pub fn parsePin(version: []const u8) error{UnparsableVersionPin}!std.SemanticVersion {
-    if (std.SemanticVersion.parse(version)) |v| return v else |_| {}
+    if (std.SemanticVersion.parse(version)) |parsed| {
+        var v = parsed;
+        v.pre = null;
+        v.build = null;
+        return v;
+    } else |_| {}
     var buf: [64]u8 = undefined;
     const padded = std.fmt.bufPrint(&buf, "{s}.0", .{version}) catch {
         std.debug.print("version pin '{s}' is too long to normalize\n", .{version});

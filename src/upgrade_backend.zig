@@ -29,7 +29,7 @@
 //!   rejects. A valid semver WITH a pre-release or build suffix
 //!   (`1.2.3-rc.1`, `1.2.3+b.5`) is written: the fetch path fetches it as the
 //!   tag `v1.2.3-rc.1` (assembler#783), and the floor tables judge it as its
-//!   `MAJOR.MINOR.PATCH` (`version_floors.subjectPin`).
+//!   `MAJOR.MINOR.PATCH` (`config.parsePin`).
 //! * A `local:` / `@` package — it builds from its checkout, so there is no
 //!   pin to bump: a no-op without a version, refused with one.
 //! * A third-party package with no version given — it has no builtin
@@ -97,7 +97,7 @@ pub fn plan(a: std.mem.Allocator, content: []const u8, requested: ?[]const u8) !
 
 fn currentFloorWarnings(a: std.mem.Allocator, cfg: ProjectConfig) ![]const []const u8 {
     // A pre-release pin already in the file is judged as its
-    // MAJOR.MINOR.PATCH by the table itself (`subjectPin`), not skipped.
+    // MAJOR.MINOR.PATCH by the table itself (`config.parsePin`), not skipped.
     const v = version_floors.verdict(cfg) catch return &.{};
     var warnings: std.ArrayList([]const u8) = .empty;
     if (v.backend) |b| {

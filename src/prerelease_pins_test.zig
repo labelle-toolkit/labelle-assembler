@@ -1,10 +1,11 @@
 //! #783: pre-release / build-suffixed pins end to end — the fetch path, the
-//! version floors and `upgrade backend` must agree on what such a pin is.
+//! version gates and `upgrade backend` must agree on what such a pin is.
 //!
 //! * fetch: `1.2.3-rc.1` is the tag `v1.2.3-rc.1` (`config.versionToGitRef`,
 //!   table-tested in `version_ref.zig`);
-//! * floors: a pre-release SUBJECT is judged as its release, a pre-release
-//!   REQUIREMENT is undecidable (`version_floors.subjectPin`);
+//! * gates (version floors, material toolchain/contract): every
+//!   `isTagVersion` pin is compared, judged as its `MAJOR.MINOR.PATCH`
+//!   (`config.parsePin`);
 //! * `upgrade backend` writes it and reaches the same floor verdict
 //!   `generate` does, because both call `version_floors.verdict`.
 const std = @import("std");
@@ -12,27 +13,28 @@ const testing = std.testing;
 const config = @import("config.zig");
 const version_floors = @import("version_floors.zig");
 const upgrade_backend = @import("upgrade_backend.zig");
+const material_pipeline = @import("material_pipeline.zig");
+const schema = @import("material_schema.zig");
 
-test "subjectPin: table — releases as written, suffixed semver as MAJOR.MINOR.PATCH, refs undecidable (#783)" {
-    const Case = struct { pin: []const u8, judged: ?[]const u8 };
+test "parsePin: table — suffixed semver judged as MAJOR.MINOR.PATCH (#783)" {
+    const Case = struct { pin: []const u8, want: []const u8 };
     const cases = [_]Case{
-        .{ .pin = "0.31.0", .judged = "0.31.0" },
-        .{ .pin = "1.2", .judged = "1.2" },
-        .{ .pin = "0.31.0-rc.1", .judged = "0.31.0" },
-        .{ .pin = "0.31.0+b.5", .judged = "0.31.0" },
-        .{ .pin = "0.31.0-rc.1+b.5", .judged = "0.31.0" },
-        .{ .pin = "main", .judged = null },
-        .{ .pin = "local:../labelle-bgfx", .judged = null },
-        .{ .pin = "159-fix", .judged = null },
-        .{ .pin = "1.2.3-", .judged = null },
-        .{ .pin = "1.2-rc.1", .judged = null },
+        .{ .pin = "0.31.0", .want = "0.31.0" },
+        .{ .pin = "1.2", .want = "1.2.0" },
+        .{ .pin = "0.31.0-rc.1", .want = "0.31.0" },
+        .{ .pin = "0.31.0+b.5", .want = "0.31.0" },
+        .{ .pin = "0.31.0-rc.1+b.5", .want = "0.31.0" },
     };
     for (cases) |c| {
         errdefer std.debug.print("pin '{s}'\n", .{c.pin});
-        var buf: [64]u8 = undefined;
-        const got = version_floors.subjectPin(&buf, c.pin);
-        if (c.judged) |want| try testing.expectEqualStrings(want, got.?) else try testing.expect(got == null);
+        const v = try config.parsePin(c.pin);
+        // Mechanism: the suffix is dropped, not merely ignored by `order`.
+        try testing.expect(v.pre == null and v.build == null);
+        var buf: [32]u8 = undefined;
+        try testing.expectEqualStrings(c.want, try std.fmt.bufPrint(&buf, "{d}.{d}.{d}", .{ v.major, v.minor, v.patch }));
     }
+    try testing.expect(try config.pinAtLeast("2.1.0-rc.1", "2.1.0"));
+    try testing.expect(!try config.pinAtLeast("2.0.0+ci.5", "2.1.0"));
 }
 
 fn bgfxCfg(bgfx: []const u8, core: []const u8) config.ProjectConfig {
@@ -44,33 +46,41 @@ fn bgfxCfg(bgfx: []const u8, core: []const u8) config.ProjectConfig {
     };
 }
 
-test "backend floor: a pre-release backend pin is floored as its release; a pre-release core is undecidable (#783)" {
+test "backend floor: suffixed pins on either side are compared as their release (#783)" {
     // bgfx >= 0.26.0 needs core >= 2.1.0 (compile break).
     const hit = (try version_floors.verdict(bgfxCfg("0.31.0-rc.1", "2.0.0"))).backend.?;
     try testing.expectEqual(version_floors.FloorSeverity.compile_break, hit.severity);
     try testing.expectEqualStrings("0.31.0-rc.1", hit.backend_version); // quoted as written
     try testing.expectEqualStrings("2.1.0", hit.core_floor);
-    // Mechanism: the same pin under a satisfying core is clean — the
-    // suffix itself is not what trips it.
+    // Requirement side: build metadata below the floor is still below it...
+    try testing.expectEqualStrings("2.0.0+ci.5", (try version_floors.verdict(bgfxCfg("0.31.0", "2.0.0+ci.5"))).backend.?.core_version);
+    // ...a pre-release of the floor release passes (permissive, like any dev pin)...
+    try testing.expect((try version_floors.verdict(bgfxCfg("0.31.0", "2.1.0-rc.1"))).backend == null);
+    // ...and the same pins with a satisfying core are clean.
     try testing.expect((try version_floors.verdict(bgfxCfg("0.31.0-rc.1", "2.1.0"))).backend == null);
     try testing.expect((try version_floors.verdict(bgfxCfg("0.31.0+b.5", "2.1.0"))).backend == null);
-    // A branch pin stays unjudged, as before.
+    // Control: a branch pin is still never judged.
     try testing.expect((try version_floors.verdict(bgfxCfg("main", "2.0.0"))).backend == null);
-    // Requirement side: `2.1.0-rc.1` may or may not carry the 2.1.0 API —
-    // undecidable, so no verdict either way (a release 2.0.0 IS judged).
-    try testing.expect((try version_floors.verdict(bgfxCfg("0.31.0", "2.1.0-rc.1"))).backend == null);
-    try testing.expect((try version_floors.verdict(bgfxCfg("0.31.0", "2.0.0"))).backend != null);
 }
 
-test "trio floor: pre-release subject judged, pre-release requirement skipped (#783)" {
-    // engine >= 3.0.0 requires gfx >= 2.0.0 (and core >= 2.0.0).
+test "trio floor: suffixed subject and requirement are compared as their release (#783)" {
+    // engine >= 3.0.0 requires gfx >= 2.0.0.
     const t = (try version_floors.trioFloorViolation("2.0.0", "3.0.0-rc.1", "1.30.1")).?;
     try testing.expectEqualStrings("engine", @tagName(t.floor.subject));
     try testing.expectEqualStrings("gfx", @tagName(t.floor.requires));
-    // gfx 2.0.0-rc.1 as the requirement is undecidable for the engine rule;
-    // as a SUBJECT (gfx >= 2.0.0 requires core >= 2.0.0, engine >= 3.0.0)
-    // it is judged as 2.0.0 and those pins satisfy it.
+    const b = (try version_floors.trioFloorViolation("2.0.0", "3.0.0", "1.30.1+ci.2")).?;
+    try testing.expectEqualStrings("gfx", @tagName(b.floor.requires));
     try testing.expect((try version_floors.trioFloorViolation("2.0.0", "3.0.0", "2.0.0-rc.1")) == null);
+}
+
+test "material gates: a suffixed official bgfx pin picks the toolchain and floor of its release (#783)" {
+    try testing.expectEqual(schema.toolchain_api142, material_pipeline.toolchain(bgfxCfg("0.23.0-rc.1", "2.1.0")));
+    try testing.expectEqual(schema.toolchain_api161, material_pipeline.toolchain(bgfxCfg("0.24.0+b.1", "2.1.0")));
+    const v = (try material_pipeline.contractViolation(bgfxCfg("0.20.0-rc.1", "2.1.0"))).?;
+    try testing.expectEqualStrings("labelle-bgfx", v.what);
+    try testing.expectEqualStrings("0.20.0-rc.1", v.pinned);
+    // Control: a branch pin still falls back to the newest toolchain.
+    try testing.expectEqual(schema.toolchain_api161, material_pipeline.toolchain(bgfxCfg("main", "2.1.0")));
 }
 
 test "upgrade backend and the fetch path agree on a pre-release pin (#783)" {

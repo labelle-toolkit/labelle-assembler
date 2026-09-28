@@ -69,7 +69,9 @@ shutil.copyfile(archives[url], sys.argv[sys.argv.index('-o') + 1])
                     info = tarfile.TarInfo('archive-root/' + name)
                     info.size = len(data)
                     tar.addfile(info, io.BytesIO(data))
-            ref = release if release == '0.0.0-dev' else f'v{release}'
+            # Every version is fetched as its `v` tag — including the dev
+            # sentinel `0.0.0-dev`, a semver pre-release since #783.
+            ref = f'v{release}'
             fixtures[f'https://github.com/labelle-toolkit/{repo}/archive/{ref}.tar.gz'] = str(archive)
         fixture_file = work / 'fixtures.json'
         fixture_file.write_text(json.dumps(fixtures))
