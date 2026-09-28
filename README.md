@@ -184,6 +184,30 @@ Exit codes: 0 whenever an answer was produced, `supported: false` included
 or parsed; 2 on a usage error. An unknown target is `supported: false` with
 a reason naming the backend and the target.
 
+### Plugin build options supplied by the assembler
+
+Some `-D` options only the assembler knows the value of. Today that's
+`ios_sdk_path`, the iOS SDK root that a plugin compiling C needs for system
+headers. On an iOS generate, the assembler passes it to a plugin's
+`b.dependency(...)` **only when the plugin takes it**. Zig rejects a `-D`
+option that the dependency's `build.zig` doesn't declare, so passing it to
+every plugin broke the others (#776). A plugin takes it when either of these
+is true:
+
+- its `plugin.labelle` declares it. This is the contract; an unknown name
+  fails the manifest load:
+
+  ```zig
+  .build_options = .{ "ios_sdk_path" },
+  ```
+
+- its `build.zig` declares the option: a `b.option(<type>, "ios_sdk_path", ...)`
+  call with that string literal as the second argument. This keeps existing
+  plugins such as labelle-box2d working unchanged. The string anywhere else
+  (a comment, a constant, a message) doesn't count; a plugin that passes the
+  name indirectly, or declares it in an imported file, must use the manifest
+  key.
+
 ### Run tests
 
 ```bash

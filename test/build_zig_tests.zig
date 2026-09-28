@@ -333,6 +333,55 @@ pub const MANIFEST_V2_IOS_GOLDEN = struct {
         try std.testing.expect(std.mem.indexOf(u8, out, "fn linkIosFrameworks(") == null);
         try std.testing.expect(std.mem.indexOf(u8, out, "configureSdkPaths(") == null);
     }
+
+    // #776: `-Dios_sdk_path` goes ONLY to plugins that take it. Zig rejects
+    // an option a dependency's build.zig does not declare, so handing it to
+    // every plugin broke the iOS build of any plugin without it.
+    fn genIosWithPlugins(sdk_plugins: []const []const u8) ![]const u8 {
+        return h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "anchor-game",
+            .backend = .sokol,
+            .platform = .ios,
+            .ecs = .mock,
+            .plugins = &.{
+                .{ .name = "fsm", .repo = "github.com/labelle-toolkit/labelle-fsm", .version = "1.0.0" },
+                .{ .name = "box2d", .repo = "github.com/labelle-toolkit/labelle-box2d", .version = "1.0.0" },
+            },
+        }, .{ .ios_sdk_path_plugins = sdk_plugins });
+    }
+
+    test "ios: a plugin that does not take ios_sdk_path is not passed it; one that does is (#776)" {
+        const out = try genIosWithPlugins(&.{"box2d"});
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "    const plugin_fsm_dep = b.dependency(\"labelle_fsm\", .{ .target = target, .optimize = optimize });\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "    const plugin_box2d_dep = b.dependency(\"labelle_box2d\", .{ .target = target, .optimize = optimize, .ios_sdk_path = @as(?[]const u8, sdk_path) });\n") != null);
+        // Exactly one plugin dep carries it.
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, ".ios_sdk_path = @as(?[]const u8, sdk_path)"));
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "ios: with no plugin taking ios_sdk_path, no plugin dep is passed it (#776)" {
+        const out = try genIosWithPlugins(&.{});
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, out, ".ios_sdk_path = @as(?[]const u8, sdk_path)"));
+        // The backend hook still receives the SDK path (unchanged).
+        try std.testing.expect(std.mem.indexOf(u8, out, ".ios_sdk_path = sdk_path,") != null);
+    }
+
+    test "desktop: ios_sdk_path_plugins is ignored off iOS (#776)" {
+        const out = try h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "anchor-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .plugins = &.{.{ .name = "box2d", .repo = "github.com/labelle-toolkit/labelle-box2d", .version = "1.0.0" }},
+        }, .{ .ios_sdk_path_plugins = &.{"box2d"} });
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "ios_sdk_path") == null);
+    }
 };
 
 // ── manifest-v2 sokol-wasm GOLDEN cell (epic #453 item 3, PR 7, design §7) ──
