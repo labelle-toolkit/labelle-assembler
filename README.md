@@ -54,6 +54,18 @@ relied on it must now declare `.backend = .raylib`. The bgfx default
 needs `.core_version` >= 2.1.0, and `generate` refuses an older core with a
 diagnostic that names the floor.
 
+`.asset_compression` is keyed by target name (labelle-cli RFC #471 P1):
+`.desktop`, `.android`, `.ios` and `.wasm` select `.png` (the default) or
+`.astc` for that target. Any other identifier key is accepted and ignored,
+with a warning, so a project written for a newer target set still
+generates. `.web` is the original spelling of `.wasm` and stays accepted
+as a warned alias; `.wasm` wins when both are set. The `.platform` key in
+`project.labelle` is deprecated: the target comes from the command line
+(the `labelle` CLI always passes it). `generate` warns about the key only
+when `--platform` is given, since that is when the key was overridden. A
+direct `generate` without `--platform` still takes its target from
+`.platform`, with no warning.
+
 The `null` backend is a headless test/CI backend with no graphics, audio,
 input, or window subsystem — every backend module is a no-op stub. The
 generated `main()` runs the engine's tick loop for `LABELLE_NULL_FRAMES`
