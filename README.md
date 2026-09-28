@@ -201,11 +201,12 @@ is true:
   .build_options = .{ "ios_sdk_path" },
   ```
 
-- its `build.zig` declares the option with the string literal
-  `"ios_sdk_path"` (`b.option([]const u8, "ios_sdk_path", ...)`). This
-  keeps existing plugins such as labelle-box2d working unchanged. Comments
-  don't count; a plugin that builds the option name indirectly must use the
-  manifest key.
+- its `build.zig` declares the option: a `b.option(<type>, "ios_sdk_path", ...)`
+  call with that string literal as the second argument. This keeps existing
+  plugins such as labelle-box2d working unchanged. The string anywhere else
+  (a comment, a constant, a message) doesn't count; a plugin that passes the
+  name indirectly, or declares it in an imported file, must use the manifest
+  key.
 
 ### Run tests
 

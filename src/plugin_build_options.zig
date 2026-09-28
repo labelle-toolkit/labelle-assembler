@@ -15,14 +15,15 @@
 //!   1. **Manifest (the contract):** `plugin.labelle` lists it —
 //!      `.build_options = .{ "ios_sdk_path" }`. Validated at manifest load
 //!      against `provided` (an unknown name fails loudly).
-//!   2. **Detection (back-compat):** the plugin's own `build.zig` contains
-//!      the string literal `"ios_sdk_path"` — the name argument of its
-//!      `b.option(...)` call. This keeps plugins that already declare the
-//!      option (labelle-box2d, labelle-box2d-physctl, labelle-ios) receiving
-//!      it with no manifest change. The scan uses the Zig tokenizer, so a
-//!      comment mentioning the name does not count. A plugin that declares
-//!      the option indirectly (e.g. a name built at comptime, or in an
-//!      imported file) must use the manifest key.
+//!   2. **Detection (back-compat):** the plugin's own `build.zig` declares
+//!      it — a `b.option(<type>, "ios_sdk_path", …)` call, found with the Zig
+//!      tokenizer (the `.option(` call whose second argument is exactly that
+//!      string literal). This keeps plugins that already declare the option
+//!      (labelle-box2d, labelle-box2d-physctl, labelle-ios) receiving it with
+//!      no manifest change. The string anywhere else (a comment, a constant,
+//!      a message, another call) does not count. A plugin that declares the
+//!      option indirectly (a name held in a constant, built at comptime, or
+//!      declared in an imported file) must use the manifest key.
 //!
 //! A plugin with neither gets no `ios_sdk_path`, and its iOS build no longer
 //! fails on an unknown option.
@@ -49,24 +50,50 @@ pub fn isProvided(name: []const u8) bool {
     return false;
 }
 
-/// True when `source` (a `build.zig`) contains the string literal
-/// `"<option>"` outside comments — the name argument of a
-/// `b.option(T, "<option>", ...)` declaration.
-pub fn buildZigMentionsOption(allocator: std.mem.Allocator, source: []const u8, option: []const u8) !bool {
+/// True when `source` (a `build.zig`) DECLARES `option`: it contains a
+/// `<expr>.option(<type>, "<option>", …)` call — `b.option([]const u8,
+/// "ios_sdk_path", "…")` — whose SECOND argument is exactly that string
+/// literal. Tokenizer-based: comments never count, and neither does the
+/// string anywhere else (a constant, a diagnostic, another call's
+/// argument, `.option`'s first or third argument). The first argument (the
+/// type) is skipped with bracket balancing, so `?[]const u8`,
+/// `std.Build.LazyPath` or `enum { a, b }` all work.
+pub fn buildZigDeclaresOption(allocator: std.mem.Allocator, source: []const u8, option: []const u8) !bool {
     const z = try allocator.dupeZ(u8, source);
     defer allocator.free(z);
+    var toks: std.ArrayList(std.zig.Token) = .empty;
+    defer toks.deinit(allocator);
     var tokenizer = std.zig.Tokenizer.init(z);
     while (true) {
         const tok = tokenizer.next();
-        switch (tok.tag) {
-            .eof => return false,
-            .string_literal => {
-                const lit = z[tok.loc.start..tok.loc.end];
-                if (lit.len == option.len + 2 and std.mem.eql(u8, lit[1 .. lit.len - 1], option)) return true;
-            },
-            else => {},
-        }
+        if (tok.tag == .eof) break;
+        try toks.append(allocator, tok);
     }
+    const t = toks.items;
+    var i: usize = 0;
+    while (i + 2 < t.len) : (i += 1) {
+        if (t[i].tag != .period or t[i + 1].tag != .identifier or t[i + 2].tag != .l_paren) continue;
+        if (!std.mem.eql(u8, z[t[i + 1].loc.start..t[i + 1].loc.end], "option")) continue;
+        // Skip the first argument up to its top-level comma.
+        var j = i + 3;
+        var depth: usize = 0;
+        const second: ?usize = while (j < t.len) : (j += 1) {
+            switch (t[j].tag) {
+                .l_paren, .l_bracket, .l_brace => depth += 1,
+                .r_paren, .r_bracket, .r_brace => {
+                    if (depth == 0) break null; // call closed: no second arg
+                    depth -= 1;
+                },
+                .comma => if (depth == 0) break j + 1,
+                else => {},
+            }
+        } else null;
+        const k = second orelse continue;
+        if (k >= t.len or t[k].tag != .string_literal) continue;
+        const lit = z[t[k].loc.start..t[k].loc.end];
+        if (lit.len == option.len + 2 and std.mem.eql(u8, lit[1 .. lit.len - 1], option)) return true;
+    }
+    return false;
 }
 
 /// Whether the plugin in `plugin_dir` takes `option`: its manifest lists
@@ -84,7 +111,7 @@ pub fn pluginTakesOption(allocator: std.mem.Allocator, plugin_dir: []const u8, p
         else => return err,
     };
     defer allocator.free(source);
-    return buildZigMentionsOption(allocator, source, option);
+    return buildZigDeclaresOption(allocator, source, option);
 }
 
 /// The names of `cfg.plugins` that take `option`. Caller frees the slice
@@ -106,16 +133,31 @@ pub fn pluginsTakingOption(allocator: std.mem.Allocator, cfg: config.ProjectConf
 
 const testing = std.testing;
 
-test "buildZigMentionsOption: a b.option name literal counts; comments and other strings do not" {
+test "buildZigDeclaresOption: only a b.option(<type>, \"ios_sdk_path\", …) declaration counts" {
     const a = testing.allocator;
-    try testing.expect(try buildZigMentionsOption(a,
-        \\const ios_sdk_path = b.option([]const u8, "ios_sdk_path", "iOS SDK path");
-    , ios_sdk_path));
-    try testing.expect(!try buildZigMentionsOption(a,
-        \\// the assembler used to pass "ios_sdk_path" to every plugin
-        \\const x = b.option(bool, "hot_reload", "ios_sdk_path is not taken");
-    , ios_sdk_path));
-    try testing.expect(!try buildZigMentionsOption(a, "const s = \"ios_sdk_path_v2\";", ios_sdk_path));
+    // Real declarations — including a complex type argument and `builder.`.
+    for ([_][]const u8{
+        "const p = b.option([]const u8, \"ios_sdk_path\", \"iOS SDK path\");",
+        "_ = b.option(?[]const u8, \"ios_sdk_path\", \"sdk\");",
+        "const p = builder.option(\n    []const u8,\n    \"ios_sdk_path\",\n    \"sdk\",\n);",
+        "const p = b.option(enum { a, b }, \"ios_sdk_path\", \"x\");",
+    }) |src| {
+        errdefer std.debug.print("not detected: {s}\n", .{src});
+        try testing.expect(try buildZigDeclaresOption(a, src, ios_sdk_path));
+    }
+    // The string elsewhere: never a declaration.
+    for ([_][]const u8{
+        "// the assembler used to pass \"ios_sdk_path\" to every plugin\nconst x = 1;",
+        "const name = \"ios_sdk_path\";\nconst p = b.option([]const u8, name, \"sdk\");",
+        "std.log.info(\"{s}\", .{\"ios_sdk_path\"});",
+        "const x = b.option(bool, \"hot_reload\", \"ios_sdk_path\");",
+        "const x = foo(\"a\", \"ios_sdk_path\");",
+        "const x = b.option(\"ios_sdk_path\");",
+        "const s = \"ios_sdk_path_v2\"; _ = b.option([]const u8, \"ios_sdk_path_v2\", \"\");",
+    }) |src| {
+        errdefer std.debug.print("wrongly detected: {s}\n", .{src});
+        try testing.expect(!try buildZigDeclaresOption(a, src, ios_sdk_path));
+    }
 }
 
 test "pluginTakesOption: manifest opt-in, build.zig detection, neither" {
@@ -135,7 +177,8 @@ test "pluginTakesOption: manifest opt-in, build.zig detection, neither" {
     // Neither: a manifest without the key and a build.zig without the option.
     try tmp.dir.createDirPath(testing.io, "n");
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "n/plugin.labelle", .data = ".{ .name = \"n\", .manifest_version = 1 }" });
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "n/build.zig", .data = "// no ios_sdk_path option here\n" });
+    // It MENTIONS the string (a constant, a message) but declares no option.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "n/build.zig", .data = "const unused = \"ios_sdk_path\";\npub fn build(b: *std.Build) void { std.log.info(\"no ios_sdk_path: {s}\", .{\"ios_sdk_path\"}); _ = b; }\n" });
     // No build.zig, no manifest.
     try tmp.dir.createDirPath(testing.io, "e");
 
