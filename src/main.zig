@@ -60,6 +60,9 @@ const describe_cmd = @import("describe_cmd.zig");
 /// and `generate --target <name>`, an alias for `--platform`. Additive: an
 /// older CLI never calls either, and a newer CLI probes for them by
 /// requiring protocol >= 7 and falls back to its own tables below that.
+/// Same (still unreleased) protocol, RFC #471 D2: `upgrade backend
+/// [version]` bumps the backend provider pin against the version floors.
+/// The CLI's `upgrade all` delegates to it at protocol >= 7.
 pub const PROTOCOL_VERSION: u32 = 7;
 
 const usage =
@@ -83,7 +86,8 @@ const usage =
     \\  generate    Materialize .labelle/<target>/ from project.labelle
     \\  install     Fetch packages into the local cache
     \\  clean       Prune unused cached package versions
-    \\  upgrade     Bump version fields in project.labelle
+    \\  upgrade     Bump version fields in project.labelle (`upgrade backend
+    \\              [version]` bumps the backend provider pin)
     \\  init        Scaffold a new project directory
     \\  check       Lint packs for §6 convention violations (Packs RFC)
     \\  add         Scaffold a pack or a feature-unit (need/role/status)

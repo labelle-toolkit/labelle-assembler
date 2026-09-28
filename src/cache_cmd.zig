@@ -22,6 +22,7 @@ const gen = @import("root.zig");
 const version_floors = @import("version_floors.zig");
 const cache = @import("cache.zig");
 const config = @import("config.zig");
+const upgrade_backend = @import("upgrade_backend.zig");
 
 /// Write directly to stderr without a level prefix. Matches main.zig.
 fn writeStderr(io: std.Io, msg: []const u8) void {
@@ -490,9 +491,13 @@ const upgrade_usage =
     \\Usage:
     \\  labelle-assembler upgrade --project-root <path> [pkg [version]]
     \\
-    \\Packages: core, engine, gfx, cli, all
+    \\Packages: core, engine, gfx, cli, all, backend
     \\  (no pkg)   upgrade core/engine/gfx/cli to the assembler's defaults
     \\  <pkg>      upgrade one package (to <version>, or the default if omitted)
+    \\  backend    bump the backend provider pin (`.backend_package.version`)
+    \\             to <version>, or to this assembler's default for a
+    \\             first-party backend; judged against the version floors,
+    \\             offline. See README "Upgrade the backend".
     \\
 ;
 
@@ -553,6 +558,20 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
         std.process.exit(1);
     };
 
+    // `upgrade backend [version]` (labelle-cli RFC #471 D2): the backend
+    // provider pin, with its own shorthand/explicit/third-party rules and
+    // the backend/core floor gate — see `upgrade_backend.zig`.
+    if (positionals.items.len > 0 and std.mem.eql(u8, positionals.items[0], "backend")) {
+        if (positionals.items.len > 2) {
+            std.log.err("labelle-assembler upgrade backend: takes at most one version argument", .{});
+            std.process.exit(2);
+        }
+        const requested: ?[]const u8 = if (positionals.items.len > 1) positionals.items[1] else null;
+        const code = upgrade_backend.run(arena_alloc, io, labelle_path, content, requested);
+        if (code != 0) std.process.exit(code);
+        return;
+    }
+
     // What this upgrade WOULD write, decided before anything is rewritten:
     // the floor gate below judges the RESULTING trio + backend pairing, and
     // a refusal must leave project.labelle untouched (#739). `null` = this
@@ -608,7 +627,7 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
             next_cli = gen.CLI_VERSION;
             announce_set = true;
         } else {
-            std.log.err("labelle-assembler upgrade: unknown package '{s}' (packages: core, engine, gfx, cli, all)", .{pkg});
+            std.log.err("labelle-assembler upgrade: unknown package '{s}' (packages: core, engine, gfx, cli, all, backend)", .{pkg});
             std.process.exit(2);
         }
         if (!announce_set) announce_one = .{ .pkg = pkg, .version = version };
@@ -1045,6 +1064,7 @@ fn readProjectConfigQuiet(allocator: std.mem.Allocator, io: std.Io, project_dir:
 
 test {
     std.testing.refAllDecls(@This());
+    _ = upgrade_backend;
 }
 
 // ── tests: upgrade version-field rewriting ───────────────────────────
