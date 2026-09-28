@@ -101,3 +101,20 @@ test "upgrade backend and the fetch path agree on a pre-release pin (#783)" {
     try testing.expect(std.mem.indexOf(u8, w.content, ".version = \"0.31.0-rc.1\"") != null);
     try testing.expectEqualStrings("v0.31.0-rc.1", try config.versionToGitRef(a, "0.31.0-rc.1"));
 }
+
+test "upgrade backend: isStrictSemver / isRelease, and every builtinProvider default is a release (#783)" {
+    for ([_][]const u8{ "1.2.3", "0.30.0", "1.2.3-rc.1", "1.2.3+b.5", "1.2.3-alpha.1+sha.abc" }) |v| try testing.expect(upgrade_backend.isStrictSemver(v));
+    for ([_][]const u8{ "1.2.3.4", "1.2", "v1.2.3", "", "main", "1.2.3-", "1.2.3-01", "1_0.2.3", "1_0.2.3-rc.1", "1.2_0.3+b" }) |v| {
+        errdefer std.debug.print("'{s}' accepted\n", .{v});
+        try testing.expect(!upgrade_backend.isStrictSemver(v));
+    }
+    // Mechanism: `std.SemanticVersion` alone accepts the underscore core;
+    // the fetch-path predicate is what refuses it.
+    _ = try std.SemanticVersion.parse("1_0.2.3-rc.1");
+    try testing.expect(!config.isTagVersion("1_0.2.3-rc.1"));
+    try testing.expect(upgrade_backend.isRelease("1.2.3"));
+    for ([_][]const u8{ "1.2.3-rc.1", "1.2.3+b.5", "1.2", "1.2.3.4" }) |v| try testing.expect(!upgrade_backend.isRelease(v));
+    inline for (@typeInfo(config.Backend).@"enum".fields) |f| {
+        try testing.expect(upgrade_backend.isRelease(config.ProjectConfig.builtinProvider(@enumFromInt(f.value)).?.version));
+    }
+}

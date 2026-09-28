@@ -211,12 +211,15 @@ fn floorGate(a: std.mem.Allocator, prospective: ProjectConfig, warnings: *std.Ar
     return null;
 }
 
-/// Strict semver 2.0.0 (`std.SemanticVersion.parse`): exactly
-/// MAJOR.MINOR.PATCH, optionally `-pre.release` and/or `+build`; no `v`
-/// prefix, no 4th numeric component, no `X.Y` abbreviation.
+/// Strict semver 2.0.0: exactly MAJOR.MINOR.PATCH, optionally
+/// `-pre.release` and/or `+build`; no `v` prefix, no 4th numeric component,
+/// no `X.Y` abbreviation. Also a version the fetch path fetches as its tag
+/// (`config.isTagVersion`, #783): `std.SemanticVersion.parse` alone takes a
+/// numeric core like `1_0.2.3`, which the fetch path would clone as a
+/// verbatim branch — so such a pin is never written.
 pub fn isStrictSemver(v: []const u8) bool {
     _ = std.SemanticVersion.parse(v) catch return false;
-    return true;
+    return config.isTagVersion(v);
 }
 
 /// Strict semver with NO pre-release/build suffix.
@@ -853,7 +856,7 @@ test "upgrade backend: versions are strict semver — 1.2.3.4, 1.2, v1.2.3 inval
     const shorthand = ".{ .name = \"g\", .backend = .sokol }";
     const explicit = ".{ .name = \"g\", .backend_package = .{ .name = \"acme\", .repo = \"github.com/acme/labelle-acme\", .version = \"1.0.0\" } }";
     for ([_][]const u8{ shorthand, explicit }) |src| {
-        for ([_][]const u8{ "1.2.3.4", "1.2", "v1.2.3", "1.2.3-", "01.2.3" }) |bad| {
+        for ([_][]const u8{ "1.2.3.4", "1.2", "v1.2.3", "1.2.3-", "01.2.3", "1_0.2.3", "1_0.2.3-rc.1" }) |bad| {
             const r = try plan(ar.a(), src, bad);
             errdefer std.debug.print("version '{s}' was not refused\n", .{bad});
             try testing.expectEqual(Outcome.Kind.refuse, r.kind);
@@ -970,16 +973,6 @@ test "upgrade backend: a first-party .backend_package with no .version gets the 
     , out.content);
     // ...and a second bare run is a no-op.
     try testing.expectEqual(Outcome.Kind.noop, (try plan(ar.a(), out.content, null)).kind);
-}
-
-test "isStrictSemver / isRelease, and every builtinProvider default is a release" {
-    for ([_][]const u8{ "1.2.3", "0.30.0", "1.2.3-rc.1", "1.2.3+b.5", "1.2.3-alpha.1+sha.abc" }) |v| try testing.expect(isStrictSemver(v));
-    for ([_][]const u8{ "1.2.3.4", "1.2", "v1.2.3", "", "main", "1.2.3-", "1.2.3-01" }) |v| try testing.expect(!isStrictSemver(v));
-    try testing.expect(isRelease("1.2.3"));
-    for ([_][]const u8{ "1.2.3-rc.1", "1.2.3+b.5", "1.2", "1.2.3.4" }) |v| try testing.expect(!isRelease(v));
-    inline for (@typeInfo(config.Backend).@"enum".fields) |f| {
-        try testing.expect(isRelease(ProjectConfig.builtinProvider(@enumFromInt(f.value)).?.version));
-    }
 }
 
 test "upgrade backend: comments, strings and enum literals spelling the field are not matched" {
