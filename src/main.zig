@@ -268,7 +268,7 @@ fn cmdGenerate(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    var cfg = readProjectConfig(arena_alloc, io, root, .{ .target_from_command_line = platform_override != null }) catch |err| {
+    var cfg = readProjectConfig(arena_alloc, io, root, .{ .target_from_command_line = targetFromCommandLine(platform_override, target_override) }) catch |err| {
         std.log.err("labelle-assembler: failed to read project.labelle in '{s}': {s}", .{ root, @errorName(err) });
         std.process.exit(1);
     };
@@ -347,6 +347,28 @@ fn parsePlatform(val: []const u8) ?gen.Platform {
     if (std.meta.stringToEnum(gen.Platform, val)) |p| return p;
     std.log.err("labelle-assembler: unknown platform '{s}'\n  expected one of:{s}", .{ val, enumFieldList(gen.Platform) });
     return null;
+}
+
+/// Whether the command line named the target, by either spelling. This is
+/// what makes a `.platform` key in project.labelle "overridden for this run",
+/// the one case `target_keys` warns about it (RFC labelle-cli#471 P1).
+fn targetFromCommandLine(platform_override: ?gen.Platform, target_override: ?[]const u8) bool {
+    return platform_override != null or target_override != null;
+}
+
+test "targetFromCommandLine: --platform or --target (either, or both) counts; neither does not" {
+    try std.testing.expect(!targetFromCommandLine(null, null));
+    try std.testing.expect(targetFromCommandLine(.android, null));
+    try std.testing.expect(targetFromCommandLine(null, "android"));
+    try std.testing.expect(targetFromCommandLine(.wasm, "wasm"));
+    // And that flag is what turns the `.platform` warning on.
+    const src: [:0]const u8 = ".{ .name = \"g\", .platform = .android }";
+    const off = try gen.target_keys.findings(std.testing.allocator, src, .{ .target_from_command_line = targetFromCommandLine(null, null) });
+    defer gen.target_keys.freeFindings(std.testing.allocator, off);
+    try std.testing.expectEqual(@as(usize, 0), off.len);
+    const on = try gen.target_keys.findings(std.testing.allocator, src, .{ .target_from_command_line = targetFromCommandLine(null, "android") });
+    defer gen.target_keys.freeFindings(std.testing.allocator, on);
+    try std.testing.expectEqual(@as(usize, 1), on.len);
 }
 
 /// Map a `--target` name onto the internal Platform enum (the only targets

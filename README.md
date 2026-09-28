@@ -64,8 +64,8 @@ generates. `.web` is the original spelling of `.wasm` and stays accepted
 as a warned alias; `.wasm` wins when both are set. The `.platform` key in
 `project.labelle` is deprecated: the target comes from the command line
 (the `labelle` CLI always passes it). `generate` warns about the key only
-when `--platform` is given, since that is when the key was overridden. A
-direct `generate` without `--platform` still takes its target from
+when `--platform` or `--target` is given, since that is when the key was
+overridden. A direct `generate` with neither still takes its target from
 `.platform`, with no warning.
 
 The `null` backend is a headless test/CI backend with no graphics, audio,
@@ -119,11 +119,20 @@ which is how the CLI came to name a third-party
 
 It answers with the same code `generate` runs: the `.backend` shorthand
 (`builtinProvider`), an explicit `.backend_package`, third-party packages,
-the `bgfx` default, `backendName()` for the target dir, `.asset_compression`
-for the asset format, the provider identity check, the requirement that an
-installed package ship `backend.manifest.v2.zon`, and the resolve-time capability check (the project's
-required capabilities against the provider's declared `.capabilities`, plus
-the v2 manifest's `.platforms.<target>` entry) for `supported`.
+the `bgfx` default, `backendName()` for the target dir, and `.asset_compression`
+for the asset format. For `supported`, when the package is installed, it
+calls **the same provider check `generate` runs before codegen**
+(`provider_contracts.checkProvider`). That check covers:
+- the manifest requirement and version floors;
+- the v2 manifest parse;
+- lifecycle privilege, provider identity and id collision;
+- capabilities;
+- the editor-preview link path and the declared build hook;
+- the `.platforms.<target>` entry, its entry template and builtin root deps;
+- the callback-lifecycle rule.
+
+A failure there is `supported: false`, with the exact diagnostic `generate`
+prints as the `reason`.
 
 It is **offline and config-only**: it reads `project.labelle` and, when the
 backend package is already installed, that package's manifest. It fetches

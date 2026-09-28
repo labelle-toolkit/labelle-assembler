@@ -50,8 +50,8 @@ const config = @import("config.zig");
 const capabilities = @import("capabilities.zig");
 const backend_registry = @import("backend_registry.zig");
 const manifest_v2 = @import("codegen/manifest_v2.zig");
-const manifest_v2_splice = @import("codegen/manifest_v2_splice.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
+const provider_contracts = @import("root/provider_contracts.zig");
 
 const Capability = config.Capability;
 const ProjectConfig = config.ProjectConfig;
@@ -198,93 +198,50 @@ pub fn describe(arena: std.mem.Allocator, cfg_in: ProjectConfig, project_dir: []
         if (b.isLocal()) desc.backend.local_path = pkg_dir;
     }
 
-    // The declared capability set, and the v2 manifest when there is one.
-    // `capabilities_source` becomes `.manifest` only once a v2 manifest has
-    // actually been parsed.
-    var declared: []const Capability = &.{};
-    var manifest: ?manifest_v2.BackendManifestV2 = null;
-    if (installed) {
-        const v2_path = try std.fs.path.join(arena, &.{ pkg_dir, manifest_v2.V2_MANIFEST_NAME });
-        if (!dirExists(v2_path)) {
-            // `generate` needs the v2 build-graph manifest: without it the
-            // run fails with `ExternalBackendNeedsManifest`, whether or not a
-            // legacy `backend.manifest.zon` is present (that file carries
-            // identity only; the v1 codegen path is gone).
-            const legacy_path = try std.fs.path.join(arena, &.{ pkg_dir, manifest_splice.LEGACY_MANIFEST_NAME });
-            desc.supported = false;
-            desc.reason = if (dirExists(legacy_path))
-                try std.fmt.allocPrint(arena, "backend '{s}': the package at '{s}' ships only the legacy {s}; generate needs {s} (ExternalBackendNeedsManifest)", .{ name, pkg_dir, manifest_splice.LEGACY_MANIFEST_NAME, manifest_v2.V2_MANIFEST_NAME })
-            else
-                try std.fmt.allocPrint(arena, "backend '{s}': the package at '{s}' ships no {s}; generate needs one (ExternalBackendNeedsManifest)", .{ name, pkg_dir, manifest_v2.V2_MANIFEST_NAME });
-            return desc;
+    if (platform == null) {
+        if (!installed and desc.backend.id == null) {
+            if (bp) |b| {
+                if (builtinSnapshot(b) != null) desc.backend.id = try std.fmt.allocPrint(arena, "labelle.{s}", .{name});
+            }
         }
-        const m = manifest_v2.loadNamedManifest(arena, cfg, project_dir, manifest_v2.V2_MANIFEST_NAME) catch |err| {
-            desc.supported = false;
-            desc.reason = try std.fmt.allocPrint(arena, "backend '{s}': {s} at '{s}' could not be read ({s})", .{ name, manifest_v2.V2_MANIFEST_NAME, pkg_dir, @errorName(err) });
-            return desc;
-        };
-        desc.capabilities_source = .manifest;
-        manifest = m;
-        declared = m.capabilities;
-
-        // The identity check `generate` runs (`validateProviderContracts`)
-        // before any codegen: a reserved, drifted or malformed id fails the
-        // run, so it is never reported as a supported identity.
-        if (m.id) |id| {
-            var w: std.Io.Writer.Allocating = .init(arena);
-            backend_registry.checkProviderIdentity(cfg, id, &w.writer) catch {
-                desc.supported = false;
-                desc.reason = w.written();
-                return desc;
-            };
-            desc.backend.id = id;
-        }
-    } else if (bp) |b| {
-        if (builtinSnapshot(b)) |s| {
-            desc.capabilities_source = .builtin;
-            declared = s.capabilities;
-        }
-    }
-
-    // A first-party provider's id is derivable without its manifest
-    // (`backend_registry.validateProviderIdentity`: "a built-in derives
-    // labelle.<name> silently").
-    if (desc.backend.id == null and desc.capabilities_source == .builtin) {
-        desc.backend.id = try std.fmt.allocPrint(arena, "labelle.{s}", .{name});
-    }
-
-    const p = platform orelse {
         desc.supported = false;
         desc.reason = try std.fmt.allocPrint(arena, "backend '{s}' has no target '{s}': this assembler generates for{s}", .{ name, target, target_list });
         return desc;
-    };
+    }
 
-    // The v2 build-graph matrix: an absent `.platforms.<target>` entry is
-    // what fails generation with `error.V2PlatformUnsupported`.
-    if (manifest) |m| {
-        if (manifest_v2_splice.platformEntry(m, p) == null) {
+    if (installed) {
+        // THE check `generate` runs before codegen (manifest requirement,
+        // version floors, v2 parse, lifecycle privilege, identity, id
+        // collision, capabilities, platform entry, callback rule). A problem
+        // there is exactly a `generate` failure, reported as the reason.
+        const v = try provider_contracts.checkProvider(arena, cfg, project_dir, .{ .emit_warnings = false });
+        if (v.manifest_loaded) desc.capabilities_source = .manifest;
+        desc.backend.id = v.id;
+        if (v.problem) |prob| {
             desc.supported = false;
-            desc.reason = try std.fmt.allocPrint(arena, "backend '{s}' does not support target '{s}': its {s} declares no `.platforms.{s}` entry", .{ desc.backend.id orelse name, target, manifest_v2.V2_MANIFEST_NAME, @tagName(p) });
-            return desc;
+            desc.reason = prob.message;
         }
+        return desc;
     }
 
-    // Capability negotiation, with `capabilities.validate`'s rules: a
-    // provider declaring no capabilities is not enforced.
-    if (declared.len == 0) return desc;
-    const required = try capabilities.requiredCapabilities(arena, cfg);
-    var missing: std.ArrayList(u8) = .empty;
-    for (required) |cap| {
-        for (declared) |d| {
-            if (d == cap) break;
-        } else {
-            if (missing.items.len != 0) try missing.appendSlice(arena, ", ");
-            try missing.appendSlice(arena, @tagName(cap));
-        }
-    }
-    if (missing.items.len != 0) {
+    // Not installed: only the config-only checks can run. Version floors
+    // are one; capabilities come from the first-party snapshot, judged by
+    // the same `capabilities.missingMessage` generate uses.
+    if (try provider_contracts.floorProblem(arena, cfg, false)) |prob| {
         desc.supported = false;
-        desc.reason = try std.fmt.allocPrint(arena, "backend provider '{s}' does not support capability '{s}' required by target '{s}'", .{ desc.backend.id orelse name, missing.items, target });
+        desc.reason = prob.message;
+    }
+    const b = bp orelse return desc;
+    const snap = builtinSnapshot(b) orelse return desc;
+    desc.capabilities_source = .builtin;
+    // A first-party provider's id is derivable without its manifest
+    // (`validateProviderIdentity`: "a built-in derives labelle.<name>").
+    desc.backend.id = try std.fmt.allocPrint(arena, "labelle.{s}", .{name});
+    if (!desc.supported) return desc;
+    const required = try capabilities.requiredCapabilities(arena, cfg);
+    if (try capabilities.missingMessage(arena, required, snap.capabilities, desc.backend.id.?)) |msg| {
+        desc.supported = false;
+        desc.reason = msg;
     }
     return desc;
 }
@@ -408,6 +365,7 @@ const Fixture = struct {
         const name = file_name orelse return;
         const file = try std.fs.path.join(f.arena(), &.{ rel, name });
         try f.tmp.dir.writeFile(testing.io, .{ .sub_path = file, .data = data });
+        if (std.mem.eql(u8, name, manifest_v2.V2_MANIFEST_NAME)) try writeTemplates(f.tmp.dir, rel);
     }
 };
 
@@ -441,6 +399,7 @@ test "describe: an explicit .backend_package wins, and a local package reports l
     defer f.deinit();
     try f.tmp.dir.createDirPath(testing.io, "vendor/bgfx");
     try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "vendor/bgfx/" ++ manifest_v2.V2_MANIFEST_NAME, .data = test_manifest_desktop_android });
+    try writeTemplates(f.tmp.dir, "vendor/bgfx");
     const cfg = try f.parse(
         \\.{ .name = "g", .backend = .bgfx,
         \\   .backend_package = .{ .name = "bgfx", .repo = "local:vendor/bgfx", .version = "0.99.0" } }
@@ -456,11 +415,12 @@ test "describe: an explicit .backend_package wins, and a local package reports l
     try testing.expectEqual(CapabilitySource.manifest, d.capabilities_source);
     try testing.expect(d.supported);
 
-    // The same manifest has no wasm platform entry: generation would raise
-    // V2PlatformUnsupported, so describe says unsupported.
+    // The same manifest cannot do wasm, so describe says unsupported.
     const w = try describe(f.arena(), cfg, f.dir, "wasm");
     try testing.expect(!w.supported);
-    try testing.expect(std.mem.indexOf(u8, w.reason.?, "`.platforms.wasm`") != null);
+    // generate's order: capability negotiation runs before the platform
+    // entry, and this manifest declares no `.wasm` capability either.
+    try testing.expect(std.mem.indexOf(u8, w.reason.?, "does not support capability 'wasm'") != null);
 }
 
 test "describe: a third-party .backend_package with no .backend names the target dir after the package (RFC #471 finding 4)" {
@@ -496,8 +456,9 @@ test "describe: an unsupported pair (raylib + ios) is supported=false with a rea
     const cfg = try f.parse(".{ .name = \"g\", .backend = .raylib }");
     const d = try describe(f.arena(), cfg, f.dir, "ios");
     try testing.expect(!d.supported);
+    // `capabilities.validate`'s own diagnostic: the message generate prints.
     try testing.expectEqualStrings(
-        "backend provider 'labelle.raylib' does not support capability 'ios' required by target 'ios'",
+        "labelle-assembler: backend provider 'labelle.raylib' does not support capability 'ios' required by this project.\n  Choose a provider that advertises 'ios', or remove the requirement.",
         d.reason.?,
     );
     // The same backend is fine on wasm.
@@ -560,7 +521,7 @@ test "describe: JSON shape (golden)" {
         \\  },
         \\  "asset_format": "astc",
         \\  "supported": false,
-        \\  "reason": "backend provider 'labelle.raylib' does not support capability 'ios' required by target 'ios'",
+        \\  "reason": "labelle-assembler: backend provider 'labelle.raylib' does not support capability 'ios' required by this project.\n  Choose a provider that advertises 'ios', or remove the requirement.",
         \\  "capabilities_source": "builtin"
         \\}
         \\
@@ -568,7 +529,7 @@ test "describe: JSON shape (golden)" {
     try testing.expectEqualStrings(golden, out.written());
 
     // And the installed, supported form carries `package_dir` and no `reason`.
-    try f.installPackage("plugins/github.com/labelle-toolkit/labelle-raylib/0.3.0", try manifestWithId(f.arena(), "labelle.raylib"));
+    try f.installPackage("plugins/github.com/labelle-toolkit/labelle-raylib/0.3.0", try manifestV2(f.arena(), "labelle.raylib", ".screenshots", loop_desktop));
     const i = try describe(f.arena(), cfg, f.dir, "desktop");
     var out2: std.Io.Writer.Allocating = .init(f.arena());
     try writeJson(&out2.writer, i);
@@ -607,92 +568,172 @@ test "describe: human output" {
     try testing.expect(std.mem.indexOf(u8, text, "target dir    .labelle/raylib_ios\n") != null);
     try testing.expect(std.mem.indexOf(u8, text, "backend       raylib (labelle.raylib)\n") != null);
     try testing.expect(std.mem.indexOf(u8, text, "supported     NO") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "reason      backend provider 'labelle.raylib'") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "reason      labelle-assembler: backend provider 'labelle.raylib'") != null);
 }
 
-test "describe: an installed package with only the legacy backend.manifest.zon is unsupported (generate needs v2)" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    const cfg = try f.parse(
-        \\.{ .name = "g", .backend_package = .{ .name = "acme", .repo = "github.com/acme/labelle-acme", .version = "1.0.0" } }
-    );
-    try f.installFile("plugins/github.com/acme/labelle-acme/1.0.0", manifest_splice.LEGACY_MANIFEST_NAME,
-        \\.{ .dir_name = "acme", .dep_name = "labelle_acme", .id = "acme.acme", .capabilities = .{ .screenshots } }
-    );
-    const d = try describe(f.arena(), cfg, f.dir, "desktop");
-    try testing.expect(!d.supported);
-    try testing.expect(std.mem.indexOf(u8, d.reason.?, "ships only the legacy backend.manifest.zon") != null);
-    try testing.expect(std.mem.indexOf(u8, d.reason.?, "ExternalBackendNeedsManifest") != null);
-    // The legacy file's capabilities were not used for the answer.
-    try testing.expectEqual(CapabilitySource.unknown, d.capabilities_source);
-    try testing.expect(d.package_dir != null);
+/// The entry templates the fixture manifests name, so a supported case
+/// passes generate's template check.
+fn writeTemplates(dir: std.Io.Dir, pkg_rel: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    for ([_][]const u8{ "t/d.txt", "t/a.txt", "templates/desktop.txt", "templates/android.txt" }) |t| {
+        const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ pkg_rel, t });
+        try dir.createDirPath(testing.io, std.fs.path.dirname(path).?);
+        try dir.writeFile(testing.io, .{ .sub_path = path, .data = "" });
+    }
 }
 
-test "describe: an installed package dir with no manifest is unsupported and capabilities_source stays unknown" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    const cfg = try f.parse(".{ .name = \"g\", .backend = .raylib }");
-    try f.installFile("plugins/github.com/labelle-toolkit/labelle-raylib/0.3.0", null, "");
-    const d = try describe(f.arena(), cfg, f.dir, "desktop");
-    try testing.expect(!d.supported);
-    try testing.expect(std.mem.indexOf(u8, d.reason.?, "ships no backend.manifest.v2.zon") != null);
-    try testing.expectEqual(CapabilitySource.unknown, d.capabilities_source);
-    try testing.expect(d.package_dir != null);
-}
-
-test "describe: a manifest id that generate's identity check rejects is unsupported, with that check's reason" {
-    var f = try Fixture.init();
-    defer f.deinit();
-
-    // Reserved namespace: a third-party repo claiming `labelle.*`.
-    const third = try f.parse(
-        \\.{ .name = "g", .backend_package = .{ .name = "acme", .repo = "github.com/acme/labelle-acme", .version = "1.0.0" } }
-    );
-    try f.installPackage("plugins/github.com/acme/labelle-acme/1.0.0", try manifestWithId(f.arena(), "labelle.bgfx"));
-    const r = try describe(f.arena(), third, f.dir, "desktop");
-    try testing.expect(!r.supported);
-    try testing.expect(r.backend.id == null);
-    try testing.expect(std.mem.indexOf(u8, r.reason.?, "claims the reserved 'labelle.*' namespace") != null);
-
-    // Drift: the `.sokol` shorthand resolving a manifest that says bgfx.
-    const shorthand = try f.parse(".{ .name = \"g\", .backend = .sokol }");
-    try f.installPackage("plugins/github.com/labelle-toolkit/labelle-sokol/" ++ comptime ProjectConfig.builtinProvider(.sokol).?.version, try manifestWithId(f.arena(), "labelle.bgfx"));
-    const drift = try describe(f.arena(), shorthand, f.dir, "desktop");
-    try testing.expect(!drift.supported);
-    try testing.expect(drift.backend.id == null);
-    try testing.expect(std.mem.indexOf(u8, drift.reason.?, "but the tag is a shorthand for 'labelle.sokol'") != null);
-
-    // Malformed: no namespace.
-    const local = try f.parse(
-        \\.{ .name = "g", .backend_package = .{ .name = "odd", .repo = "local:vendor/odd", .version = "0.1.0" } }
-    );
-    try f.tmp.dir.createDirPath(testing.io, "vendor/odd");
-    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "vendor/odd/" ++ manifest_v2.V2_MANIFEST_NAME, .data = try manifestWithId(f.arena(), "odd") });
-    const bad = try describe(f.arena(), local, f.dir, "desktop");
-    try testing.expect(!bad.supported);
-    try testing.expect(bad.backend.id == null);
-    try testing.expect(std.mem.indexOf(u8, bad.reason.?, "is not a canonical '<namespace>.<name>'") != null);
-
-    // The same checks, through generate's own entry point, agree.
-    try testing.expectError(error.ReservedProviderNamespace, backend_registry.validateProviderIdentity(third, "labelle.bgfx"));
-    try testing.expectError(error.ProviderIdDrift, backend_registry.validateProviderIdentity(shorthand, "labelle.bgfx"));
-    try testing.expectError(error.MalformedProviderId, backend_registry.validateProviderIdentity(local, "odd"));
-}
-
-fn manifestWithId(a: std.mem.Allocator, id: []const u8) ![]const u8 {
+/// A v2 manifest for the fixtures. `id` null omits `.id`; `platforms` is
+/// the `.platforms` body.
+fn manifestV2(a: std.mem.Allocator, id: ?[]const u8, caps: []const u8, platforms: []const u8) ![]const u8 {
+    const id_line = if (id) |i| try std.fmt.allocPrint(a, "    .id = \"{s}\",\n", .{i}) else "";
     return std.fmt.allocPrint(a,
         \\.{{
         \\    .manifest_version = 2,
         \\    .dir_name = "x",
         \\    .dep_name = "labelle_x",
-        \\    .id = "{s}",
-        \\    .capabilities = .{{ .screenshots }},
+        \\{s}    .capabilities = .{{ {s} }},
         \\    .modules = .{{}},
-        \\    .platforms = .{{
-        \\        .desktop = .{{ .entry = "templates/desktop.txt", .loop_style = .loop, .target = .native, .package = .binary }},
-        \\    }},
+        \\    .platforms = .{{ {s} }},
         \\}}
-    , .{id});
+    , .{ id_line, caps, platforms });
+}
+
+const loop_desktop = ".desktop = .{ .entry = \"t/d.txt\", .loop_style = .loop, .target = .native, .package = .binary },";
+const callback_desktop = ".desktop = .{ .entry = \"t/d.txt\", .loop_style = .callback, .target = .native, .package = .binary },";
+const callback_desktop_declared = ".desktop = .{ .entry = \"t/d.txt\", .loop_style = .callback, .target = .native, .package = .binary, .lifecycle = .{ .runner_module_var = true } },";
+const privileged_desktop = ".desktop = .{ .entry = \"t/d.txt\", .loop_style = .callback, .target = .native, .package = .binary, .lifecycle = .{ .preview = .sokol_readback } },";
+const loop_android = ".android = .{ .entry = \"t/a.txt\", .loop_style = .loop, .target = .resolved, .package = .{ .apk = .{} } },";
+
+const acme_cfg = ".{ .name = \"g\", .y_axis = .up, .backend_package = .{ .name = \"acme\", .repo = \"github.com/acme/labelle-acme\", .version = \"1.0.0\" } }";
+const acme_dir = "plugins/github.com/acme/labelle-acme/1.0.0";
+const sokol_cfg = ".{ .name = \"g\", .y_axis = .up, .backend = .sokol }";
+const sokol_dir = "plugins/github.com/labelle-toolkit/labelle-sokol/" ++ ProjectConfig.builtinProvider(.sokol).?.version;
+const bgfx_dir = "plugins/github.com/labelle-toolkit/labelle-bgfx/" ++ ProjectConfig.builtinProvider(.bgfx).?.version;
+
+fn caseManifest(a: std.mem.Allocator, c: Case) ![]const u8 {
+    if (c.raw) |r| {
+        if (!std.mem.eql(u8, r, "BUILD_HOOK")) return r;
+        const base = try manifestV2(a, "acme.acme", ".screenshots", loop_desktop);
+        // Splice `.build_hook` in before the closing brace.
+        return std.fmt.allocPrint(a, "{s}    .build_hook = \"backend.hook.zig\",\n}}", .{base[0 .. base.len - 1]});
+    }
+    return manifestV2(a, c.id, c.caps, c.platforms);
+}
+
+/// One row of the describe ↔ generate agreement table.
+const Case = struct {
+    name: []const u8,
+    cfg: [:0]const u8,
+    target: []const u8 = "desktop",
+    /// Package dir under the cache's `packages/`.
+    pkg: []const u8,
+    /// File to write there (null: an empty package dir).
+    file: ?[]const u8 = manifest_v2.V2_MANIFEST_NAME,
+    /// The manifest: `id`, capabilities and platforms, or `raw` verbatim.
+    id: ?[]const u8 = null,
+    caps: []const u8 = ".screenshots, .android",
+    platforms: []const u8 = loop_desktop,
+    raw: ?[]const u8 = null,
+    /// The error generate fails with, or null when it passes every check.
+    expect: ?[]const u8,
+    /// The `backend.id` describe reports when supported.
+    expect_id: ?[]const u8 = null,
+};
+
+const cases = [_]Case{
+    .{ .name = "happy: loop backend with its id", .cfg = sokol_cfg, .pkg = sokol_dir, .id = "labelle.sokol", .expect = null, .expect_id = "labelle.sokol" },
+    .{ .name = "happy: built-in without .id derives labelle.<name>", .cfg = sokol_cfg, .pkg = sokol_dir, .expect = null, .expect_id = "labelle.sokol" },
+    .{ .name = "happy: third-party with a vendor id", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .expect = null, .expect_id = "acme.acme" },
+    .{ .name = "happy: declared callback lifecycle", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .platforms = callback_desktop_declared, .expect = null, .expect_id = "acme.acme" },
+    .{ .name = "happy: an android entry + capability", .cfg = acme_cfg, .target = "android", .pkg = acme_dir, .id = "acme.acme", .caps = ".android, .surface_loss", .platforms = loop_android, .expect = null, .expect_id = "acme.acme" },
+    .{ .name = "no manifest at all", .cfg = acme_cfg, .pkg = acme_dir, .file = null, .expect = "ExternalBackendNeedsManifest" },
+    .{ .name = "legacy-only manifest", .cfg = acme_cfg, .pkg = acme_dir, .file = manifest_splice.LEGACY_MANIFEST_NAME, .raw = ".{ .id = \"acme.acme\", .capabilities = .{ .screenshots } }", .expect = "ExternalBackendNeedsManifest" },
+    .{ .name = "unparseable v2 manifest", .cfg = acme_cfg, .pkg = acme_dir, .raw = ".{ .manifest_version = 2, .dir_name = }", .expect = "BackendManifestParseError" },
+    .{ .name = "reserved namespace", .cfg = acme_cfg, .pkg = acme_dir, .id = "labelle.bgfx", .expect = "ReservedProviderNamespace" },
+    .{ .name = "shorthand id drift", .cfg = sokol_cfg, .pkg = sokol_dir, .id = "labelle.bgfx", .expect = "ProviderIdDrift" },
+    .{ .name = "malformed id", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme", .expect = "MalformedProviderId" },
+    .{ .name = "privileged lifecycle from a third party", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .platforms = privileged_desktop, .expect = "PrivilegedLifecycleRequiresReservedNamespace" },
+    .{ .name = "undeclared callback lifecycle", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .platforms = callback_desktop, .expect = "ExternalCallbackBackendUnsupported" },
+    .{ .name = "missing capability", .cfg = acme_cfg, .target = "android", .pkg = acme_dir, .id = "acme.acme", .caps = ".screenshots", .platforms = loop_android, .expect = "UnsupportedCapability" },
+    .{ .name = "missing platform entry", .cfg = acme_cfg, .target = "android", .pkg = acme_dir, .id = "acme.acme", .caps = ".android, .surface_loss", .expect = "V2PlatformUnsupported" },
+    .{ .name = "entry template missing", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .platforms = ".desktop = .{ .entry = \"t/missing.txt\", .loop_style = .loop, .target = .native, .package = .binary },", .expect = "TemplateNotFound" },
+    .{ .name = "unknown builtin root build dep", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .platforms = ".desktop = .{ .entry = \"t/d.txt\", .loop_style = .loop, .target = .native, .package = .binary, .root_build_deps = .{ .{ .name = \"ndk\", .resolution = .builtin } } },", .expect = "UnknownBuiltinRootDep" },
+    .{ .name = "declared build hook missing", .cfg = acme_cfg, .pkg = acme_dir, .raw = "BUILD_HOOK", .expect = "FileNotFound" },
+    .{ .name = "version floor (bgfx 0.30.0 on core 1.32.0)", .cfg = ".{ .name = \"g\", .y_axis = .up, .backend = .bgfx, .core_version = \"1.32.0\", .engine_version = \"2.12.2\", .gfx_version = \"1.30.1\" }", .pkg = bgfx_dir, .id = "labelle.bgfx", .expect = "VersionFloorViolation" },
+};
+
+test "describe: agrees with generate's provider check on every case (supported/reason = generate's outcome)" {
+    for (cases) |c| {
+        var f = try Fixture.init();
+        defer f.deinit();
+        const a = f.arena();
+        const manifest = try caseManifest(a, c);
+        try f.installFile(c.pkg, c.file, manifest);
+        var cfg = try f.parse(c.cfg);
+
+        const d = try describe(a, cfg, f.dir, c.target);
+        // The check `generate` runs, on the same config.
+        cfg.platform = parseTarget(c.target).?;
+        const v = try provider_contracts.checkProvider(a, cfg, f.dir, .{ .emit_warnings = false });
+
+        errdefer std.debug.print("case '{s}': supported={} reason={?s}\n", .{ c.name, d.supported, d.reason });
+        if (c.expect) |want| {
+            const p = v.problem orelse return error.TestExpectedProblem;
+            try testing.expectEqualStrings(want, @errorName(p.err));
+            try testing.expect(!d.supported);
+            try testing.expectEqualStrings(p.message, d.reason.?);
+            try testing.expect(d.backend.id == null or !std.mem.eql(u8, want, "ReservedProviderNamespace"));
+        } else {
+            try testing.expect(v.problem == null);
+            try testing.expect(d.supported);
+            try testing.expect(d.reason == null);
+            try testing.expectEqualStrings(c.expect_id.?, d.backend.id.?);
+            try testing.expectEqual(CapabilitySource.manifest, d.capabilities_source);
+        }
+        // A manifest that was not parsed never reads as the capability source.
+        if (!v.manifest_loaded) try testing.expect(d.capabilities_source != .manifest);
+    }
+}
+
+test "describe: the failing cases fail the real generate with the same error" {
+    const gen = @import("root.zig");
+    for (cases) |c| {
+        const want = c.expect orelse continue;
+        var f = try Fixture.init();
+        defer f.deinit();
+        const a = f.arena();
+        const manifest = try caseManifest(a, c);
+        try f.installFile(c.pkg, c.file, manifest);
+        var cfg = try f.parse(c.cfg);
+        cfg.platform = parseTarget(c.target).?;
+        const out = try std.fs.path.join(a, &.{ f.dir, ".labelle" });
+        errdefer std.debug.print("case '{s}'\n", .{c.name});
+        if (gen.generate(testing.allocator, cfg, out, f.dir, .{})) |_| {
+            return error.TestExpectedError;
+        } else |err| {
+            try testing.expectEqualStrings(want, @errorName(err));
+        }
+    }
+}
+
+test "describe: an installed .sokol whose manifest has no .id reports the derived labelle.sokol" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.installFile(sokol_dir, manifest_v2.V2_MANIFEST_NAME, try manifestV2(f.arena(), null, ".screenshots", loop_desktop));
+    const d = try describe(f.arena(), try f.parse(sokol_cfg), f.dir, "desktop");
+    try testing.expect(d.supported);
+    try testing.expectEqual(CapabilitySource.manifest, d.capabilities_source);
+    try testing.expectEqualStrings("labelle.sokol", d.backend.id.?);
+}
+
+test "describe: an installed package dir with no manifest keeps capabilities_source unknown" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.installFile("plugins/github.com/labelle-toolkit/labelle-raylib/0.3.0", null, "");
+    const d = try describe(f.arena(), try f.parse(".{ .name = \"g\", .backend = .raylib }"), f.dir, "desktop");
+    try testing.expect(!d.supported);
+    try testing.expectEqual(CapabilitySource.unknown, d.capabilities_source);
+    try testing.expect(d.package_dir != null);
 }
 
 const test_manifest_desktop_android =
@@ -705,7 +746,7 @@ const test_manifest_desktop_android =
     \\    .modules = .{},
     \\    .platforms = .{
     \\        .desktop = .{ .entry = "templates/desktop.txt", .loop_style = .loop, .target = .native, .package = .binary },
-    \\        .android = .{ .entry = "templates/android.txt", .loop_style = .callback, .target = .resolved, .package = .{ .apk = .{} } },
+    \\        .android = .{ .entry = "templates/android.txt", .loop_style = .callback, .target = .resolved, .package = .{ .apk = .{} }, .lifecycle = .{} },
     \\    },
     \\}
 ;

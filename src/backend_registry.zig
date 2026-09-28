@@ -295,41 +295,67 @@ pub fn assertLifecyclePrivilege(
     declares_privileged: bool,
     manifest_id: ?[]const u8,
 ) !void {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    checkLifecyclePrivilege(cfg, declares_privileged, manifest_id, &w) catch |err| {
+        std.debug.print("{s}\n", .{w.buffered()});
+        return err;
+    };
+}
+
+/// The pure core of `assertLifecyclePrivilege`: on a violation, writes the
+/// diagnostic to `w` (no trailing newline) and returns the error. Shared with
+/// `describe` through `provider_contracts.checkProvider`.
+pub fn checkLifecyclePrivilege(
+    cfg: config.ProjectConfig,
+    declares_privileged: bool,
+    manifest_id: ?[]const u8,
+    w: *std.Io.Writer,
+) error{PrivilegedLifecycleRequiresReservedNamespace}!void {
     if (!declares_privileged) return;
     // Bundled built-in (no provider package): in-tree/trusted. None exist today,
     // but keep the shape parallel to validateProviderIdentity's early return.
     _ = cfg.effectiveBackendPackage() orelse return;
     const id = manifest_id orelse {
-        std.debug.print(
+        w.writeAll(
             "labelle-assembler: a backend provider declares a PRIVILEGED lifecycle block " ++
                 "(sokol readback / bgfx shell) but ships no canonical `.id`. Those blocks emit " ++
-                "backend-private Zig and are reserved to the official `labelle.*` namespace.\n",
-            .{},
-        );
+                "backend-private Zig and are reserved to the official `labelle.*` namespace.",
+        ) catch {};
         return error.PrivilegedLifecycleRequiresReservedNamespace;
     };
     const dot = std.mem.indexOfScalar(u8, id, '.') orelse id.len;
     if (!std.mem.eql(u8, id[0..dot], "labelle")) {
-        std.debug.print(
+        w.print(
             "labelle-assembler: backend provider '{s}' declares a PRIVILEGED lifecycle block " ++
                 "(`preview = .sokol_readback` or `android_register = .bgfx_shell`), but those emit " ++
                 "backend-private Zig and are reserved to the official `labelle.*` namespace. A " ++
                 "third-party callback backend uses the unprivileged defaults (empty preview, no " ++
-                "Android register, input-dispatch stub).\n",
+                "Android register, input-dispatch stub).",
             .{id},
-        );
+        ) catch {};
         return error.PrivilegedLifecycleRequiresReservedNamespace;
     }
 }
 
 pub fn checkProviderIdCollisions(ids: []const []const u8) !void {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    findProviderIdCollision(ids, &w) catch |err| {
+        std.debug.print("{s}\n", .{w.buffered()});
+        return err;
+    };
+}
+
+/// The pure core of `checkProviderIdCollisions` (writes the diagnostic to `w`).
+pub fn findProviderIdCollision(ids: []const []const u8, w: *std.Io.Writer) error{ProviderIdCollision}!void {
     for (ids, 0..) |a, i| {
         for (ids[i + 1 ..]) |b| {
             if (std.mem.eql(u8, a, b)) {
-                std.debug.print(
-                    "labelle-assembler: two resolved providers claim the same canonical id '{s}'. Provider ids must be globally unique.\n",
+                w.print(
+                    "labelle-assembler: two resolved providers claim the same canonical id '{s}'. Provider ids must be globally unique.",
                     .{a},
-                );
+                ) catch {};
                 return error.ProviderIdCollision;
             }
         }
