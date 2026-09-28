@@ -13,6 +13,7 @@ const config = @import("../config.zig");
 const env = @import("env.zig");
 const local = @import("local.zig");
 const local_hint = @import("local_hint.zig");
+const path_key = @import("path_key.zig");
 
 /// Resolve a framework package (core, engine, gfx) to its cached path.
 /// Returns an absolute path like: ~/.labelle/packages/core/0.3.0
@@ -51,9 +52,7 @@ pub fn frameworkVersionPath(allocator: std.mem.Allocator, package: []const u8, v
 /// The version-named slot for a plugin, ignoring any active local slot.
 /// Same contract as `frameworkVersionPath`.
 pub fn pluginVersionPath(allocator: std.mem.Allocator, plugin: config.PluginDep) ![]const u8 {
-    const packages_dir = try env.getPackagesDir(allocator);
-    defer allocator.free(packages_dir);
-    return try std.fs.path.join(allocator, &.{ packages_dir, "plugins", plugin.repo, plugin.version });
+    return pluginSlotPath(allocator, plugin.repo, plugin.version);
 }
 
 /// Resolve an assembler-bundled package (backend, ecs adapter, gui) to its cached path.
@@ -102,9 +101,7 @@ pub fn resolvePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, pro
     // #685: same reserved-slot rule as the framework packages.
     if (try local.activePluginSlot(allocator, plugin)) |slot| return slot;
 
-    const packages_dir = try env.getPackagesDir(allocator);
-    defer allocator.free(packages_dir);
-    return try std.fs.path.join(allocator, &.{ packages_dir, "plugins", plugin.repo, plugin.version });
+    return pluginSlotPath(allocator, plugin.repo, plugin.version);
 }
 
 /// Resolve a local path override relative to a project directory.
@@ -352,9 +349,20 @@ pub fn resolveGuiPackage(allocator: std.mem.Allocator, package: []const u8, vers
         return resolveLocalPath(allocator, config.localVersionPath(version), project_dir);
     }
 
+    return pluginSlotPath(allocator, package, version);
+}
+
+/// `~/.labelle/packages/plugins/<repo>/<version>` through the validating
+/// builder (#782): a repo/version the host cannot name (a `:` on Windows,
+/// from a `git+https://…` spelling) is reported and refused as
+/// `error.UnusableCachePath` BEFORE any filesystem call sees it.
+fn pluginSlotPath(allocator: std.mem.Allocator, repo: []const u8, version: []const u8) ![]const u8 {
     const packages_dir = try env.getPackagesDir(allocator);
     defer allocator.free(packages_dir);
-    return try std.fs.path.join(allocator, &.{ packages_dir, "plugins", package, version });
+    return path_key.pluginCachePath(allocator, packages_dir, repo, version) catch |err| {
+        if (err == error.UnusableCachePath) path_key.report(repo, version);
+        return err;
+    };
 }
 
 /// Resolve a GUI `.url` reference to its deterministic cache path.
