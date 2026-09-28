@@ -21,8 +21,11 @@
 //!   * exactly one root `pub const debug` whose iOS value is a struct with a
 //!     DIRECT `pub const SelfInfo` → accepted; `SLOT` is removed. For
 //!     `if (<cond>) A else B`: when `<cond>` is recognisably
-//!     `….os.tag == .ios` (or `!= .ios`) only the branch iOS takes is
-//!     checked; otherwise EVERY branch must have it (a missing `else` fails);
+//!     the build target's `os.tag == .ios` (or `!= .ios`) — the receiver
+//!     `@import("builtin")[.target]`, or a root identifier bound to it
+//!     (#784) — only the branch iOS takes is checked; otherwise EVERY
+//!     branch must have it (a missing `else` fails). Names compare as the
+//!     identifiers they spell: `@"debug"` is `debug` (#785);
 //!   * a non-`pub` root `debug`, or one whose iOS value has no direct
 //!     `pub const SelfInfo` (a private one, one in a nested type, an
 //!     `@import`, …) → `error.IosRootDebugWithoutSelfInfo`: a second root
@@ -76,7 +79,7 @@ pub fn judge(arena: std.mem.Allocator, source: []const u8) !Verdict {
     var found: std.ArrayList(Ast.full.VarDecl) = .empty;
     for (tree.rootDecls()) |node| {
         const vd = tree.fullVarDecl(node) orelse continue;
-        if (std.mem.eql(u8, tree.tokenSlice(vd.ast.mut_token + 1), "debug")) try found.append(arena, vd);
+        if (identIs(tree, vd.ast.mut_token + 1, "debug")) try found.append(arena, vd);
     }
     if (found.items.len == 0) return .absent;
     if (found.items.len > 1) {
@@ -109,7 +112,7 @@ fn iosValueHasSelfInfo(tree: Ast, node: Ast.Node.Index) bool {
             const vd = tree.fullVarDecl(m) orelse continue;
             if (vd.visib_token == null) continue;
             if (!std.mem.eql(u8, tree.tokenSlice(vd.ast.mut_token), "const")) continue;
-            if (std.mem.eql(u8, tree.tokenSlice(vd.ast.mut_token + 1), "SelfInfo")) return true;
+            if (identIs(tree, vd.ast.mut_token + 1, "SelfInfo")) return true;
         }
         return false;
     }
@@ -129,7 +132,7 @@ fn iosValueHasSelfInfo(tree: Ast, node: Ast.Node.Index) bool {
 
 const Cond = enum { is_ios, not_ios, unknown };
 
-/// Recognise `<…>.os.tag == .ios` / `.ios == <…>.os.tag` (and `!=`).
+/// Recognise `<target>.os.tag == .ios` / `.ios == <…>.os.tag` (and `!=`).
 /// Anything else (`and`/`or`, a helper call, a different tag) is `unknown`.
 fn iosCondition(tree: Ast, node: Ast.Node.Index) Cond {
     const tag = tree.nodeTag(node);
@@ -141,18 +144,87 @@ fn iosCondition(tree: Ast, node: Ast.Node.Index) Cond {
     return if (tag == .equal_equal) .is_ios else .not_ios;
 }
 
-/// `<anything>.os.tag`.
+/// The BUILD TARGET's OS tag (#784): `B.target.os.tag` or `B.os.tag`, where
+/// `B` is `@import("builtin")` or a root identifier bound to it. Any other
+/// receiver (`settings.os.tag`, …) is not the target, so the condition it
+/// appears in is `unknown`.
 fn isOsTag(tree: Ast, node: Ast.Node.Index) bool {
-    if (tree.nodeTag(node) != .field_access) return false;
-    const obj, const field = tree.nodeData(node).node_and_token;
-    if (!std.mem.eql(u8, tree.tokenSlice(field), "tag")) return false;
-    if (tree.nodeTag(obj) != .field_access) return false;
-    return std.mem.eql(u8, tree.tokenSlice(tree.nodeData(obj).node_and_token[1]), "os");
+    const os = fieldOf(tree, node, "tag") orelse return false;
+    const recv = fieldOf(tree, os, "os") orelse return false;
+    if (isBuiltinRef(tree, recv)) return true;
+    const b = fieldOf(tree, recv, "target") orelse return false;
+    return isBuiltinRef(tree, b);
+}
+
+/// For `<obj>.<name>` (either spelling of `name`), `obj`; otherwise null.
+fn fieldOf(tree: Ast, node: Ast.Node.Index, name: []const u8) ?Ast.Node.Index {
+    const n = unparen(tree, node);
+    if (tree.nodeTag(n) != .field_access) return null;
+    const obj, const field = tree.nodeData(n).node_and_token;
+    return if (identIs(tree, field, name)) obj else null;
+}
+
+fn unparen(tree: Ast, node: Ast.Node.Index) Ast.Node.Index {
+    var n = node;
+    while (tree.nodeTag(n) == .grouped_expression) n = tree.nodeData(n).node_and_token[0];
+    return n;
+}
+
+/// `@import("builtin")`, or an identifier that a root `const` binds to it.
+/// The `debug` value is evaluated at root, so root decls are its scope.
+fn isBuiltinRef(tree: Ast, node: Ast.Node.Index) bool {
+    const n = unparen(tree, node);
+    if (isImportBuiltin(tree, n)) return true;
+    if (tree.nodeTag(n) != .identifier) return false;
+    const ident = tree.nodeMainToken(n);
+    for (tree.rootDecls()) |d| {
+        const vd = tree.fullVarDecl(d) orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(vd.ast.mut_token), "const")) continue;
+        if (!sameIdent(tree, vd.ast.mut_token + 1, ident)) continue;
+        const init = vd.ast.init_node.unwrap() orelse return false;
+        return isImportBuiltin(tree, unparen(tree, init));
+    }
+    return false;
+}
+
+fn isImportBuiltin(tree: Ast, node: Ast.Node.Index) bool {
+    var buf: [2]Ast.Node.Index = undefined;
+    const params = tree.builtinCallParams(&buf, node) orelse return false;
+    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) return false;
+    if (params.len != 1 or tree.nodeTag(params[0]) != .string_literal) return false;
+    return decodedIs(tree.tokenSlice(tree.nodeMainToken(params[0])), "builtin");
 }
 
 /// `.ios`.
 fn isIosLiteral(tree: Ast, node: Ast.Node.Index) bool {
-    return tree.nodeTag(node) == .enum_literal and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "ios");
+    return tree.nodeTag(node) == .enum_literal and identIs(tree, tree.nodeMainToken(node), "ios");
+}
+
+/// Whether identifier token `tok` names `name`, reading `@"…"` as the
+/// identifier it spells (#785): `@"debug"` IS `debug`.
+fn identIs(tree: Ast, tok: Ast.TokenIndex, name: []const u8) bool {
+    const s = tree.tokenSlice(tok);
+    if (std.mem.startsWith(u8, s, "@\"")) return decodedIs(s[1..], name);
+    return std.mem.eql(u8, s, name);
+}
+
+/// Whether two identifier tokens name the same identifier.
+fn sameIdent(tree: Ast, a: Ast.TokenIndex, b: Ast.TokenIndex) bool {
+    var buf: [256]u8 = undefined;
+    const s = tree.tokenSlice(b);
+    if (!std.mem.startsWith(u8, s, "@\"")) return identIs(tree, a, s);
+    var w: std.Io.Writer = .fixed(&buf);
+    const r = std.zig.string_literal.parseWrite(&w, s[1..]) catch return false;
+    if (r != .success) return false;
+    return identIs(tree, a, w.buffered());
+}
+
+/// Whether the string literal `quoted` (with its quotes) decodes to `name`.
+fn decodedIs(quoted: []const u8, name: []const u8) bool {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const r = std.zig.string_literal.parseWrite(&w, quoted) catch return false;
+    return r == .success and std.mem.eql(u8, w.buffered(), name);
 }
 
 pub const Error = error{ IosRootDebugWithoutSelfInfo, IosDuplicateRootDebug };
@@ -232,6 +304,45 @@ test "judge: none / provided / incompatible / duplicate" {
     try testing.expectEqual(T.incompatible, try judgeTag("pub const debug = @import(\"my_debug.zig\");"));
     // Duplicates.
     try testing.expectEqual(T.duplicate, try judgeTag("pub const debug = struct { pub const SelfInfo = void; };\npub const debug = struct { pub const SelfInfo = void; };"));
+}
+
+test "judge: only the build target's os.tag selects the iOS branch (#784)" {
+    const T = std.meta.Tag(Verdict);
+    // A non-builtin `.os.tag` is an unknown condition: SelfInfo in one branch fails.
+    try testing.expectEqual(T.incompatible, try judgeTag("const settings = @import(\"settings.zig\");\npub const debug = if (settings.os.tag == .ios) struct { pub const SelfInfo = void; } else struct {};"));
+    try testing.expectEqual(T.incompatible, try judgeTag("pub const debug = if (settings.target.os.tag == .ios) struct { pub const SelfInfo = void; } else struct {};"));
+    try testing.expectEqual(T.incompatible, try judgeTag("pub const debug = if (@import(\"settings\").os.tag == .ios) struct { pub const SelfInfo = void; } else struct {};"));
+    // `builtin` not bound to @import("builtin") in this file is not the target.
+    try testing.expectEqual(T.incompatible, try judgeTag("pub const debug = if (builtin.os.tag == .ios) struct { pub const SelfInfo = void; } else struct {};"));
+    try testing.expectEqual(T.incompatible, try judgeTag("const builtin = @import(\"my_builtin.zig\");\npub const debug = if (builtin.target.os.tag == .ios) struct { pub const SelfInfo = void; } else struct {};"));
+    // ...but in every branch it is fine.
+    try testing.expectEqual(T.provided, try judgeTag("pub const debug = if (settings.os.tag == .ios) struct { pub const SelfInfo = void; } else struct { pub const SelfInfo = void; };"));
+    // The real builtin forms still select the iOS branch.
+    try testing.expectEqual(T.provided, try judgeTag("pub const debug = if (@import(\"builtin\").os.tag == .ios) struct { pub const SelfInfo = void; } else struct {};"));
+    try testing.expectEqual(T.provided, try judgeTag("const builtin = @import(\"builtin\");\npub const debug = if (builtin.target.os.tag == .ios) struct { pub const SelfInfo = void; } else struct {};"));
+    try testing.expectEqual(T.provided, try judgeTag("pub const debug = if (bi.os.tag == .ios) struct { pub const SelfInfo = void; } else struct {};\nconst bi = @import(\"builtin\");"));
+    try testing.expectEqual(T.provided, try judgeTag("const @\"builtin\" = @import(\"builtin\");\npub const debug = if (builtin.os.tag == .ios) struct { pub const SelfInfo = void; } else struct {};"));
+}
+
+test "judge: quoted @\"debug\" / @\"SelfInfo\" identifiers (#785)" {
+    const T = std.meta.Tag(Verdict);
+    try testing.expectEqual(T.provided, try judgeTag("pub const @\"debug\" = struct { pub const SelfInfo = void; };"));
+    try testing.expectEqual(T.provided, try judgeTag("pub const debug = struct { pub const @\"SelfInfo\" = void; };"));
+    try testing.expectEqual(T.provided, try judgeTag("pub const @\"debug\" = struct { pub const @\"SelfInfo\" = void; };"));
+    try testing.expectEqual(T.incompatible, try judgeTag("pub const @\"debug\" = struct {};"));
+    try testing.expectEqual(T.duplicate, try judgeTag("pub const debug = struct { pub const SelfInfo = void; };\npub const @\"debug\" = struct { pub const SelfInfo = void; };"));
+    // A different quoted name is not `debug`.
+    try testing.expectEqual(T.absent, try judgeTag("pub const @\"debug2\" = struct {};"));
+}
+
+test "finalize: a quoted root debug is accepted, a quoted duplicate is rejected (#785)" {
+    const a = testing.allocator;
+    const src = "pub const @\"debug\" = struct { pub const @\"SelfInfo\" = void; };\n";
+    const out = try finalize(a, SLOT ++ src);
+    defer a.free(out);
+    try testing.expectEqualStrings(src, out);
+    try testing.expect(std.mem.indexOf(u8, out, "pub const debug") == null);
+    try testing.expectError(error.IosDuplicateRootDebug, finalize(a, SLOT ++ "pub const debug = struct { pub const SelfInfo = void; };\n" ++ src));
 }
 
 test "finalize: the slot becomes the override, disappears, or the call fails" {
