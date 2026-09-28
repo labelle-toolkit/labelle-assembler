@@ -486,6 +486,57 @@ pub const MAIN_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, one, "labelle-assembler#774") == null);
     }
 
+    fn genIosMainWith(engine_tmpl: []const u8, lifecycle: []const u8) ![]const u8 {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
+        return generate.generateMainZigFromTemplate(std.testing.allocator, engine_tmpl, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .sokol,
+            .platform = .ios,
+            .ecs = .mock,
+        }, lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+    }
+
+    test "ios main.zig: a template `debug` inside a block that renders away does not count — the override IS emitted (#774)" {
+        // `has_gui` is false for this project, so the engine block holding
+        // the `debug` renders to nothing; ownership is judged on the
+        // rendered main.zig, where there is no root `debug` at all.
+        const engine_with_gated_debug = engine_template ++
+            \\{{#if has_gui}}pub const debug = struct {
+            \\    pub const SelfInfo = void;
+            \\};
+            \\{{/if}}
+        ;
+        const main_zig = try genIosMainWith(engine_with_gated_debug, sokol_mobile_lifecycle);
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, main_zig, "pub const debug ="));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, main_zig, selfinfo_decl));
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "labelle-assembler#774") != null);
+        // The slot never survives into the output.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "ios-selfinfo-slot") == null);
+    }
+
+    test "ios main.zig: SelfInfo only in the branch iOS does NOT take fails generate (#774)" {
+        const wrong_branch = sokol_mobile_lifecycle ++
+            \\pub const debug = if (@import("builtin").target.os.tag == .ios) struct {} else struct {
+            \\    pub const SelfInfo = void;
+            \\};
+            \\
+        ;
+        try std.testing.expectError(error.IosRootDebugWithoutSelfInfo, genSokolMain(.ios, wrong_branch));
+    }
+
+    test "ios main.zig: a private root `debug` fails generate, even with SelfInfo (#774)" {
+        const private_debug = sokol_mobile_lifecycle ++
+            \\const debug = struct {
+            \\    pub const SelfInfo = void;
+            \\};
+            \\
+        ;
+        try std.testing.expectError(error.IosRootDebugWithoutSelfInfo, genSokolMain(.ios, private_debug));
+    }
+
     test "non-iOS main.zig has no SelfInfo override (#774)" {
         inline for (.{ generate.Platform.android, generate.Platform.desktop }) |p| {
             const main_zig = try genSokolMain(p, sokol_mobile_lifecycle);

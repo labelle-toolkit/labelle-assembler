@@ -203,46 +203,6 @@ pub fn generateMainZigFromTemplate(
     return generateMainZigWithAnimations(allocator, engine_template, cfg, lifecycle_tmpl, script_entries, prefab_names, jsonc_scene_names, scene_manifests, component_names, hook_names, event_names, enum_names, view_names, gizmo_names, animation_names, &.{}, plugin_events, plugin_flow_nodes, plugin_pin_styles, plugin_coercions);
 }
 
-/// iOS (#774): whether a template's root `debug` already carries the
-/// `SelfInfo` override (then the assembler emits none). A root `debug`
-/// WITHOUT a direct `pub const SelfInfo` is an error: the assembler cannot
-/// add a second root `debug`, and silently skipping would leave the iOS
-/// link broken. Both templates owning one is an error too (a duplicate
-/// root decl in the one generated main.zig).
-fn iosTemplatesProvideSelfInfo(allocator: std.mem.Allocator, lifecycle_tmpl: []const u8, engine_template: []const u8) !bool {
-    var provided = false;
-    for ([_]struct { src: []const u8, what: []const u8 }{
-        .{ .src = lifecycle_tmpl, .what = "the backend's iOS entry template" },
-        .{ .src = engine_template, .what = "the engine's main.zig template" },
-    }) |t| {
-        switch (try ios_selfinfo.rootDebugState(allocator, t.src)) {
-            .absent => {},
-            .with_selfinfo => {
-                if (provided) {
-                    // Both templates own the override: two root `debug`
-                    // decls in one main.zig is a compile error.
-                    const msg = "labelle-assembler: both the backend's iOS entry template and the engine's main.zig template declare a root `debug` with `SelfInfo`.\n" ++
-                        "  They are rendered into the same main.zig, so that is a duplicate root declaration. Exactly one may own it:\n" ++
-                        "  drop it from the backend template (the engine's copy then applies) (#774).\n";
-                    std.Io.File.stderr().writeStreamingAll(config.globalIo(), msg) catch {};
-                    return error.IosDuplicateRootDebug;
-                }
-                provided = true;
-            },
-            .without_selfinfo => {
-                var buf: [768]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "labelle-assembler: {s} declares a root `debug` without `SelfInfo`.\n" ++
-                    "  An iOS build needs `debug.SelfInfo = void` (Zig 0.16's Mach-O SelfInfo references a symbol the iOS SDK\n" ++
-                    "  does not export), and the assembler cannot add a second root `debug`. Declare\n" ++
-                    "  `pub const SelfInfo = void;` inside that `debug` for iOS, or remove it and let the assembler emit it (#774).\n", .{t.what}) catch "labelle-assembler: a template declares a root `debug` without `SelfInfo` (#774)\n";
-                std.Io.File.stderr().writeStreamingAll(config.globalIo(), msg) catch {};
-                return error.IosRootDebugWithoutSelfInfo;
-            },
-        }
-    }
-    return provided;
-}
-
 pub fn generateMainZigWithAnimations(
     allocator: std.mem.Allocator,
     engine_template: []const u8,
@@ -354,8 +314,6 @@ pub fn generateMainZigWithAnimations(
             std.mem.indexOf(u8, lifecycle_tmpl, "pub const panic") != null,
         // ios-only (#774): skip the assembler's SelfInfo override when a
         // template already declares a root `debug`.
-        .ios_template_provides_debug = cfg.platform == .ios and
-            try iosTemplatesProvideSelfInfo(allocator, lifecycle_tmpl, engine_template),
     };
 
     var data = tpl.TemplateData{
@@ -624,7 +582,13 @@ pub fn generateMainZigWithAnimations(
     // `requireYAxis` first enforces the unset-guard — an absent `.y_axis` is a
     // hard error so no existing game silently flips.
     const y_axis = try cfg.requireYAxis();
-    return injectYAxis(allocator, rendered, y_axis);
+    const with_axis = try injectYAxis(allocator, rendered, y_axis);
+    if (cfg.platform != .ios) return with_axis;
+    // iOS (#774): the SelfInfo override's owner is decided on the FINAL
+    // rendered text — `ios_selfinfo.finalize` resolves the slot the hook
+    // imports block wrote (override, nothing, or a clear error).
+    defer allocator.free(with_axis);
+    return ios_selfinfo.finalize(allocator, with_axis);
 }
 
 /// Override the value of the engine template's single source-of-truth

@@ -53,14 +53,12 @@ pub fn Mixin(comptime Self: type) type {
                 else
                     preview.WASM_PANIC_WORKAROUND);
             }
-            // Zig 0.16 iOS link fix (#774): root `debug.SelfInfo = void`, so
-            // every iOS backend gets it. Skipped when the backend's entry
-            // template already declares a root `debug` carrying `SelfInfo` (a
-            // duplicate root decl is a compile error); a root `debug` without
-            // it fails generate earlier. See `Codegen.ios_template_provides_debug`.
-            if (cfg.platform == .ios and !self.ios_template_provides_debug) {
-                try w.writeAll(@import("../ios_selfinfo.zig").OVERRIDE);
-            }
+            // Zig 0.16 iOS link fix (#774): a slot for the root
+            // `debug.SelfInfo = void` override. Whether it becomes the
+            // override, nothing (a template already owns a compatible root
+            // `debug`) or an error is decided on the FINAL rendered main.zig
+            // by `ios_selfinfo.finalize`, not on the raw templates.
+            if (cfg.platform == .ios) try w.writeAll(@import("../ios_selfinfo.zig").SLOT);
             if (hook_names.len > 0 or self.hasPackHooks()) {
                 try w.writeAll("\n// --- Hook imports ---\n");
                 for (hook_names) |name| {
