@@ -86,6 +86,10 @@ pub const Description = struct {
     /// Why `supported` is false. Null when supported.
     reason: ?[]const u8,
     capabilities_source: CapabilitySource,
+    /// The error name when the package directory could not be probed for a
+    /// reason other than "missing" (then `supported` is false and `reason`
+    /// carries it). Human output only; the JSON reports it via `reason`.
+    package_access_error: ?[]const u8 = null,
 
     pub const Backend = struct {
         /// `backendName()` — the package name, e.g. "bgfx" or "acme".
@@ -147,20 +151,53 @@ const builtin_snapshots = [_]BuiltinSnapshot{
 
 /// The snapshot for `bp` when it is a first-party package at its default
 /// version from its official repo, else null.
+///
+/// "Official repo" is the identity check's classification
+/// (`backend_registry.repoIsOfficialOrLocal`, the gate behind
+/// `error.ReservedProviderNamespace`), NOT the looser `sameRemote`
+/// normalisation: a spelling such as `git+https://github.com/labelle-toolkit/…`
+/// fetches the same repository, but the identity check rejects its
+/// `labelle.*` id, so `generate` would refuse it once installed. Answering it
+/// from the first-party snapshot would report "supported" for a project
+/// `generate` refuses (#777). `local:` repos are excluded too: a dev checkout
+/// is not the released first-party manifest the snapshot records.
 fn builtinSnapshot(bp: config.PluginDep) ?BuiltinSnapshot {
+    if (bp.isLocal()) return null;
+    if (!backend_registry.repoIsOfficialOrLocal(bp.repo)) return null;
     for (builtin_snapshots) |s| {
         const official = ProjectConfig.builtinProvider(s.backend) orelse continue;
         if (!std.mem.eql(u8, bp.name, official.name)) continue;
         if (!std.mem.eql(u8, bp.version, s.version)) continue;
+        // Same classification first (above), then the same repository.
         if (!config.sameRemote(bp.repo, official.repo)) continue;
         return s;
     }
     return null;
 }
 
-fn dirExists(path: []const u8) bool {
-    std.Io.Dir.cwd().access(config.globalIo(), path, .{}) catch return false;
-    return true;
+/// Where the backend package directory stands on disk.
+const PackageState = union(enum) {
+    installed,
+    /// `FileNotFound`: the ONLY state that selects the snapshot fallback.
+    missing,
+    /// Any other access error (permission denied, I/O, bad name, ...). The
+    /// package may well be there; describe cannot tell, so it must not
+    /// answer from the snapshot as if it were absent (#777).
+    inaccessible: anyerror,
+};
+
+pub const AccessFn = *const fn (path: []const u8) std.Io.Dir.AccessError!void;
+
+fn defaultAccess(path: []const u8) std.Io.Dir.AccessError!void {
+    return std.Io.Dir.cwd().access(config.globalIo(), path, .{});
+}
+
+fn packageState(access: AccessFn, path: []const u8) PackageState {
+    access(path) catch |err| return switch (err) {
+        error.FileNotFound => .missing,
+        else => .{ .inaccessible = err },
+    };
+    return .installed;
 }
 
 /// Answer `describe` for `cfg` and `target`. `project_dir` anchors
@@ -174,6 +211,10 @@ pub const Options = struct {
     /// The `LABELLE_EDITOR_PREVIEW` value (null: unset). `describe` reads
     /// the process environment; tests pass it explicitly.
     editor_preview_env: ?[]const u8 = null,
+    /// How the package directory is probed. Tests inject access errors a
+    /// real filesystem cannot produce portably (e.g. permission denied when
+    /// CI runs as root).
+    access: AccessFn = defaultAccess,
 };
 
 /// `describe` with the environment supplied.
@@ -206,11 +247,13 @@ pub fn describeWith(arena: std.mem.Allocator, cfg_in: ProjectConfig, project_dir
 
     // Package location: pure path math, no fetch.
     const pkg_dir = try backend_registry.resolveBackendPackage(arena, cfg, project_dir);
-    const installed = dirExists(pkg_dir);
+    const state = packageState(opts.access, pkg_dir);
+    const installed = state == .installed;
     if (installed) desc.package_dir = pkg_dir;
     if (bp) |b| {
         if (b.isLocal()) desc.backend.local_path = pkg_dir;
     }
+    if (state == .inaccessible) desc.package_access_error = @errorName(state.inaccessible);
 
     if (platform == null) {
         if (installed) {
@@ -221,8 +264,8 @@ pub fn describeWith(arena: std.mem.Allocator, cfg_in: ProjectConfig, project_dir
             const v = try provider_contracts.checkProvider(arena, probe, project_dir, .{ .emit_warnings = false });
             if (v.manifest_loaded) desc.capabilities_source = .manifest;
             desc.backend.id = v.id;
-        } else if (bp) |b| {
-            if (builtinSnapshot(b) != null) {
+        } else if (state == .missing and bp != null) {
+            if (builtinSnapshot(bp.?) != null) {
                 desc.capabilities_source = .builtin;
                 desc.backend.id = try std.fmt.allocPrint(arena, "labelle.{s}", .{name});
             }
@@ -244,6 +287,15 @@ pub fn describeWith(arena: std.mem.Allocator, cfg_in: ProjectConfig, project_dir
             desc.supported = false;
             desc.reason = prob.message;
         }
+        return desc;
+    }
+
+    if (state == .inaccessible) {
+        // Not "not installed": the directory could not be checked at all.
+        // Report it rather than fall back to the snapshot and answer
+        // "supported" for a package describe never saw (#777).
+        desc.supported = false;
+        desc.reason = try std.fmt.allocPrint(arena, "labelle-assembler: cannot access backend package directory '{s}': {s}", .{ pkg_dir, @errorName(state.inaccessible) });
         return desc;
     }
 
@@ -314,6 +366,8 @@ pub fn writeText(w: *std.Io.Writer, d: Description) !void {
     if (d.backend.local_path) |l| try w.print("  local path  {s}\n", .{l});
     if (d.package_dir) |pd| {
         try w.print("  installed   {s}\n", .{pd});
+    } else if (d.package_access_error) |e| {
+        try w.print("  installed   unknown ({s})\n", .{e});
     } else {
         try w.writeAll("  installed   no\n");
     }
@@ -326,7 +380,14 @@ pub fn writeText(w: *std.Io.Writer, d: Description) !void {
     switch (d.capabilities_source) {
         .manifest => try w.writeAll(" (from the installed manifest)\n"),
         .builtin => try w.writeAll(" (from the first-party manifest snapshot; package not installed)\n"),
-        .unknown => try w.writeAll(" (unverified: package not installed)\n"),
+        // The wording follows `package_dir` (#777): an installed package
+        // whose v2 manifest is missing or unreadable is NOT "not installed".
+        .unknown => if (d.package_dir != null)
+            try w.writeAll(" (unverified: installed package has no readable v2 manifest)\n")
+        else if (d.package_access_error != null)
+            try w.writeAll(" (unverified: package directory not accessible)\n")
+        else
+            try w.writeAll(" (unverified: package not installed)\n"),
     }
     if (d.reason) |r| try w.print("  reason      {s}\n", .{r});
 }
@@ -785,6 +846,143 @@ test "describe: an installed package dir with no manifest keeps capabilities_sou
     try testing.expect(!d.supported);
     try testing.expectEqual(CapabilitySource.unknown, d.capabilities_source);
     try testing.expect(d.package_dir != null);
+}
+
+test "describe: installed-but-no-manifest human wording follows package_dir, not 'not installed' (#777)" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.installFile("plugins/github.com/labelle-toolkit/labelle-raylib/0.3.0", null, "");
+    const d = try describe(f.arena(), try f.parse(".{ .name = \"g\", .backend = .raylib }"), f.dir, "desktop");
+    try testing.expect(d.package_dir != null);
+    try testing.expectEqual(CapabilitySource.unknown, d.capabilities_source);
+    var out: std.Io.Writer.Allocating = .init(f.arena());
+    try writeText(&out.writer, d);
+    const text = out.written();
+    try testing.expect(std.mem.indexOf(u8, text, "(unverified: installed package has no readable v2 manifest)") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "package not installed") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "installed   no") == null);
+
+    // And the not-installed form keeps its own wording.
+    const n = try describe(f.arena(), try f.parse(acme_cfg), f.dir, "desktop");
+    var out2: std.Io.Writer.Allocating = .init(f.arena());
+    try writeText(&out2.writer, n);
+    try testing.expect(std.mem.indexOf(u8, out2.written(), "(unverified: package not installed)") != null);
+    try testing.expect(std.mem.indexOf(u8, out2.written(), "installed   no\n") != null);
+}
+
+test "describe: the builtin snapshot uses the identity check's repo classification, not sameRemote (#777)" {
+    const official = ProjectConfig.builtinProvider(.sokol).?;
+    // The mechanism: every spelling `sameRemote` folds to the official repo
+    // but `repoIsOfficialOrLocal` rejects gets NO snapshot.
+    inline for (.{
+        "git+https://github.com/labelle-toolkit/labelle-sokol",
+        "git+https://github.com/labelle-toolkit/labelle-sokol?ref=main",
+        "http://github.com/labelle-toolkit/labelle-sokol",
+        "GITHUB.COM/labelle-toolkit/labelle-sokol",
+    }) |spelling| {
+        try testing.expect(config.sameRemote(spelling, official.repo));
+        try testing.expect(!backend_registry.repoIsOfficialOrLocal(spelling));
+        try testing.expect(builtinSnapshot(.{ .name = official.name, .repo = spelling, .version = official.version }) == null);
+    }
+    // Spellings the identity check accepts still get it.
+    inline for (.{
+        "github.com/labelle-toolkit/labelle-sokol",
+        "https://github.com/labelle-toolkit/labelle-sokol",
+        "https://github.com/labelle-toolkit/labelle-sokol.git",
+    }) |spelling| {
+        try testing.expect(builtinSnapshot(.{ .name = official.name, .repo = spelling, .version = official.version }) != null);
+    }
+    // Another labelle-toolkit repo under the same name is not this package.
+    try testing.expect(builtinSnapshot(.{ .name = official.name, .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = official.version }) == null);
+    // A local dev checkout is not the released manifest the snapshot records.
+    try testing.expect(builtinSnapshot(.{ .name = official.name, .repo = "local:vendor/sokol", .version = official.version }) == null);
+}
+
+test "describe: a git+https spelling of the official repo is not answered from the snapshot, and generate refuses it once installed (#777)" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const a = f.arena();
+    const v = ProjectConfig.builtinProvider(.sokol).?.version;
+    const src = try std.fmt.allocPrint(a, ".{{ .name = \"g\", .y_axis = .up, .backend = .sokol, .backend_package = .{{ .name = \"sokol\", .repo = \"git+https://github.com/labelle-toolkit/labelle-sokol\", .version = \"{s}\" }} }}", .{v});
+    const cfg = try f.parse(src);
+
+    // Not installed: previously `builtin` + supported (sameRemote accepted
+    // the spelling); now unverified, exactly like any non-official repo.
+    const d = try describe(a, cfg, f.dir, "desktop");
+    try testing.expect(d.package_dir == null);
+    try testing.expectEqual(CapabilitySource.unknown, d.capabilities_source);
+    try testing.expect(d.backend.id == null);
+
+    // Installed with its real `labelle.sokol` id: the identity check (the
+    // classification the snapshot now shares) refuses it, and describe says so.
+    const pkg = try backend_registry.resolveBackendPackage(a, cfg, f.dir);
+    try std.Io.Dir.cwd().createDirPath(testing.io, pkg);
+    const man = try manifestV2(a, "labelle.sokol", ".screenshots", loop_desktop);
+    const man_path = try std.fs.path.join(a, &.{ pkg, manifest_v2.V2_MANIFEST_NAME });
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = man_path, .data = man });
+    const i = try describe(a, cfg, f.dir, "desktop");
+    try testing.expect(!i.supported);
+    var probe = cfg;
+    probe.platform = .desktop;
+    const chk = try provider_contracts.checkProvider(a, probe, f.dir, .{ .emit_warnings = false });
+    try testing.expectEqualStrings("ReservedProviderNamespace", @errorName(chk.problem.?.err));
+    try testing.expectEqualStrings(chk.problem.?.message, i.reason.?);
+}
+
+fn accessPermissionDenied(_: []const u8) std.Io.Dir.AccessError!void {
+    return error.PermissionDenied;
+}
+
+fn accessFileNotFound(_: []const u8) std.Io.Dir.AccessError!void {
+    return error.FileNotFound;
+}
+
+test "describe: only FileNotFound selects the snapshot fallback; other access errors report unsupported with the error (#777)" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const a = f.arena();
+    const cfg = try f.parse(".{ .name = \"g\", .backend = .sokol }");
+
+    // Control: a missing dir (the injected FileNotFound) answers from the
+    // snapshot — proving the injected probe is the one consulted.
+    const m = try describeWith(a, cfg, f.dir, "desktop", .{ .access = accessFileNotFound });
+    try testing.expect(m.supported);
+    try testing.expectEqual(CapabilitySource.builtin, m.capabilities_source);
+
+    // Permission denied: NOT "not installed".
+    const d = try describeWith(a, cfg, f.dir, "desktop", .{ .access = accessPermissionDenied });
+    try testing.expect(!d.supported);
+    try testing.expectEqual(CapabilitySource.unknown, d.capabilities_source);
+    try testing.expect(d.package_dir == null);
+    try testing.expect(d.backend.id == null);
+    try testing.expect(std.mem.indexOf(u8, d.reason.?, "cannot access backend package directory") != null);
+    try testing.expect(std.mem.indexOf(u8, d.reason.?, "PermissionDenied") != null);
+    try testing.expectEqualStrings("PermissionDenied", d.package_access_error.?);
+
+    var out: std.Io.Writer.Allocating = .init(a);
+    try writeText(&out.writer, d);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "installed   unknown (PermissionDenied)\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "(unverified: package directory not accessible)") != null);
+
+    // The JSON carries it through `reason`; no `package_dir`.
+    var js: std.Io.Writer.Allocating = .init(a);
+    try writeJson(&js.writer, d);
+    const obj = (try std.json.parseFromSliceLeaky(std.json.Value, a, js.written(), .{})).object;
+    try testing.expect(obj.get("package_dir") == null);
+    try testing.expect(!obj.get("supported").?.bool);
+    try testing.expectEqualStrings("unknown", obj.get("capabilities_source").?.string);
+
+    // An unknown target keeps its own reason, and still skips the snapshot.
+    const u = try describeWith(a, cfg, f.dir, "xbox", .{ .access = accessPermissionDenied });
+    try testing.expect(std.mem.indexOf(u8, u.reason.?, "has no target 'xbox'") != null);
+    try testing.expectEqual(CapabilitySource.unknown, u.capabilities_source);
+}
+
+test "describe: packageState classifies access errors" {
+    try testing.expect(packageState(accessFileNotFound, "x") == .missing);
+    const pd = packageState(accessPermissionDenied, "x");
+    try testing.expect(pd == .inaccessible);
+    try testing.expectEqual(error.PermissionDenied, pd.inaccessible);
 }
 
 const test_manifest_desktop_android =
