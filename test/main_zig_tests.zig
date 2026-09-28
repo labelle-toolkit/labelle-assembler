@@ -436,6 +436,56 @@ pub const MAIN_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, desktop, "SelfInfo") == null);
     }
 
+    test "ios main.zig: SelfInfo in a nested type or private does not count — generate fails (#774)" {
+        // `root.debug.SelfInfo` must be a DIRECT `pub` member; these root
+        // `debug`s have none, and a second root `debug` cannot be added.
+        const nested = sokol_mobile_lifecycle ++
+            \\pub const debug = struct {
+            \\    pub const Inner = struct {
+            \\        pub const SelfInfo = void;
+            \\    };
+            \\};
+            \\
+        ;
+        try std.testing.expectError(error.IosRootDebugWithoutSelfInfo, genSokolMain(.ios, nested));
+        const private = sokol_mobile_lifecycle ++
+            \\pub const debug = struct {
+            \\    const SelfInfo = void;
+            \\};
+            \\
+        ;
+        try std.testing.expectError(error.IosRootDebugWithoutSelfInfo, genSokolMain(.ios, private));
+    }
+
+    test "ios main.zig: backend AND engine templates both owning root debug.SelfInfo fail as duplicate owners (#774)" {
+        const owner =
+            \\pub const debug = if (@import("builtin").target.os.tag == .ios) struct {
+            \\    pub const SelfInfo = void;
+            \\} else struct {};
+            \\
+        ;
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
+        try std.testing.expectError(error.IosDuplicateRootDebug, generate.generateMainZigFromTemplate(std.testing.allocator, engine_template ++ owner, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .sokol,
+            .platform = .ios,
+            .ecs = .mock,
+        }, sokol_mobile_lifecycle ++ owner, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions));
+        // One owner (the engine's) is fine: the assembler emits none.
+        const one = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template ++ owner, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .sokol,
+            .platform = .ios,
+            .ecs = .mock,
+        }, sokol_mobile_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(one);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, one, "pub const debug ="));
+        try std.testing.expect(std.mem.indexOf(u8, one, "labelle-assembler#774") == null);
+    }
+
     test "non-iOS main.zig has no SelfInfo override (#774)" {
         inline for (.{ generate.Platform.android, generate.Platform.desktop }) |p| {
             const main_zig = try genSokolMain(p, sokol_mobile_lifecycle);

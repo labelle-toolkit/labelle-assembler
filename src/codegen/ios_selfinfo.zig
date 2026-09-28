@@ -52,15 +52,19 @@ pub const RootDebug = enum {
 /// `const`/`var debug`. Tokenizer-based with a brace-depth count, so a
 /// comment, a string, a nested decl (`struct { const debug = … }`) or
 /// `debug_draw` is not a root `debug`. The decl runs to its `;` at root
-/// depth; it declares `SelfInfo` when a `const`/`var SelfInfo` appears
-/// anywhere inside it (either arm of an `if … struct {…} else struct {}`).
+/// depth; it declares `SelfInfo` only when `pub const SelfInfo` is a DIRECT
+/// member of its struct literal (either arm of an
+/// `if … struct {…} else struct {}`) — not a private decl, not a member of
+/// a nested type.
 /// Template holes (`{{x}}`) tokenize as balanced braces.
 pub fn rootDebugState(allocator: std.mem.Allocator, source: []const u8) !RootDebug {
     const z = try allocator.dupeZ(u8, source);
     defer allocator.free(z);
+    blankTemplateHoles(z);
     var tokenizer = std.zig.Tokenizer.init(z);
     var depth: usize = 0;
     var prev: std.zig.Token.Tag = .eof;
+    var prev2: std.zig.Token.Tag = .eof;
     var in_debug = false;
     var debug_depth: usize = 0;
     var result: RootDebug = .absent;
@@ -80,13 +84,38 @@ pub fn rootDebugState(allocator: std.mem.Allocator, source: []const u8) !RootDeb
                     in_debug = true;
                     debug_depth = depth;
                     if (result == .absent) result = .without_selfinfo;
-                } else if (in_debug and is_decl and std.mem.eql(u8, text, "SelfInfo")) {
+                } else if (in_debug and depth == debug_depth + 1 and prev == .keyword_const and
+                    prev2 == .keyword_pub and std.mem.eql(u8, text, "SelfInfo"))
+                {
+                    // A DIRECT public member of the `debug` struct literal
+                    // (either arm of an `if … struct {…} else struct {…}`) —
+                    // `root.debug.SelfInfo` is what std reads. A nested
+                    // type's `SelfInfo` or a private one does not count.
                     result = .with_selfinfo;
                 }
             },
             else => {},
         }
+        prev2 = prev;
         prev = tok.tag;
+    }
+}
+
+/// Replace every single-line `{{…}}` template hole (`{{title}}`,
+/// `{{#if x}}`, `{{/each}}`) with spaces. The Zig tokenizer turns a `#` or
+/// `/` hole into an `.invalid` token that swallows the rest of its line —
+/// including the closing `}}` — which would unbalance the brace depth and
+/// hide every root decl after it.
+fn blankTemplateHoles(buf: []u8) void {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, buf, i, "{{")) |open| {
+        const eol = std.mem.indexOfScalarPos(u8, buf, open, '\n') orelse buf.len;
+        const close = std.mem.indexOfPos(u8, buf[0..eol], open + 2, "}}") orelse {
+            i = open + 2;
+            continue;
+        };
+        @memset(buf[open .. close + 2], ' ');
+        i = close + 2;
     }
 }
 
@@ -104,6 +133,15 @@ test "rootDebugState: absent / with SelfInfo / without SelfInfo" {
     try std.testing.expectEqual(S.without_selfinfo, try rootDebugState(a, "const debug = @import(\"my_debug.zig\");"));
     // `SelfInfo` OUTSIDE the root `debug` does not make it compatible.
     try std.testing.expectEqual(S.without_selfinfo, try rootDebugState(a, "const debug = struct {};\nconst X = struct { const SelfInfo = void; };"));
+    // `SelfInfo` inside a nested type, or private: not `root.debug.SelfInfo`.
+    try std.testing.expectEqual(S.without_selfinfo, try rootDebugState(a, "pub const debug = struct { pub const Inner = struct { pub const SelfInfo = void; }; };"));
+    try std.testing.expectEqual(S.without_selfinfo, try rootDebugState(a, "pub const debug = struct { const SelfInfo = void; };"));
+    try std.testing.expectEqual(S.without_selfinfo, try rootDebugState(a, "pub const debug = struct { pub var SelfInfo: type = void; };"));
+    // Either arm of the conditional form counts.
+    try std.testing.expectEqual(S.with_selfinfo, try rootDebugState(a, "pub const debug = if (c) struct {} else struct { pub const SelfInfo = void; };"));
+    // Template control holes (`{{#if}}`/`{{/if}}`) must not hide a later root decl.
+    try std.testing.expectEqual(S.with_selfinfo, try rootDebugState(a, "{{#if has_gui}}\nconst g = 1;\n{{/if}}\n{{#each xs}}{{name}}{{/each}}\npub const debug = struct { pub const SelfInfo = void; };"));
+    try std.testing.expectEqual(S.without_selfinfo, try rootDebugState(a, "{{#if a}}\n{{/if}}\npub const debug = struct {};"));
     // Not a root `debug`.
     try std.testing.expectEqual(S.absent, try rootDebugState(a, "pub const debug_draw = 1;"));
     try std.testing.expectEqual(S.absent, try rootDebugState(a, "// pub const debug = struct {};\nconst s = \"pub const debug\";"));

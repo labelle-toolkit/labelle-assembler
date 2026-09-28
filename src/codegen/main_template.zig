@@ -205,8 +205,10 @@ pub fn generateMainZigFromTemplate(
 
 /// iOS (#774): whether a template's root `debug` already carries the
 /// `SelfInfo` override (then the assembler emits none). A root `debug`
-/// WITHOUT `SelfInfo` is an error: the assembler cannot add a second root
-/// `debug`, and silently skipping would leave the iOS link broken.
+/// WITHOUT a direct `pub const SelfInfo` is an error: the assembler cannot
+/// add a second root `debug`, and silently skipping would leave the iOS
+/// link broken. Both templates owning one is an error too (a duplicate
+/// root decl in the one generated main.zig).
 fn iosTemplatesProvideSelfInfo(allocator: std.mem.Allocator, lifecycle_tmpl: []const u8, engine_template: []const u8) !bool {
     var provided = false;
     for ([_]struct { src: []const u8, what: []const u8 }{
@@ -215,7 +217,18 @@ fn iosTemplatesProvideSelfInfo(allocator: std.mem.Allocator, lifecycle_tmpl: []c
     }) |t| {
         switch (try ios_selfinfo.rootDebugState(allocator, t.src)) {
             .absent => {},
-            .with_selfinfo => provided = true,
+            .with_selfinfo => {
+                if (provided) {
+                    // Both templates own the override: two root `debug`
+                    // decls in one main.zig is a compile error.
+                    const msg = "labelle-assembler: both the backend's iOS entry template and the engine's main.zig template declare a root `debug` with `SelfInfo`.\n" ++
+                        "  They are rendered into the same main.zig, so that is a duplicate root declaration. Exactly one may own it:\n" ++
+                        "  drop it from the backend template (the engine's copy then applies) (#774).\n";
+                    std.Io.File.stderr().writeStreamingAll(config.globalIo(), msg) catch {};
+                    return error.IosDuplicateRootDebug;
+                }
+                provided = true;
+            },
             .without_selfinfo => {
                 var buf: [768]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "labelle-assembler: {s} declares a root `debug` without `SelfInfo`.\n" ++
