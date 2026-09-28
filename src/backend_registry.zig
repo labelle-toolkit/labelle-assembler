@@ -157,7 +157,7 @@ pub fn isBuiltin(name: []const u8) bool {
 /// from the reserved-namespace rule so a `local:backends/sokol` dev override
 /// can legitimately be `labelle.sokol`. A remote repo is official iff its URL
 /// is under the `labelle-toolkit/` org.
-fn repoIsOfficialOrLocal(repo: []const u8) bool {
+pub fn repoIsOfficialOrLocal(repo: []const u8) bool {
     if (config.PluginDep.isLocal(.{ .name = "", .repo = repo })) return true;
     // A remote repo is official iff it is OWNED by the `labelle-toolkit` org —
     // i.e. its URL STARTS with one of the supported owner-prefixed forms. A bare
