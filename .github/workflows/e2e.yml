@@ -1,0 +1,1821 @@
+# End-to-end suite: runs after every merge to main, and on demand
+# (Actions → "E2E (main + manual)" → Run workflow). PRs run only CI (ci.yml).
+#
+# These jobs were part of CI until 2026-09-28, when the owner moved every
+# e2e out of the per-PR run (PRs get less than main) to bring CI down to ~10 minutes. Run this before
+# a release, or when a change touches generate→build, the curated version
+# sets, C# embedding, pinned bgfx examples, the material shader pipeline or
+# clean-home install.
+name: E2E (main + manual)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+    # Cap the job so a hung/stuck runner can't spin for hours (GitHub's
+    # default is 6h), while still failing fast on a wedged runner — a
+    # ubuntu runner once hung this job IN_PROGRESS for ~28 min.
+    #
+    # Was 10, which turned out to be under the real spread rather than
+    # above it. A green macos run on main sits at ~6m30s end to end
+    # (Test alone ~4m15s), so the cap was only ~3m30s of headroom, and
+    # a slower-than-usual macos runner ate it: PR #664 was cancelled at
+    # the cap on two consecutive attempts — once mid-Test at 8m31s, once
+    # in teardown at 10m18s after every real step had already passed. A
+    # cap that fires on ordinary runner variance is a flaky gate, not a
+    # safety net. 20 still catches the ~28m hang by a wide margin.
+    timeout-minutes: 20
+
+    # All steps run from inside the labelle-assembler checkout so the
+    # `../labelle-gui/flow-codegen` path-dep in build.zig.zon resolves
+    # to the sibling checkout below. actions/checkout@v4 forbids
+    # `path:` values that escape the workspace, so we put both repos
+    # inside it as siblings.
+    defaults:
+      run:
+        working-directory: labelle-assembler
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
+
+      - name: Checkout labelle-gui (flow_codegen)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          # Track gui's `main`. The path-dep on `../labelle-gui/flow-codegen`
+          # in build.zig.zon resolves against this sibling checkout. The
+          # 0.16 migration of flow-codegen is now on main, so no commit
+          # pin is needed.
+          ref: main
+          path: labelle-gui
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install sokol + SDL2 system libs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libgl1-mesa-dev libx11-dev libxi-dev libxcursor-dev \
+            libsdl2-dev libsdl2-mixer-dev
+
+      - name: Install SDL2 system libs (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sdl2 sdl2_mixer
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test
+
+      - name: Clean-home install (offline archives)
+        run: python3 test/clean_home_install_e2e.py
+
+      - name: zig-ecs adapter tests
+        run: cd ecs/zig-ecs && zig build test
+
+
+      - name: sokol backend unit tests + audio.zig compile-check
+        run: cd backends/sokol && zig build test
+
+      - name: plugins/debug tests
+        run: cd plugins/debug && zig build test
+
+      - name: Verify binary
+        run: |
+          ./zig-out/bin/labelle-assembler --protocol-version
+          ./zig-out/bin/labelle-assembler --help
+
+      # `describe` through the real binary (labelle-cli RFC #471 D1): a
+      # third-party package names the target dir after itself (finding 4),
+      # and nothing lands in the cache (offline, config-only).
+      - name: Verify describe (offline)
+        run: |
+          d=$(mktemp -d)
+          printf '.{ .name = "g", .backend_package = .{ .name = "acme", .repo = "github.com/acme/labelle-acme", .version = "1.0.0" } }\n' > "$d/project.labelle"
+          LABELLE_HOME="$d/home" ./zig-out/bin/labelle-assembler describe --project-root "$d" --target desktop --json > "$d/out.json"
+          cat "$d/out.json"
+          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['target_dir'] == '.labelle/acme_desktop', d" "$d/out.json"
+          test ! -e "$d/home"
+          test ! -e "$d/.labelle"
+
+  # End-to-end usage test: check out every sibling repo the examples
+  # need (labelle-cli for the binary, labelle-core/engine/gfx for the
+  # runtime packages), then `labelle generate` and `zig build` the
+  # in-tree examples. Validates that the assembler + backends +
+  # zig-ecs + deps_linker pipeline produces a project that actually
+  # compiles, not just resolves paths.
+  #
+  # The pure-raylib and pure-sokol examples were migrated into their
+  # backend packages (labelle-raylib#7 / labelle-sokol#5), which now
+  # own their own generate+build CI, so the assembler no longer owns
+  # them. The assembler tests its generate→build path against the
+  # backend-AGNOSTIC null backend (the `null` / `plugin-controllers`
+  # steps below) plus the still-in-tree feature smokes.
+  #
+  # Linux only for now — raylib-zig's transitive hexops/xcode-frameworks
+  # dep doesn't fetch cleanly from the macos GitHub runner (see the
+  # slot-allocator gate above for context).
+  examples-integration:
+    # NAMED for what it actually resolves (#732 half 2). This lane clones
+    # labelle-core / labelle-engine / labelle-gfx / labelle-null at `main` as
+    # SIBLINGS, and the assembler's monorepo auto-discovery (findRepoRoot walks
+    # up from the EXECUTABLE) builds those siblings INSTEAD of each example's
+    # declared pins. That is deliberate — it is the cross-repo integration
+    # signal — but it means a red here does NOT necessarily mean this PR is
+    # broken: during a multi-repo release train the four mains disagree for the
+    # minutes between merges, and an example fails on a contract that exists on
+    # one main and not another. PR #730 went red in a null-backend example on
+    # `backend_contract has no member named 'PixelWaterRgba'`, and a re-run of
+    # the IDENTICAL commit passed once the mains agreed.
+    #
+    # So: read a failure here as "this PR vs the toolkit mains, right now".
+    # The `bgfx-examples-pinned` job below is the lane that tests a PR against
+    # what it DECLARES; if that one is green and this one is red, check the SHA
+    # banner this job prints first — you are probably mid-train.
+    name: Examples integration (siblings @ main — cross-repo, may be mid-train)
+    runs-on: ubuntu-latest
+    # Builds several example projects end-to-end; normally a few minutes.
+    # 15 gives headroom for the multi-repo checkout + apt install while
+    # still bounding a wedged runner well under GitHub's 6h default.
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout labelle-assembler
+        uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
+
+      - name: Checkout labelle-gui (flow_codegen)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          # Track gui's `main`. The path-dep on `../labelle-gui/flow-codegen`
+          # in build.zig.zon resolves against this sibling checkout. The
+          # 0.16 migration of flow-codegen is now on main, so no commit
+          # pin is needed.
+          ref: main
+          path: labelle-gui
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-cli
+          ref: main
+          path: labelle-cli
+
+      # `cd labelle-cli && zig build` below pulls labelle-cli's pinned
+      # labelle_assembler package, which transitively declares
+      # `flow_codegen` as a relative path-dep (`../labelle-gui/flow-codegen`,
+      # an in-tree sub-package of labelle-gui). Zig unpacks the package
+      # into `labelle-cli/zig-pkg/`, so labelle-gui must be checked out
+      # there too. Mirrors the same fix in labelle-cli's own ci.yml.
+      - name: Checkout labelle-gui for the labelle-cli build
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-cli/zig-pkg/labelle-gui
+
+      # Stacked-PR sibling checkout: this PR (FP#549 in-engine video) needs
+      # labelle-core's VideoInterface/VideoComponent and labelle-engine's
+      # VideoImpl slot, which live on the `feat/video-interface` branch of each.
+      # Try that branch first, fall back to the default branch the job otherwise
+      # uses, so this keeps working once the video branches merge/are deleted.
+      - name: Checkout labelle-core (video branch first)
+        run: |
+          git clone --depth 1 --branch feat/video-interface \
+            https://github.com/labelle-toolkit/labelle-core.git labelle-core \
+          || git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-core.git labelle-core
+
+      - name: Checkout labelle-engine (video branch first)
+        run: |
+          git clone --depth 1 --branch feat/video-interface \
+            https://github.com/labelle-toolkit/labelle-engine.git labelle-engine \
+          || git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-engine.git labelle-engine
+
+      # Dedicated engine checkout for the hook-trace-ids example
+      # (labelle-assembler#727 / labelle-engine#858). That example needs the
+      # receiver-id TABLE CONSUMER, which is not on engine `main` until
+      # labelle-engine#866 lands. Kept separate from the shared
+      # `labelle-engine` sibling above so every other example keeps building
+      # against the engine it builds against today. Branch-first with a
+      # fallback to `main`, so this keeps working after #866 merges and the
+      # branch is deleted.
+      - name: Checkout labelle-engine for hook-trace-ids (#727 branch first)
+        run: |
+          git clone --depth 1 --branch feat/727-receiver-id-table \
+            https://github.com/labelle-toolkit/labelle-engine.git labelle-engine-727 \
+          || git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-engine.git labelle-engine-727
+
+      # Sibling checkout for the scripting-smoke example: its explicit
+      # `backend_package` pins `local:../../../labelle-null` so the generated
+      # main carries the `script_contract.bind` touchpoint from labelle-null's
+      # `templates/headless.txt` (labelle-engine#749 / #739) — the registry-
+      # resolved null release predates it. Branch fallback, same pattern as
+      # core/engine above: try the touchpoint branch first, fall back to main
+      # once it merges/is deleted.
+      - name: Checkout labelle-null (scripting-touchpoint branch first)
+        run: |
+          git clone --depth 1 --branch feat/scripting-touchpoint \
+            https://github.com/labelle-toolkit/labelle-null.git labelle-null \
+          || git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-null.git labelle-null
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gfx
+          ref: main
+          path: labelle-gfx
+
+      # Print WHICH sibling revisions this run resolved, before anything is
+      # built (#732). The examples' own pins are overridden by these
+      # checkouts, so these SHAs — not the `project.labelle` version fields —
+      # are what a failure below was actually compiled against. Without this
+      # banner a mid-release-train red is indistinguishable from a real break
+      # and gets debugged from scratch; with it, one glance at the top of the
+      # log says "core is 40 commits ahead of engine, wait for the train".
+      - name: Sibling revisions under test (READ THIS FIRST on a failure)
+        run: |
+          set -uo pipefail
+          echo "::group::Sibling checkouts resolved for this run"
+          printf '%-22s %-46s %s\n' REPO REVISION DESCRIBE
+          for d in labelle-core labelle-engine labelle-gfx labelle-null \
+                   labelle-cli labelle-gui labelle-engine-727; do
+            dir="$GITHUB_WORKSPACE/$d"
+            if [ ! -d "$dir/.git" ]; then
+              printf '%-22s %-46s %s\n' "$d" "(not checked out)" "-"
+              continue
+            fi
+            sha=$(git -C "$dir" rev-parse HEAD)
+            ref=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+            desc=$(git -C "$dir" describe --tags --always 2>/dev/null || echo "?")
+            printf '%-22s %-46s %s\n' "$d" "$sha ($ref)" "$desc"
+          done
+          echo "::endgroup::"
+          echo "NOTE: these siblings OVERRIDE each example's project.labelle pins."
+          echo "      A failure here may be a mid-release-train disagreement between"
+          echo "      the mains above rather than a defect in this PR. The"
+          echo "      'bgfx examples (PINNED resolution)' job tests the declared pins."
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install raylib + sokol system libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev \
+            libxinerama-dev libxi-dev libxext-dev libxfixes-dev \
+            libwayland-dev libxkbcommon-dev libasound2-dev \
+            libsdl2-dev
+
+      - name: Build labelle-assembler
+        run: cd labelle-assembler && zig build
+
+      - name: Build labelle-cli
+        run: cd labelle-cli && zig build
+
+      # Smoke test for the Asset Streaming RFC (labelle-assembler#55,
+      # labelle-engine#437). This fixture tests the assembler's
+      # asset-streaming CODEGEN — lazy-inference flipping the two atlases
+      # to `registerAtlasFromMemory` (parse JSON, defer PNG decode) plus
+      # the emitted `SceneAssetManifests.entries` / `setSceneAssets` loop.
+      # That pipeline is backend-AGNOSTIC, so the fixture now targets the
+      # headless `.null` backend (labelle-assembler#520): generate + build
+      # need no display / GL context, and the generated streaming main
+      # loop + ImageBackendAdapter also RUN headless (frame-capped, clean
+      # exit). Real GPU texture upload / on-screen render stays a local
+      # `labelle run --timeout=Ns` check — null has no GPU to upload to.
+      - name: Generate + build + run the asset-streaming-smoke example
+        run: |
+          cd labelle-assembler/examples/asset-streaming-smoke
+          ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
+
+          # `.null` is an EXTRACTED external backend (#386 Phase 6c) — it
+          # resolves to the `labelle-null` package, not a bundled slot, so
+          # its `backend.manifest.zon` must be in the package cache before
+          # `generate` can splice the codegen. `install` populates that
+          # cache (remote-fetches `labelle-null`). Do it explicitly per
+          # step so this fixture is self-sufficient and order-independent
+          # rather than piggy-backing on another example's `labelle generate`
+          # → `ensureCache`. Mirrors the external-backend step's `$ASM install`.
+          $ASM install --project-root .
+
+          # Invoke the assembler binary directly — labelle-cli's bundled
+          # generator is pinned to an older release that predates the
+          # `.null` Backend variant, so `labelle generate` would fail at
+          # the project.labelle parse step. Same recipe as the null /
+          # flows-smoke / plugin-controllers steps below.
+          $ASM generate --project-root .
+
+          # Codegen assertions — fail loudly if lazy-inference regresses
+          # and the atlases stop deferring their PNG decode.
+          grep -q 'registerAtlasFromMemory' .labelle/null_desktop/main.zig
+          grep -q 'SceneAssetManifests' .labelle/null_desktop/main.zig
+
+          cd .labelle/null_desktop
+
+          # labelle-cli-equivalent fixFingerprint dance (see the null step
+          # below) — the assembler emits a placeholder fingerprint.
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
+          # Null backend has no window / GL context — the generated
+          # streaming main loop + ImageBackendAdapter run for
+          # LABELLE_NULL_FRAMES frames and exit cleanly (rc=0) or crash.
+          LABELLE_NULL_FRAMES=10 ./zig-out/bin/asset_streaming_smoke
+          echo "PASS: asset-streaming-smoke generated + built + ran headless on null"
+
+      # External (out-of-tree) backend wiring, backend-AGNOSTIC. Proves the
+      # opt-in `.backend_package` path end-to-end: `install` FETCHES the backend
+      # package from GitHub into the cache, then `generate` stages it + codegens
+      # against its manifest. Uses the headless `nullfixture` backend (a real
+      # out-of-tree package with zero native deps) so the whole fetch → stage →
+      # codegen → BUILD pipeline runs cheaply — no heavy native compile. bgfx,
+      # the other external backend, builds + tests in its own repo (labelle-bgfx).
+      # Bypasses labelle-cli and drives the assembler binary directly.
+      - name: Verify an external (out-of-tree) backend wires up end-to-end
+        run: |
+          ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
+          # Backend-AGNOSTIC fetch test: the assembler resolves ANY external
+          # backend_package the same way (Phase 6a). bgfx now lives + is tested in
+          # its own repo (labelle-bgfx); here we use the headless `nullfixture`
+          # backend — a real out-of-tree package with zero native deps, so it
+          # exercises the full remote-fetch → stage → codegen → BUILD pipeline cheaply.
+          cd labelle-assembler/examples/external-null
+          $ASM install --project-root .
+          $ASM generate --project-root .
+
+          # The fetched package staged with its manifest, and codegen wired the dep.
+          test -f .labelle/deps/labelle-nullfixture/backend.manifest.zon
+          grep -qF 'b.dependency("labelle_nullfixture"' .labelle/nullfixture_desktop/build.zig
+
+          # Headless backend → a full build is cheap (no native C++), so build the
+          # binary outright rather than only resolving the graph.
+          cd .labelle/nullfixture_desktop
+          zig build
+          test -x zig-out/bin/example_external_null
+          echo "PASS: external backend fetched + staged self-contained + codegen + build OK"
+
+      # Hardware-free RUNTIME check of the shared sdl_gamepad source
+      # (backends/sdl_gamepad/sim — see its README). Attaches an
+      # in-process SDL2 virtual gamecontroller, drives every button and
+      # axis, and asserts the toolkit Source reports each one back with
+      # the correct canonical mapping. The gamepad example (now in
+      # labelle-raylib) only proves the source COMPILES; this proves
+      # connect detection,
+      # button routing, axis scaling/sign, and the synthesized
+      # analog-trigger button actually behave — headless, no window, no
+      # input devices on the runner needed.
+      - name: Run the gamepad-sim harness
+        run: |
+          cd labelle-assembler/backends/sdl_gamepad/sim
+          zig build run
+
+      # Null-backend headless example (labelle-assembler#129). Smoke-tests
+      # the .null path end-to-end: generate → build → RUN. The example has
+      # no plugins / GUI / assets — just a single per-frame script logging
+      # `[null] frame=N`. Asserts the binary exits cleanly after the
+      # default `LABELLE_NULL_FRAMES=5` cap (rc=0) and emits exactly the 5
+      # canonical lines. Catches "headless main compiles but doesn't
+      # behave" regressions that the codegen-snapshot tests in tests.zig
+      # can't surface — e.g. a future refactor accidentally routing null
+      # through the sokol-callback branch, or the frame counter going
+      # unbounded.
+      # THE #727 INTEGRATION PROOF. The unit tests show the assembler emits
+      # an index-aligned `hook_receiver_ids` table, and the engine harnesses
+      # show the tracer reads such a table. Neither shows the two halves
+      # AGREE in a real generated game — the table could be emitted and
+      # consumed correctly while its ids disagreed with the route
+      # inspector's, and nothing would notice.
+      #
+      # So: generate, BUILD and RUN a real game, then diff the receiver ids
+      # the tracer recorded at RUNTIME against the ids in the generated
+      # `hook_routes.json`. Real tuple, real table, real route report, real
+      # dispatch. The null backend needs no window, GPU or display server.
+      - name: Generate + build + run the hook-receiver-id trace integration (#727)
+        run: |
+          set -euo pipefail
+          cd labelle-assembler/examples/hook-trace-ids
+          $GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler generate --project-root .
+
+          cd .labelle/null_desktop
+          # The fingerprint fixup is OPTIONAL, so every grep in it must be
+          # allowed to match nothing. Under `set -e` a bare
+          # `X=$(... | grep ...)` aborts the whole step when the pattern is
+          # absent — which is the NORMAL case here, a build that simply
+          # succeeded, so the step would have failed every time. Hence
+          # `|| true` on each, plus an explicit check of the first build's
+          # exit code so a real (non-fingerprint) failure is reported with
+          # its output instead of being retried blindly.
+          set +e
+          ERR=$(zig build 2>&1)
+          BUILD_RC=$?
+          set -e
+          if [ "$BUILD_RC" -ne 0 ]; then
+            BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}' || true)
+            GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}' || true)
+            if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+              echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+              sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+              zig build
+            else
+              echo "FAIL: the generated project did not build, and it is not the fingerprint placeholder:"
+              printf '%s\n' "$ERR"
+              exit 1
+            fi
+          fi
+
+          LABELLE_NULL_FRAMES=6 ./zig-out/bin/hook_trace_ids > run.log 2>&1
+          cat run.log
+
+          # NON-VACUITY FIRST. If nothing was delivered there is nothing to
+          # compare, and an empty list would diff clean against an empty
+          # list — the failure mode this whole check exists to avoid.
+          grep -q '\[trace\] deliver_count=2' run.log || {
+            echo "FAIL: expected 2 deliveries, trace says otherwise"; exit 1; }
+
+          # EVERY delivery must be labelled from the TABLE. This is the
+          # assertion that makes it a consumer proof: for a root hook the
+          # @typeName DERIVATION happens to produce the same string as the
+          # table, so matching ids alone would pass even with an engine that
+          # ignored the table entirely. `kind` is what distinguishes them.
+          if grep -E '\[trace\] slot=' run.log | grep -qv 'kind=table'; then
+            echo "FAIL: a delivery was not labelled from the generated table"
+            grep -E '\[trace\] slot=' run.log
+            exit 1
+          fi
+
+          # RUNTIME ids vs the ROUTE REPORT, in dispatch order.
+          grep -oE 'slot=[0-9]+ receiver=[^ ]+' run.log > /tmp/runtime_ids.txt
+          # `python3 -c` rather than a heredoc, purely to keep the quoting
+          # on one line. (A heredoc would work here too — YAML strips the
+          # block scalar's common indentation before bash sees it, so the
+          # terminator does land at column 0. An earlier revision of this
+          # comment claimed otherwise; that was wrong.)
+          python3 -c 'import json; d=json.load(open("../hook_routes.json")); [print("slot=%d receiver=%s" % (i, r.get("id"))) for i, r in enumerate(d.get("receivers", []))]' > /tmp/report_ids.txt
+
+          echo "--- runtime (tracer) ---"; cat /tmp/runtime_ids.txt
+          echo "--- generated route report ---"; cat /tmp/report_ids.txt
+          diff /tmp/runtime_ids.txt /tmp/report_ids.txt || {
+            echo "FAIL: runtime receiver ids disagree with hook_routes.json"; exit 1; }
+          echo "OK: runtime trace ids == route report ids, all from the generated table"
+
+      - name: Generate + build + run the null headless example
+        run: |
+          cd labelle-assembler/examples/null
+
+          # Bypass labelle-cli (pinned to an older release that doesn't
+          # know about the `.null` Backend variant added in this PR);
+          # invoke the assembler binary directly, then patch the
+          # placeholder fingerprint the same way labelle-cli's runner
+          # does. Mirrors the plugin-controllers recipe below.
+          $GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler generate --project-root .
+
+          cd .labelle/null_desktop
+
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
+          # Null backend has no window / display server / GL context,
+          # so the binary either runs to completion (rc=0) or crashes.
+          ./zig-out/bin/null_headless_demo > run.log 2>&1
+
+          # Pin the canonical 5-frame sequence — surfaces a runaway
+          # loop or a missed counter bump immediately. Drop log
+          # timestamps + level prefix; only the tagged frame events
+          # matter.
+          grep -oE '\[null\] frame=[0-9]+' run.log > actual.txt || true
+          cat > expected.txt <<'END'
+          [null] frame=1
+          [null] frame=2
+          [null] frame=3
+          [null] frame=4
+          [null] frame=5
+          END
+          sed -i 's/^          //' expected.txt
+          if ! diff -u expected.txt actual.txt; then
+            echo "E: null headless example frame sequence mismatch"
+            echo "--- full captured output ---"
+            cat run.log
+            exit 1
+          fi
+          echo "PASS: null headless example ran 5 frames and exited cleanly"
+
+      # Lua scripting end-to-end smoke (labelle-assembler#593 splice;
+      # Phase-1 proof for labelle-engine#739, epic labelle-engine#237).
+      # The REAL consumer chain, nothing mocked:
+      #
+      #   project.labelle `.params.language = "lua"` on the labelle-scripting
+      #   plugin (fetched from GitHub at v0.2.1) → splice embeds
+      #   scripts/behavior.lua (the scripts/ convention — labelle-engine#237)
+      #   + registers it pre-VM-boot → labelle-null's
+      #   headless template binds `engine.script_contract` → per-frame
+      #   `scripting.Controller.tick` runs the VM → `drainEvents` taps the
+      #   engine event bus → the behavior creates an entity, moves its
+      #   Position, emits a custom `lua_ping` event AND receives it back,
+      #   plus the engine's own `engine__tick`.
+      #
+      # v0.2.1 also ships the declare tool, so this run exercises DECLARE
+      # MODE (#585/#598) end-to-end against the real thing: generate builds
+      # `labelle-declare` from the resolved dep (`zig build labelle-declare`),
+      # runs it over the collected scripts/ sources, and codegens the behavior's chunk-scope
+      # `labelle.component("Hunger", ...)` into `scripting_components.zig` +
+      # the registry — and the running game then writes/reads the declared
+      # component through the contract (the LUA_DECLARED_LEVEL_0.875 token,
+      # derived from the read-back value, pins the round-trip).
+      #
+      # Runs bounded (LABELLE_NULL_FRAMES=5) and pins the exact ordered
+      # LUA_* milestone sequence — this run doubles as the Script Runtime
+      # Contract's end-to-end integration test (labelle-engine#749).
+      - name: Generate + build + run the scripting-smoke example (Lua end-to-end)
+        run: |
+          cd labelle-assembler/examples/scripting-smoke
+          ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
+
+          # Fetch the scripting plugin (GitHub, v0.2.1) into the package
+          # cache. The backend needs no fetch — `backend_package` pins the
+          # sibling labelle-null checkout (see the clone step above).
+          # generate then ALSO builds + runs the dep's real declare tool
+          # (fetching its Lua dep -- the GitHub-hosted mirror since v0.2.1 -- on first build) — see the step
+          # comment above.
+          $ASM install --project-root .
+          $ASM generate --project-root .
+
+          # Codegen assertions — each is one link of the chain; fail loudly
+          # if a regression drops it.
+          M=.labelle/null_desktop/main.zig
+          # Splice: embedded script registered before the VM boots.
+          grep -qF 'scripting.registerScript("behavior", @embedFile("scripts/behavior.lua"));' $M
+          # Splice: the generated flag half of the templates' double-gate.
+          grep -qF 'const scripting_enabled = true;' $M
+          # labelle-null template: the bind touchpoint (proves the sibling
+          # checkout — not a stale registry release — was staged).
+          grep -qF 'engine.script_contract.bind(&g);' $M
+          # Splice: the VM tick that actually advances the scripts.
+          grep -qF 'scripting.Controller.tick(&g, scaled_dt);' $M
+          # Splice: the event tap between plugin ticks and dispatchEvents.
+          grep -qF 'engine.script_contract.drainEvents(&g);' $M
+          # Build wiring: the plugin's -Dlanguage option.
+          grep -qF '.language = .lua' .labelle/null_desktop/build.zig
+          # Declare mode (#585/#598): the REAL labelle-declare tool ran from
+          # the resolved v0.2.1 dep and codegened the script-declared
+          # component into the target...
+          C=.labelle/null_desktop/scripting_components.zig
+          grep -qF 'pub const Hunger = struct' $C
+          # ...with the declared f32 default intact (0.875 = 7/8, exact)...
+          grep -qF 'level: f32 = 0.875,' $C
+          # ...and the registry wires it under its declared name, so the
+          # contract's by-name dispatch (and scenes, saves, queries) see it
+          # like any components/*.zig file.
+          grep -qF '.Hunger = @import("scripting_components.zig").Hunger,' $M
+
+          cd .labelle/null_desktop
+
+          # labelle-cli-equivalent fixFingerprint dance (see the null step
+          # above) — the assembler emits a placeholder fingerprint.
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
+          # Headless bounded run: no window, no GL — the binary runs to
+          # completion (rc=0) or crashes.
+          LABELLE_NULL_FRAMES=5 ./zig-out/bin/scripting_smoke > run.log 2>&1
+
+          # Pin the exact ordered milestone sequence. Payload facts are
+          # encoded IN the tokens (LUA_EVENT_SEEN_N_2 = the emitted payload
+          # round-tripped bit-exact; LUA_MOVED_X_30 = Position reached x=30
+          # on tick 3; LUA_DECLARED_LEVEL_0.875 = the DECLARED default of
+          # the script-declared Hunger component read back through the real
+          # ECS — the char class includes '.' for exactly that token), so
+          # token extraction pins behavior, not just liveness. See
+          # scripts/behavior.lua for the frame-by-frame timeline.
+          grep -oE 'LUA_[A-Z0-9_.]+' run.log > actual.txt || true
+          cat > expected.txt <<'END'
+          LUA_INIT
+          LUA_DECLARED_LEVEL_0.875
+          LUA_TICK_1
+          LUA_TICK_2
+          LUA_EMIT_OK
+          LUA_ENGINE_TICK_SEEN
+          LUA_EVENT_SEEN_N_2
+          LUA_TICK_3
+          LUA_MOVED_X_30
+          LUA_TICK_4
+          LUA_TICK_5
+          END
+          sed -i 's/^          //' expected.txt
+          if ! diff -u expected.txt actual.txt; then
+            echo "E: scripting-smoke LUA milestone sequence mismatch"
+            echo "--- full captured output ---"
+            cat run.log
+            exit 1
+          fi
+          echo "PASS: Lua behavior drove the real engine — entity + Position + emit/subscribe + declared-component (declare-mode) round-trips over 5 headless frames"
+
+      # Smoke test for the Flows end-to-end compile loop
+      # (labelle-gui#96). Exercises the full pipeline shipped by
+      # labelle-gui#94/#101/#102 + labelle-engine#541 + labelle-assembler
+      # #115/#117:
+      #
+      #   .flow.zon (4-node graph) → flow_scanner → flow_codegen.renderFlowZig
+      #     → emitted scripts/flows/tick.zig → "game" module re-export
+      #     → Game.getComponent / Game.setField / game.preview.emitNodeEntered
+      #     → linked into the generated game binary
+      #
+      # Invokes the assembler binary directly (same recipe as the null
+      # step above) — labelle-cli's bundled generator module is pinned
+      # to an older release and routing through `labelle generate` is
+      # unnecessary friction here.
+      #
+      # Backend: `.null` (labelle-assembler#520). This fixture tests FLOW
+      # CODEGEN, not rendering, so it targets the backend-agnostic
+      # headless backend — generate + build need no display / GL context.
+      # Build-only (no headless run): the generated flow event-handler's
+      # `tick` graph does a runtime `game.getComponent` on the
+      # entity_created payload, which currently faults inside labelle-core's
+      # ecs (`alive.contains`) — a pre-existing, backend-INDEPENDENT runtime
+      # gap this fixture never surfaced while it was raylib build-only. The
+      # codegen contract under test is fully asserted by generate + build.
+      - name: Generate + build the flows-smoke example
+        run: |
+          cd labelle-assembler/examples/flows-smoke
+          ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
+
+          # `.null` is an EXTRACTED external backend (#386 Phase 6c): its
+          # `backend.manifest.zon` must be in the package cache before
+          # `generate` can splice the codegen. Populate it explicitly so
+          # this fixture is self-sufficient / order-independent instead of
+          # relying on an earlier example's `ensureCache`. (See the
+          # asset-streaming-smoke step above for the full rationale.)
+          $ASM install --project-root .
+
+          $ASM generate --project-root .
+
+          # Asserted output of the flow_scanner pass — fails loudly here
+          # if a regression silently disables the scanner.
+          test -f scripts/flows/tick.zig
+          test -f .labelle/null_desktop/scripts/flows/tick.zig
+
+          # Game-script CustomNode (labelle-assembler#240) — the
+          # `custom.flow.jsonc` references `logger.log_i32`, a FlowNode
+          # declared in `scripts/logger.zig`. Assert the flow lowered AND
+          # that the named-module promotion (#240 Gap 2) + shim
+          # `PluginFlowNodes` (#240 Gap 1) landed in the generated build.
+          test -f scripts/flows/custom.zig
+          test -f .labelle/null_desktop/scripts/flows/custom.zig
+          # Call reaches `impl` through `@TypeOf(...)` so Zig doesn't UFCS-bind
+          # the FlowNode value as impl's first arg (flow-codegen#28).
+          grep -qF "@TypeOf(game_mod.PluginFlowNodes.logger__log_i32).impl(game" .labelle/null_desktop/scripts/flows/custom.zig
+          # Shim exposes PluginFlowNodes via the NAMED module (Gap 1+2).
+          grep -q 'pub const PluginFlowNodes = struct' .labelle/null_desktop/game.zig
+          grep -q 'logger__log_i32 = @import("script__logger")' .labelle/null_desktop/game.zig
+          # build.zig declares + wires the named module.
+          grep -q 'const script__logger_mod = b.createModule' .labelle/null_desktop/build.zig
+          grep -q 'overrideImport(game_mod, "script__logger"' .labelle/null_desktop/build.zig
+
+          cd .labelle/null_desktop
+
+          # Same labelle-cli-equivalent fixFingerprint dance as the
+          # null step above — the assembler emits a placeholder
+          # fingerprint that the CLI normally rewrites post-generate.
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
+      # End-to-end test for PR #73's plugin-Controller machinery
+      # (RFC-plugin-controllers §1–§2). Unlike the build-only examples
+      # above, this step also RUNS the binary and asserts the log output
+      # matches a canonical `setup` → interleaved `game-tick` /
+      # `plugin-tick` → `deinit` sequence. Catches "generated code
+      # compiles but doesn't behave" regressions that snapshot tests in
+      # tests.zig can't — e.g. PluginControllers.setup silently skipped,
+      # plugin-shipped scripts copied but never dispatched, or
+      # PluginControllers.deinit not actually wired into the defer chain.
+      #
+      # Backend: `.null` (see project.labelle). The null backend has no
+      # graphics context, no window, no input — runs the engine's tick
+      # loop for `LABELLE_NULL_FRAMES` (default 5) frames and exits.
+      # That removes the xvfb-on-Linux dance the raylib backend
+      # required and lets the loop exit cleanly so `defer
+      # PluginControllers.deinit(&g)` actually runs (which is the whole
+      # point of asserting `[demo-plugin] deinit` in the canonical log).
+      # The pack module wall (#498 / docs/packs.md), end-to-end: a two-pack
+      # game builds headless on null, then four negative probes each FAIL
+      # to compile with the wall's message. Positive first so a probe
+      # failure can't mask a broken baseline.
+      - name: Generate + build the packs-demo example (+ wall probes)
+        run: |
+          cd labelle-assembler/examples/packs-demo
+          ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
+
+          $ASM install --project-root .
+          $ASM generate --project-root .
+
+          # Generated-shape assertions: the pack module + Registry bridge
+          # + exposes surface all present.
+          grep -q 'pack__citizens_mod = b.createModule' .labelle/null_desktop/build.zig
+          grep -q 'pub const Registry' .labelle/null_desktop/packs/citizens/__pack_root.zig
+          grep -q 'find_idle' .labelle/null_desktop/packs/citizens/__surface.zig
+
+          cd .labelle/null_desktop
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+          LABELLE_NULL_FRAMES=10 ./zig-out/bin/packs_demo
+          echo "PASS: packs-demo built + ran headless (wall positive)"
+          cd ../..
+
+          # Negative probes: append an escape to the consuming script,
+          # regenerate, and require the build to FAIL with the wall's
+          # message. `git checkout` restores between probes.
+          probe() {
+            local snippet="$1" needle="$2" label="$3"
+            printf '%s\n' "$snippet" >> packs/production/scripts/playing/20_consume.zig
+            $ASM generate --project-root . > /dev/null
+            set +e
+            OUT=$(cd .labelle/null_desktop && zig build 2>&1)
+            RC=$?
+            set -e
+            if [ $RC -eq 0 ]; then echo "FAIL: probe '$label' compiled"; exit 1; fi
+            printf '%s\n' "$OUT" | grep -q "$needle" || { echo "FAIL: probe '$label' died without the wall message ($needle)"; printf '%s\n' "$OUT" | tail -20; exit 1; }
+            git -C "$GITHUB_WORKSPACE/labelle-assembler" checkout -- examples/packs-demo/packs/production/scripts/playing/20_consume.zig
+            echo "PASS: probe '$label' blocked"
+          }
+
+          probe 'const stolen = @import("../../../citizens/components/counter.zig"); comptime { _ = stolen; }' \
+                "file exists in modules" "sibling relative import"
+          probe 'const shim = @import("game"); comptime { _ = shim; }' \
+                "no module named .game." "game shim from a pack"
+          probe 'comptime { _ = @import("citizens").queries.internal_reset; }' \
+                "no member named .internal_reset." "non-exposed verb"
+          probe 'comptime { _ = @import("pack").Registry.getType("citizens__Counter"); }' \
+                "is not visible to this pack" "foreign name through the Registry bridge"
+
+          # Baseline still green after the probe cycle.
+          $ASM generate --project-root . > /dev/null
+          (cd .labelle/null_desktop && zig build)
+          echo "PASS: packs-demo wall — 1 positive + 4 blocked probes"
+
+      - name: Generate + build the plugin-controllers example
+        run: |
+          cd labelle-assembler/examples/plugin-controllers
+
+          # Invoke the assembler binary directly — labelle-cli's bundled
+          # generator module is pinned to an older release that doesn't
+          # know about the `.null` Backend variant added in this PR, so
+          # `labelle generate` would fail at the project.labelle parse
+          # step before forwarding to LABELLE_ASSEMBLER. Once labelle-cli
+          # bumps its pinned assembler dep past this PR we can route this
+          # back through `labelle generate` like the other examples.
+          $GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler generate --project-root .
+
+          cd .labelle/null_desktop
+
+          # The assembler intentionally leaves build.zig.zon's fingerprint
+          # at a placeholder; labelle-cli normally patches it via a
+          # post-generate `runner.fixFingerprint` pass. Replicate that
+          # here: capture Zig's "invalid fingerprint: 0xBAD; ... use this
+          # value: 0xGOOD" diagnostic from a first build attempt, rewrite
+          # the field, then build for real.
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
+      - name: Runtime log-order check for plugin-controllers
+        run: |
+          cd labelle-assembler/examples/plugin-controllers/.labelle/null_desktop
+
+          # Null backend exits cleanly after LABELLE_NULL_FRAMES frames
+          # (default 5). No window, no GL context, no display server —
+          # the binary either runs to completion (rc=0) or crashes
+          # (anything else). No `timeout` wrapper needed.
+          ./zig-out/bin/plugin_controllers_demo > run.log 2>&1
+
+          # Extract only the tagged lifecycle events we care about.
+          # Drops log timestamps and log level prefix.
+          grep -oE '\[(demo-plugin|game)\] [a-z-]+( frame=[0-9]+)?' run.log > actual.txt || true
+
+          # Canonical sequence — see `examples/plugin-controllers/README.md`
+          # and the `FRAMES_BEFORE_QUIT = 5` in the two tick scripts.
+          # The trailing `[demo-plugin] deinit` is reachable now that the
+          # null backend exits cleanly (raylib's hidden-window loop
+          # couldn't, which is why PR #73's matching assertion was a
+          # snapshot-only check on the generated `defer ... deinit`).
+          cat > expected.txt <<'END'
+          [demo-plugin] setup
+          [game] game-tick frame=1
+          [demo-plugin] plugin-tick frame=1
+          [game] game-tick frame=2
+          [demo-plugin] plugin-tick frame=2
+          [game] game-tick frame=3
+          [demo-plugin] plugin-tick frame=3
+          [game] game-tick frame=4
+          [demo-plugin] plugin-tick frame=4
+          [game] game-tick frame=5
+          [demo-plugin] plugin-tick frame=5
+          [demo-plugin] deinit
+          END
+          # Strip the YAML-block leading indent from the heredoc body.
+          sed -i 's/^          //' expected.txt
+
+          if ! diff -u expected.txt actual.txt; then
+            echo "E: plugin-controllers log order mismatch"
+            echo "--- full captured output ---"
+            cat run.log
+            exit 1
+          fi
+          echo "PASS: plugin-controllers lifecycle order matches canonical sequence"
+          echo "  ($(wc -l < actual.txt | tr -d ' ') lifecycle events in order)"
+
+      # Asset-Plugins Phase 2 reference (labelle-engine#728). The
+      # fantasy-dungeon plugin bundles two packs (`tiles`, `props`) + a
+      # plugin-level `banner` atlas + license/author, attached by a single
+      # `local:./plugin` entry. This step is the Phase-2 acceptance fixture:
+      # a fresh generate wires every atlas namespaced + merged with ZERO
+      # `.resources` in the game, then builds + runs headless so the pack
+      # generator script actually fires.
+      - name: Generate + build + run the fantasy-dungeon asset-plugin example
+        run: |
+          cd labelle-assembler/examples/fantasy-dungeon
+          $GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler generate --project-root .
+
+          M=.labelle/null_desktop/main.zig
+
+          # #573/#576 resource MERGE: all three atlases registered under their
+          # namespaced <unit>__<name> keys, repathed into packs/<unit>/assets/.
+          grep -qF 'registerAtlasFromMemory("tiles__tileset", @embedFile("packs/tiles/assets/tileset.json")' "$M"
+          grep -qF 'registerAtlasFromMemory("props__atlas", @embedFile("packs/props/assets/props.json")' "$M"
+          grep -qF 'registerAtlasFromMemory("fantasy_dungeon__banner", @embedFile("packs/fantasy_dungeon/assets/banner.json")' "$M"
+
+          # #575 scene auto-wiring: referencing the pack prefabs pulled each
+          # pack's atlas into the scene manifest with no hand-listed assets.
+          grep -qE 'pub const main:.*"tiles__tileset".*"props__atlas"' "$M"
+
+          # #574 frame-key namespacing on disk: bare `floor.png` became
+          # `tiles/floor.png`; the plugin banner became `fantasy_dungeon/banner.png`.
+          grep -qF '"tiles/floor.png"' .labelle/null_desktop/packs/tiles/assets/tileset.json
+          grep -qF '"props/torch.png"' .labelle/null_desktop/packs/props/assets/props.json
+          grep -qF '"fantasy_dungeon/banner.png"' .labelle/null_desktop/packs/fantasy_dungeon/assets/banner.json
+          # ...and the pack prefab's own sprite_name ref was rewritten to match.
+          grep -qF '"tiles/floor.png"' .labelle/null_desktop/packs/tiles/prefabs/floor_tile.jsonc
+          echo "PASS: fantasy-dungeon resources merged + namespaced (zero game .resources)"
+
+          cd .labelle/null_desktop
+          # Same labelle-cli-equivalent fixFingerprint dance the other examples use.
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+          LABELLE_NULL_FRAMES=10 ./zig-out/bin/fantasy_dungeon_demo > run.log 2>&1
+
+          # The bundled `tiles` pack's generator script (an ordinary pack
+          # script) ran each `playing` tick and stamped the room silhouette.
+          grep -q '\[fantasy-dungeon:tiles\] generate row 0: ####' run.log
+          grep -q '\[fantasy-dungeon:tiles\] generate row 3: ####' run.log
+          echo "PASS: fantasy-dungeon built + ran headless; pack generator fired"
+
+      # Showcase games (labelle-assembler#611, docs/showcase-plan.md rows 6-9).
+      # These pin the RELEASED RUNTIME package set (core 1.26.0 / engine 2.6.0 /
+      # gfx 1.28.1 / cli 1.58.0) + released backends, and — like every sibling
+      # example — pin the ASSEMBLER at `local:../../` (in-tree source). So this
+      # step fetches the published runtime tarballs (`install`) and generates
+      # against them with the in-tree assembler binary, which (a) carries the
+      # #611 sokol backend_gfx core-unify fix that released 0.94.0 lacks, and
+      # (b) provides the bundled `ecs/zig-ecs` adapter a numbered assembler pin
+      # would instead stage from ~/.labelle/packages/assembler/<ver>/ (only a
+      # released `labelle` populates that; this CI does not). On the
+      # fully-released `labelle` path the bgfx/raylib games build on assembler
+      # 0.94.0 and the sokol game needs >= 0.95.0 (post-#611) — see the READMEs.
+      #
+      # generate is run for all four (the released-runtime codegen path); zig
+      # build is run for the raylib + sokol games (their system libs are
+      # installed above, and sprite-runner is the regression guard for the #611
+      # sokol-desktop material-seam fix). The two bgfx games (pack-city,
+      # material-demo) stay generate-only IN THIS LANE on purpose: here their
+      # pins are overridden by the sibling `main` checkouts, so a build would
+      # be a moving target. They are BUILT — not just generated — against their
+      # DECLARED pins in the `bgfx examples (PINNED resolution)` job below
+      # (#732). Screenshots are NOT part of CI: each game ships a committed
+      # deterministic preview.png and documents manual `--screenshot` capture
+      # (windowed backends need a GUI session / xvfb). See each game's README.
+      - name: Generate + build the #611 showcase games (released runtime pins)
+        run: |
+          ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
+
+          fix_and_build () {
+            # labelle-cli-equivalent fixFingerprint dance, then build.
+            set +e
+            ERR=$(zig build 2>&1)
+            set -e
+            BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+            GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+            if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+              sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+            fi
+            zig build
+          }
+
+          # generate-only for all four (released-pin codegen path).
+          for g in tile-explorer sprite-runner pack-city material-demo; do
+            echo "== $g: install + generate (released pins) =="
+            ( cd labelle-assembler/examples/$g
+              $ASM install  --project-root .
+              $ASM generate --project-root . )
+          done
+
+          # Full build for the raylib + sokol games (libs present above).
+          echo "== tile-explorer: zig build (raylib) =="
+          ( cd labelle-assembler/examples/tile-explorer/.labelle/raylib_desktop && fix_and_build )
+
+          echo "== sprite-runner: zig build (sokol; #611 backend_gfx fix regression guard) =="
+          ( cd labelle-assembler/examples/sprite-runner/.labelle/sokol_desktop && fix_and_build )
+
+          echo "PASS: #611 showcase games — 4 generated on released pins, raylib+sokol built"
+
+  # C# EMBED-path end-to-end (labelle-assembler#617). The csharp
+  # counterpart of the rust/crystal native-language splices: proves THIS
+  # assembler compiles a csharp game's scripts/*.cs into the managed
+  # assembly at generate/build and stages it where hostfxr loads it — with
+  # NO manual dotnet step and NO manual LABELLE_CS_ASSEMBLY_DIR export.
+  #
+  # It drives labelle-scripting's real `examples/csharp-game` (its plugin
+  # pin `local:../..` resolves to the sibling checkout, backend
+  # `local:../../../labelle-null` to the null sibling) through the
+  # assembler binary built from THIS checkout — so the splice, the
+  # `.language_builds` dotnet-publish wiring, the runtime-output InstallDir
+  # staging and the run-step env injection under review are exactly what
+  # runs. Unlike labelle-scripting's own csharp-example job (which pins a
+  # RELEASED assembler and therefore hand-locates the published DLL +
+  # exports the env), this job does NEITHER: the assembly must arrive
+  # beside the installed binary and `zig build run` must point the CoreCLR
+  # host at it on its own. That delta IS the #617 acceptance.
+  #
+  # Linux only (the examples-integration lane's constraint) + setup-dotnet
+  # 7.0.x (the example's net7.0 target — the SDK builds it and provides the
+  # runtime hostfxr loads).
+  curated-set:
+    name: Curated version set (init -> generate -> build)
+    runs-on: ubuntu-latest
+    # One cold toolkit fetch + one engine compile against the null
+    # backend. 30 bounds a wedged runner far under GitHub's 6h default,
+    # matching the sibling released-path jobs.
+    timeout-minutes: 30
+
+    # `build.zig` carries a curated trio (core / engine / gfx) that a
+    # fresh `labelle-assembler init` stamps into every new project, and
+    # the release workflow bakes into every scaffold pin. Until this job
+    # existed, NOTHING verified that set: the feature examples resolve
+    # local checkouts, and the showcase block pins its own explicit
+    # versions because it exists to test the RELEASED path. So a default
+    # could point at an unreleased or mutually-incompatible version and
+    # CI stayed green while every fresh `labelle init` failed to compile
+    # at the user's machine — exactly what shipped in v0.96.0 (engine
+    # 2.7.0 -> 2.11.0 with core left at 1.26.0). See #667.
+    #
+    # Deliberately uses the DEFAULTS: no `--core-version` / `--gfx-version`
+    # flags. Pinning anything here would test the pin, not the trio.
+    steps:
+      - name: Checkout labelle-assembler
+        uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
+
+      - name: Checkout labelle-gui (flow_codegen)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-gui
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build labelle-assembler
+        run: cd labelle-assembler && zig build
+
+      - name: Scaffold with the curated defaults
+        run: |
+          set -euo pipefail
+          mkdir -p curated && cd curated
+          "$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler" \
+            init curated-check --backend=null
+          echo "== stamped pins =="
+          grep '_version' curated-check/project.labelle
+
+      # `init` stamps `assembler_version` from build.zig.zon, which on a
+      # non-release build is a stale placeholder. Point it at THIS
+      # checkout so the job tests the assembler under review rather than
+      # downloading an old release of it.
+      - name: Resolve the assembler under test
+        run: |
+          set -euo pipefail
+          cd curated/curated-check
+          sed -i "s|    .assembler_version = \".*\",|    .assembler_version = \"local:$GITHUB_WORKSPACE/labelle-assembler\",|" project.labelle
+          grep 'assembler_version' project.labelle
+
+      # `.null` is an EXTRACTED external backend (#386 Phase 6c): it
+      # resolves to the `labelle-null` PACKAGE rather than a bundled
+      # slot, so its `backend.manifest.zon` has to be in the package
+      # cache before `generate` can splice the codegen — otherwise
+      # generate dies with `ExternalBackendNeedsManifest`. `install`
+      # populates it. Same explicit-per-step recipe the null and
+      # external-backend example steps use.
+      #
+      # This is invisible on a developer machine, whose cache already
+      # holds `labelle-null` from any earlier build. It only shows up on
+      # a cold runner — which is precisely the environment this job is
+      # here to represent.
+      - name: Install packages (populates the null backend manifest)
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler" \
+            install --project-root "$PWD/curated/curated-check"
+
+      - name: Generate
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler" \
+            generate --project-root "$PWD/curated/curated-check"
+
+      # Guard against the failure mode where generation "succeeds" but
+      # resolves versions other than the ones the defaults asked for — a
+      # green build would then prove nothing about the curated set.
+      #
+      # Asserted against the CACHE SLOT, whose directory name is the
+      # resolved pin, NOT against the fetched package's own
+      # `build.zig.zon` `.version`. That field drifts from the tag across
+      # this toolkit (engine v2.11.0 ships `.version = "2.10.0"`; gfx
+      # carried 1.28.1 through the v1.28.2-v1.28.5 tags), so comparing
+      # against it reports false mismatches.
+      #
+      # Exact on a cold runner, which is where this job lives: the slot
+      # can only exist because this generate fetched it.
+      - name: Assert the resolved packages match the stamped pins
+        run: |
+          set -euo pipefail
+          cd curated/curated-check
+          for pkg in core engine gfx; do
+            want=$(sed -n "s/.*\.${pkg}_version = \"\([^\"]*\)\".*/\1/p" project.labelle)
+            slot="${LABELLE_HOME:-$HOME/.labelle}/packages/${pkg}/${want}"
+            echo "${pkg}: stamped=${want}"
+            if [ ! -d "$slot" ]; then
+              echo "::error::${pkg} ${want} is the curated default but was never fetched ($slot missing)"
+              exit 1
+            fi
+            if [ ! -d ".labelle/deps/labelle-${pkg}" ]; then
+              echo "::error::${pkg} was not vendored into .labelle/deps/"
+              exit 1
+            fi
+          done
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          cd curated/curated-check/.labelle/null_desktop
+          zig build
+
+  # The DEFAULT new project, end to end. `curated-set` above proves the
+  # trio on the cheap null backend; this job proves what a bare
+  # `labelle-assembler init <name>` actually scaffolds — desktop + bgfx
+  # since 2026-09-27 — generates and COMPILES on a cold runner with the
+  # curated trio and the builtin bgfx provider. No `--backend`, no version
+  # flags: pinning anything here would test the pin, not the default.
+  curated-set-default-backend:
+    name: Curated version set, default backend (init -> generate -> bgfx desktop build)
+    runs-on: ubuntu-latest
+    # Cold toolkit fetch + a cold bgfx C++ compile + one engine compile.
+    # Same bound as `bgfx-examples-pinned`, which pays the same compile.
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout labelle-assembler
+        uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
+
+      - name: Checkout labelle-gui (flow_codegen)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-gui
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # bgfx desktop on Linux: X11/Wayland + Vulkan headers. Same list as
+      # `bgfx-examples-pinned` (which mirrors labelle-bgfx's own CI).
+      - name: Install bgfx desktop system libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev \
+            libvulkan-dev
+
+      - name: Build labelle-assembler
+        run: cd labelle-assembler && zig build
+
+      - name: Scaffold with NO flags (the default backend)
+        run: |
+          set -euo pipefail
+          mkdir -p curated && cd curated
+          "$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler" \
+            init default-check
+          echo "== stamped backend + pins =="
+          grep -E '\.backend|_version' default-check/project.labelle
+          # The default IS bgfx, and nothing names a provider package.
+          grep -qE '^    \.backend = \.bgfx,$' default-check/project.labelle \
+            || { echo "::error::a bare init did not scaffold .backend = .bgfx"; exit 1; }
+          if grep -q 'backend_package' default-check/project.labelle; then
+            echo "::error::a bare init wrote a .backend_package (desktop needs no provider)"; exit 1
+          fi
+
+      # Same reason as `curated-set`: test the assembler under review, not
+      # an old release of it.
+      - name: Resolve the assembler under test
+        run: |
+          set -euo pipefail
+          cd curated/default-check
+          sed -i "s|    .assembler_version = \".*\",|    .assembler_version = \"local:$GITHUB_WORKSPACE/labelle-assembler\",|" project.labelle
+          grep 'assembler_version' project.labelle
+
+      - name: Install packages
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler" \
+            install --project-root "$PWD/curated/default-check"
+
+      - name: Generate
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler" \
+            generate --project-root "$PWD/curated/default-check"
+          test -d curated/default-check/.labelle/bgfx_desktop \
+            || { echo "::error::generate did not produce .labelle/bgfx_desktop/"; exit 1; }
+
+      # The resolved packages match the stamped pins AND the builtin bgfx
+      # provider version — asserted against the cache SLOTS (see
+      # `curated-set` for why not the packages' own `.version` fields).
+      - name: Assert the resolved packages match the stamped pins
+        run: |
+          set -euo pipefail
+          cd curated/default-check
+          home="${LABELLE_HOME:-$HOME/.labelle}"
+          for pkg in core engine gfx; do
+            want=$(sed -n "s/.*\.${pkg}_version = \"\([^\"]*\)\".*/\1/p" project.labelle)
+            echo "${pkg}: stamped=${want}"
+            [ -d "$home/packages/${pkg}/${want}" ] \
+              || { echo "::error::${pkg} ${want} was never fetched"; exit 1; }
+            [ -d ".labelle/deps/labelle-${pkg}" ] \
+              || { echo "::error::${pkg} was not vendored into .labelle/deps/"; exit 1; }
+          done
+          BGFX_VER=$(sed -n 's/.*\.bgfx => .*\.repo = "github\.com\/labelle-toolkit\/labelle-bgfx".*\.version = "\([^"]*\)".*/\1/p' \
+            "$GITHUB_WORKSPACE/labelle-assembler/src/config.zig")
+          test -n "$BGFX_VER" || { echo "::error::could not read the builtin bgfx provider version from src/config.zig"; exit 1; }
+          echo "bgfx: builtin provider=${BGFX_VER}"
+          [ -d "$home/packages/plugins/github.com/labelle-toolkit/labelle-bgfx/${BGFX_VER}" ] \
+            || { echo "::error::bgfx ${BGFX_VER} was never fetched"; exit 1; }
+          [ -d ".labelle/deps/labelle-bgfx" ] \
+            || { echo "::error::bgfx was not vendored into .labelle/deps/"; exit 1; }
+
+      - name: Build (bgfx desktop)
+        run: |
+          set -euo pipefail
+          cd curated/default-check/.labelle/bgfx_desktop
+          zig build
+          ls -l zig-out/bin/default-check
+
+  csharp-example:
+    name: C# example (EMBED path) end-to-end
+    runs-on: ubuntu-latest
+    # Cold toolkit fetch + one engine compile + one dotnet publish; 30
+    # bounds a wedged runner far under GitHub's 6h default.
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout labelle-assembler
+        uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
+
+      - name: Checkout labelle-gui (flow_codegen)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-gui
+
+      # The scripting plugin under test — its `examples/csharp-game` is the
+      # fixture, its `native-csharp/` crate + `src/csharp/vm.zig` are what
+      # dotnet publishes and hostfxr loads. Track main (the csharp row +
+      # native-csharp crate are unreleased at the assembler floor here).
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-scripting
+          ref: main
+          path: labelle-scripting
+
+      # The null backend — the example pins it `local:` and needs the
+      # `script_contract.bind` touchpoint that lives on main (unreleased),
+      # same reason the scripting rust/crystal/csharp jobs clone it.
+      - name: Checkout labelle-null (bind touchpoint is unreleased)
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-null.git labelle-null
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # The .NET SDK must exist before GENERATE (the declare phase runs
+      # labelle-declare-csharp, a `dotnet build` probe) AND build (the
+      # `.language_builds` `dotnet publish`). >= 7 for the [LibraryImport]
+      # source generator (Glue.cs); it also provides the runtime hostfxr
+      # loads (framework-dependent publish).
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "7.0.x"
+
+      - name: Install sokol/null system libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev \
+            libxinerama-dev libxi-dev libxext-dev libxfixes-dev \
+            libwayland-dev libxkbcommon-dev libasound2-dev
+
+      - name: Build labelle-assembler
+        run: cd labelle-assembler && zig build
+
+      - name: Generate + build + run examples/csharp-game (no manual dotnet step)
+        run: |
+          set -o pipefail
+          # Fresh HOME so the assembler's ~/.labelle cache + NuGet caches
+          # never leak the runner's real one.
+          export HOME="$RUNNER_TEMP/labelle-home"
+          mkdir -p "$HOME"
+
+          ASM="$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler"
+          cd labelle-scripting/examples/csharp-game
+
+          "$ASM" install --project-root . || true   # engine/core/gfx fetch
+          "$ASM" generate --project-root . 2>&1 | tee generate.log
+          if grep -q 'generate failed' generate.log; then
+            echo "E: generate reported failure"; exit 1
+          fi
+
+          B=.labelle/null_desktop/build.zig
+          # THE #617 wiring: the link-less dotnet-publish step…
+          grep -qF 'b.addSystemCommand(&.{ "dotnet", "publish"' "$B"
+          # …no addObjectFile (a CoreCLR host LOADS the assembly)…
+          if grep -q 'addObjectFile(plugin_scripting_build_artifact' "$B"; then
+            echo "E: a link artifact was wired for a runtime-loaded language"; exit 1
+          fi
+          # …the runtime-output InstallDir staging beside the exe…
+          grep -qF 'const plugin_scripting_runtime_outputs = b.addInstallDirectory(.{' "$B"
+          grep -qF 'b.getInstallStep().dependOn(&plugin_scripting_runtime_outputs.step);' "$B"
+          # …and the run-step env pointing at the publish dir.
+          grep -qF 'run_cmd.setEnvironmentVariable("LABELLE_CS_ASSEMBLY_DIR", plugin_scripting_build_cache);' "$B"
+
+          cd .labelle/null_desktop
+          # labelle-cli-equivalent fixFingerprint dance; `zig build` also
+          # runs the plugin's dotnet-publish step + stages the assembly.
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}' || true)
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}' || true)
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
+          # THE ACCEPTANCE: `zig build` alone put the managed assembly
+          # BESIDE the binary — no manual dotnet, no manual copy.
+          test -f zig-out/bin/labelle_csharp_scripts.dll
+          test -f zig-out/bin/labelle_csharp_scripts.runtimeconfig.json
+          test -f zig-out/bin/labelle_csharp_scripts.deps.json
+
+          # `zig build run` (what `labelle run` invokes) runs the CACHED
+          # binary and auto-sets LABELLE_CS_ASSEMBLY_DIR — hostfxr resolves
+          # the assembly with NO env exported by hand. Pin the exact ordered
+          # transcript (token-for-token the rust/crystal shape).
+          LABELLE_NULL_FRAMES=5 zig build run > run.log 2>&1
+          grep -oE 'CS_[A-Z0-9_.]+' run.log > actual.txt || true
+          cat > expected.txt <<'END'
+          CS_INIT
+          CS_CTRL_READY
+          CS_LEVEL_0.625
+          CS_FEED_SENT
+          CS_LEVEL_0.375
+          CS_ENGINE_TICK_SEEN
+          CS_FED_LEVEL_0.875
+          CS_WATCHER_SAW_0.5
+          CS_LEVEL_0.625
+          CS_LEVEL_0.375
+          CS_LEVEL_0.125
+          CS_STARVING
+          CS_BATCH_OK_3_13.5
+          CS_CTRL_DONE
+          CS_DEINIT
+          END
+          sed -i 's/^          //' expected.txt
+          if ! diff -u expected.txt actual.txt; then
+            echo "E: csharp-example milestone sequence mismatch"
+            echo "--- full captured output ---"; cat run.log
+            exit 1
+          fi
+          echo "PASS: C# scripts compiled by zig build (dotnet publish), staged beside the binary + loaded through hostfxr with NO manual dotnet step or env export — 15 ordered milestones over 5 headless frames"
+
+  # Windows gate for the local-slot cache machinery (#688 review).
+  #
+  # Why a dedicated job rather than `windows-latest` in the matrix above:
+  # that job installs SDL2/sokol system libs, builds the sokol + raylib +
+  # bgfx backends and the zig-ecs adapter, and verifies the binary through
+  # a POSIX `./zig-out/bin/...` path. None of that ports to a Windows
+  # runner as written, so widening the matrix would go red for reasons
+  # that have nothing to do with the cache.
+  #
+  # What this DOES cover: the assembler and its test suite compile and run
+  # on Windows. That is the platform where `symLink(.is_directory = true)`
+  # needs Developer Mode and `symlinkToCache` falls back to a COPY — the
+  # path `isFrameworkCached`/`isPluginCached`/`isAssemblerCached` treat as
+  # permanently stale, so a locally-sourced package is deleted and
+  # re-copied on every build with no fixpoint.
+  #
+  # Scope: the FULL `zig build test`, as of #699.
+  #
+  # This job used to run `zig build test-cache` only — the cache modules the
+  # #688 work touched — because the full suite was red on Windows for ~33
+  # pre-existing failures, and a job that is red for unrelated reasons
+  # guards nothing. Both halves of that justification are now gone:
+  #
+  #   * The failures are fixed. #708 (ZON escaping), #712 (the cache suite
+  #     was 83/123 SKIPPED behind a PosixBlock env seam), #710 + #713
+  #     (symlink privilege → junctions), #714 (POSIX path/shell assumptions)
+  #     and #719 (the last four) took Windows `zig build test` from 40
+  #     unique failures to zero: 77/77 steps, 0 failures, 0 compile errors.
+  #     Enumerated total 2839 on both a dev box and this runner; the pass/
+  #     skip SPLIT differs by environment — 2810 passed / 29 skipped here,
+  #     2806 / 33 on a local Windows box, because four tests that skip for
+  #     a missing local prerequisite actually run on the runner. Compare
+  #     the enumerated total across environments, never the pass count.
+  #   * The old "what it does NOT cover" caveat — that `src/cache/local.zig`
+  #     set `std.testing.environ` through a PosixBlock and skipped on
+  #     Windows outright, so a green run proved nothing about the
+  #     copy-fallback path — was closed by #712. There is no PosixBlock
+  #     skip left in that file.
+  #
+  # Narrowing it further would keep the blind spot that made this whole
+  # class of defect possible: `test-cache` is 142 tests, the full suite
+  # enumerates 2839, so the narrow job gated about 5% of the tree on the
+  # one platform where the POSIX assumptions actually break. #704, #706,
+  # #708 and #710 all shipped underneath a green narrow run.
+  #
+  # Still NOT covered here (deliberately): the backends. Unlike the
+  # `build-and-test` matrix this job does not install SDL2 or build the
+  # sokol/raylib/bgfx backends or the zig-ecs adapter — none of that ports
+  # to a Windows runner as written. This job covers the assembler and its
+  # test suite, which is where the portability defects live.
+  cache-windows:
+    name: Assembler test suite (Windows)
+    runs-on: windows-latest
+    # Was 25, sized for `zig build test-cache` (9 build steps). The full
+    # suite is 77 steps and compiles every test binary from cold on the
+    # runner.
+    #
+    # MEASURED, not guessed: green runs of this job on windows-latest took
+    # 6m17s and 8m34s (the narrow job was ~2-3m). That 36% spread between
+    # two runs of identical work is exactly why the cap is not trimmed to
+    # the fastest observation. 30 leaves ~3.5x headroom on the SLOWER of
+    # the two, matching the ratio `build-and-test` settled on
+    # (cap 20, ~6m30s green run) after PR #664 — where a cap trimmed close
+    # to the observed time fired on ordinary runner variance twice in a
+    # row, cancelling a job whose every real step had already passed. A cap
+    # exists to catch a hang, not to police normal spread.
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: labelle-assembler
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
+
+      # Same sibling-checkout layout as `build-and-test`: the
+      # `../labelle-gui/flow-codegen` path-dep in build.zig.zon resolves
+      # against this.
+      - name: Checkout labelle-gui (flow_codegen)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-gui
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build
+
+      # The full suite — see the scope note above. `zig build test-cache`
+      # is a strict subset of this, so nothing is lost by widening.
+      - name: Test
+        run: zig build test --summary all
+
+      # `.exe` suffix and no `./` prefix — the POSIX spelling in
+      # `build-and-test` does not resolve under PowerShell.
+      - name: Verify binary
+        run: |
+          .\zig-out\bin\labelle-assembler.exe --protocol-version
+          .\zig-out\bin\labelle-assembler.exe --help
+
+  # ── bgfx examples, resolved from the PINS they declare (#732) ────────
+  #
+  # Two defects, one job.
+  #
+  # 1. CI GENERATED the bgfx examples and never BUILT them, so a break that
+  #    only appears at compile time — which is most of them, and all of the
+  #    ones that live in a DEPENDENCY — passed. labelle-core v1.32.0 shipped
+  #    `MaterialEffect.pixel_water`; `material-demo` and `pack-city` both
+  #    pinned a bgfx whose exhaustive switches had no arm for it. Both were
+  #    broken and CI said nothing, because `generate` succeeds — the error is
+  #    in backend source that only a real build compiles. The signal read as
+  #    "one backend (sokol) is broken" rather than "three examples are broken,
+  #    two of them untested" (#731).
+  #
+  # 2. The examples lane clones core/engine/gfx/null at `main` as SIBLINGS,
+  #    and the assembler's auto-discovery builds those INSTEAD of the pins.
+  #    Nothing tested a PR against what it DECLARES. During a release train
+  #    the mains disagree for the minutes between merges and CI fabricates
+  #    failures: #730 went red on `backend_contract has no member named
+  #    'PixelWaterRgba'` and a re-run of the identical commit passed.
+  #
+  # This job fixes both: it checks out NOTHING but the assembler (+ the
+  # labelle-gui path-dep that `build.zig.zon` needs), points LABELLE_HOME at a
+  # scratch dir so nothing is inherited from a warm cache, and BUILDS both
+  # bgfx examples against the exact `project.labelle` pins. It then ASSERTS the
+  # pins are what got used, rather than trusting a green build: the assembler
+  # warns `is built from LOCAL sources, not the pinned <v>` whenever
+  # auto-discovery wins, and this job fails on that string.
+  #
+  # WHY EVERY PR, AND WHY LINUX ONLY:
+  #   * Linux only — one platform is enough to catch a compile break in
+  #     backend source, and it is the cheapest runner. macOS would re-prove
+  #     the same sema against Metal instead of Vulkan for ~2x the minutes.
+  #   * Every PR, NOT gated on `examples/**` / `src/config.zig` / backend
+  #     pins. That gate was the tempting option and it does not cover the
+  #     defect that motivated the issue: the v1.32.0 break arrived from a
+  #     DEPENDENCY's release. No file in this repo changed, so a path filter
+  #     would have skipped the job on every PR while main stayed broken. A
+  #     check that skips exactly when the break lands is the same class of
+  #     defect as the one being fixed here.
+  #   * Cost is bounded by sharing one zig cache between the two examples —
+  #     the bgfx C++ objects compile once and pack-city links against them.
+  bgfx-examples-pinned:
+    name: bgfx examples (PINNED resolution)
+    runs-on: ubuntu-latest
+    # The first example pays a cold bgfx C++ compile; the second reuses it.
+    # 45 bounds a wedged runner far under GitHub's 6h default while leaving
+    # room for a cold package fetch on top.
+    timeout-minutes: 45
+
+    env:
+      # Scratch package home. NOT the default `~/.labelle` — a pinned lane
+      # must prove the pins resolve from the registry on a cold machine, and
+      # a warm shared cache would hide a pin that no longer exists.
+      LABELLE_HOME: ${{ github.workspace }}/pinned-labelle-home
+
+    steps:
+      - name: Checkout labelle-assembler
+        uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
+
+      # The ONLY sibling checkout in this job. `build.zig.zon` has a
+      # `../labelle-gui/flow-codegen` path-dep, so the assembler cannot build
+      # without it. It is not part of the runtime trio, so it cannot shadow a
+      # pin — deliberately, NO labelle-core / labelle-engine / labelle-gfx /
+      # labelle-null sibling lives here. That absence IS the test.
+      - name: Checkout labelle-gui (flow_codegen path-dep)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-gui
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # bgfx desktop on Linux: X11/Wayland + Vulkan headers. Mirrors
+      # labelle-bgfx's own CI so the two lanes compile the same backend.
+      - name: Install bgfx desktop system libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev \
+            libvulkan-dev
+
+      - name: Build labelle-assembler
+        run: cd labelle-assembler && zig build
+
+      - name: Assert no runtime sibling can shadow the pins
+        run: |
+          set -euo pipefail
+          for repo in labelle-core labelle-engine labelle-gfx labelle-null; do
+            if [ -d "$GITHUB_WORKSPACE/$repo" ]; then
+              echo "::error::$repo is checked out as a sibling — the assembler's"
+              echo "::error::auto-discovery would build it INSTEAD of the declared pin,"
+              echo "::error::which is exactly what this job exists to avoid."
+              exit 1
+            fi
+          done
+          echo "No runtime siblings present; pins will resolve from the registry."
+
+      - name: Generate + BUILD the bgfx examples against their declared pins
+        run: |
+          set -euo pipefail
+          ASM="$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler"
+          mkdir -p "$LABELLE_HOME"
+
+          for g in material-demo pack-city; do
+            echo "::group::$g — declared pins"
+            grep -E '_version|backend_package' \
+              "$GITHUB_WORKSPACE/labelle-assembler/examples/$g/project.labelle" \
+              | grep -v '^\s*//' || true
+            echo "::endgroup::"
+
+            cd "$GITHUB_WORKSPACE/labelle-assembler/examples/$g"
+            "$ASM" install  --project-root . 2>&1 | tee install.log
+            "$ASM" generate --project-root . 2>&1 | tee generate.log
+
+            # MECHANISM assertion, not a value one. The assembler's monorepo
+            # auto-discovery symlinks a sibling checkout into the cache's local
+            # slot in preference to the pin, and SAYS SO when it does — two
+            # distinct strings, one per phase (both verified against a real
+            # sibling checkout while writing this job):
+            #   install:  core: using LOCAL sources from '<dir>' — the pinned
+            #             1.32.0 will NOT be built (#685)
+            #   generate: labelle: core is built from LOCAL sources, not the
+            #             pinned 1.32.0 — source '<dir>' (rev <sha>)
+            # A green build only proves the example compiles against SOMETHING.
+            # This is what proves it compiled against what the example declares.
+            if grep -Eq 'built from LOCAL sources|using LOCAL sources' install.log generate.log; then
+              echo "::error::$g resolved a LOCAL checkout instead of its pins:"
+              grep -E 'built from LOCAL sources|using LOCAL sources' install.log generate.log
+              exit 1
+            fi
+
+            # And the pinned versions really were fetched into the scratch home.
+            for pkg in core engine gfx; do
+              want=$(sed -n "s/.*\.${pkg}_version = \"\([^\"]*\)\".*/\1/p" project.labelle | head -1)
+              if [ ! -d "$LABELLE_HOME/packages/${pkg}/${want}" ]; then
+                echo "::error::$g pins ${pkg} ${want} but it was never fetched into the scratch LABELLE_HOME"
+                exit 1
+              fi
+              echo "$g: ${pkg} ${want} resolved from the registry"
+            done
+
+            # THE POINT OF THIS JOB. `generate` alone would already be green
+            # here; the backend source is only compiled by a real build.
+            echo "== $g: zig build (bgfx desktop) =="
+            cd .labelle/bgfx_desktop
+            # labelle-cli-equivalent fixFingerprint dance — the assembler emits
+            # a placeholder fingerprint (see the showcase step for context).
+            set +e
+            ERR=$(zig build 2>&1)
+            RC=$?
+            set -e
+            if [ $RC -ne 0 ]; then
+              BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+              GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+              if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+                sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+              else
+                printf '%s\n' "$ERR"
+                echo "::error::$g failed to build against its declared pins"
+                exit 1
+              fi
+            fi
+            zig build
+            echo "PASS: $g BUILT against its declared pins"
+          done
+
+          echo "PASS: both bgfx examples built from the registry-resolved pins"
+
+  # ── The shader BUILD pipeline, end to end, with a real shaderc (#735) ─
+  #
+  # `test/material_pipeline_e2e.py` is the only test that covers the PRODUCER
+  # side of game-owned materials: descriptor -> shaderc -> packaged variants ->
+  # a material that compiles and validates against core's contract. Every other
+  # material check in CI covers CONSUMERS of already-compiled shaders (the
+  # goldens, the bgfx probe with checked-in `.bin` fixtures) — and pre-compiled
+  # fixtures are structurally incapable of noticing a pipeline regression.
+  #
+  # It was opt-in behind three `-D` flags because CI had no shaderc, so it
+  # never ran anywhere. This job provisions one and un-gates it. Nobody passes
+  # a flag by hand: the job DERIVES all three from the repo's own pins.
+  #
+  # The toolchain is REUSED, not duplicated: labelle-bgfx already builds
+  # shaderc from its pinned `zbgfx` for the golden harnesses, so this job reads
+  # the builtin bgfx provider version out of `src/config.zig`, reads that
+  # release's `zbgfx` archive URL out of its `build.zig.zon`, and builds
+  # `shaderc` from exactly that source. No second toolchain, and no separate
+  # pin to drift.
+  #
+  # Independent of `examples/condenser` by construction — the python driver
+  # synthesizes its own three-material fixture (shared includes, an escaping
+  # include, a deliberately broken shader) under `.zig-cache/`.
+  #
+  # FAILS CLOSED, not just open: the driver asserts five REJECTION paths as
+  # well as the happy one — an include that escapes the material dir
+  # (`EscapingShaderInclude`), an uncompilable `.sc`, a descriptor missing the
+  # variant the host renderer requires, and two component-collision cases in
+  # the emitted comptime guard. A pipeline that silently accepted any of those
+  # turns this job red.
+  material-pipeline-e2e:
+    name: Material shader pipeline e2e (real shaderc)
+    runs-on: ubuntu-latest
+    # Cold shaderc build (glslang + spirv-tools) dominates; ~2.5 min of it on
+    # a warm local machine, and it is cached below. 40 leaves room for a cold
+    # miss plus the fixture's 12 shader compiles.
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout labelle-assembler
+        uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
+
+      - name: Checkout labelle-gui (flow_codegen path-dep)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-gui
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # zbgfx's default build step touches its glfw/bgfx targets alongside the
+      # shaderc host tool, so the X11/GL headers have to be present even
+      # though shaderc itself is a pure host compiler.
+      - name: Install zbgfx build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev libvulkan-dev
+
+      # Resolve the shaderc SOURCE from this repo's own pins, so the compiler
+      # under test is the one the builtin bgfx provider actually ships with.
+      # Chain: src/config.zig builtinProvider(.bgfx).version
+      #     -> labelle-bgfx@v<that>/build.zig.zon .zbgfx.url
+      #     -> that archive, built with -Dwith_shaderc=true.
+      - name: Resolve the pinned zbgfx (shaderc source)
+        id: zbgfx
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          BGFX_VER=$(sed -n 's/.*\.bgfx => .*\.repo = "github\.com\/labelle-toolkit\/labelle-bgfx".*\.version = "\([^"]*\)".*/\1/p' \
+            labelle-assembler/src/config.zig | head -1)
+          test -n "$BGFX_VER" || { echo "::error::could not read the builtin bgfx provider version from src/config.zig"; exit 1; }
+          echo "builtin bgfx provider: $BGFX_VER"
+
+          git clone --quiet --depth 1 --branch "v$BGFX_VER" \
+            https://github.com/labelle-toolkit/labelle-bgfx.git labelle-bgfx
+          ZBGFX_URL=$(sed -n 's#.*\.url = "\(https://[^"]*zbgfx/archive/[^"]*\)".*#\1#p' \
+            labelle-bgfx/build.zig.zon | head -1)
+          test -n "$ZBGFX_URL" || { echo "::error::labelle-bgfx v$BGFX_VER declares no zbgfx archive url"; exit 1; }
+          echo "pinned zbgfx: $ZBGFX_URL"
+
+          mkdir -p zbgfx
+          curl -sSfL "$ZBGFX_URL" -o zbgfx.tar.gz
+          tar xzf zbgfx.tar.gz -C zbgfx --strip-components=1
+          test -f zbgfx/build.zig
+
+          echo "url=$ZBGFX_URL" >> "$GITHUB_OUTPUT"
+          echo "key=$(printf '%s' "$ZBGFX_URL" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      # The build is deterministic in the pinned source, so cache it on the
+      # zbgfx URL. A cold miss costs a few minutes; a hit costs seconds.
+      - name: Cache the built shaderc
+        uses: actions/cache@v4
+        with:
+          path: |
+            zbgfx/zig-out
+            zbgfx/.zig-cache
+          key: shaderc-${{ runner.os }}-zig0.16.0-${{ steps.zbgfx.outputs.key }}
+
+      - name: Build shaderc from the pinned zbgfx
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/zbgfx"
+          zig build -Dwith_shaderc=true
+          test -x zig-out/bin/shaderc
+          ./zig-out/bin/shaderc --help >/dev/null 2>&1 || true
+          echo "shaderc ready: $PWD/zig-out/bin/shaderc"
+
+      # The fixture compiles `core.shader_material` descriptors, so it needs a
+      # core checkout. Take the CURATED default out of build.zig — the same
+      # version a fresh `labelle init` scaffolds — so this lane tracks the set
+      # the assembler ships rather than a second, drifting pin.
+      - name: Check out the curated labelle-core
+        id: core
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          CORE_VER=$(sed -n 's/.*"core_version", "Default core library version") orelse "\([^"]*\)".*/\1/p' \
+            labelle-assembler/build.zig | head -1)
+          test -n "$CORE_VER" || { echo "::error::could not read the curated core_version from build.zig"; exit 1; }
+          echo "curated core: $CORE_VER"
+          git clone --quiet --depth 1 --branch "v$CORE_VER" \
+            https://github.com/labelle-toolkit/labelle-core.git labelle-core-e2e
+
+      - name: Run the material pipeline e2e (descriptor -> shaderc -> material)
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/labelle-assembler"
+          zig build test-material-integration \
+            -Dshaderc="$GITHUB_WORKSPACE/zbgfx/zig-out/bin/shaderc" \
+            -Dmaterial-test-core="$GITHUB_WORKSPACE/labelle-core-e2e" \
+            -Dmaterial-test-zbgfx="$GITHUB_WORKSPACE/zbgfx"
