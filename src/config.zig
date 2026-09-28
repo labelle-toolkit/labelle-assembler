@@ -427,10 +427,11 @@ pub const AndroidConfig = struct {
     /// (`manifest_v2_splice/android.zig`). The provider reads its own
     /// `target_sdk_version` for the APK manifest.
     target_sdk_version: u32 = 34, // Android 14
-    /// Launch the game fullscreen. The assembler emits
-    /// `engine.android.enableImmersiveMode()` into the generated `main.zig`
-    /// (`lifecycle/callback.zig`, `lifecycle/render.zig`); the labelle-android
-    /// provider reads the same key for the fullscreen theme.
+    /// Launch the game fullscreen. The assembler emits a call to
+    /// labelle-android's `immersive` service into the generated `main.zig`
+    /// (`lifecycle/immersive.zig`; it needs the `android` plugin since
+    /// labelle-engine#902); the labelle-android provider reads the same key
+    /// for the fullscreen theme.
     immersive_mode: bool = false,
 };
 

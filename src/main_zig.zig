@@ -27,6 +27,7 @@ pub const asset_wiring = @import("codegen/blocks/asset_wiring.zig");
 pub const plugin_registries = @import("codegen/blocks/plugin_registries.zig");
 pub const lifecycle_loop = @import("codegen/lifecycle/loop.zig");
 pub const lifecycle_callback = @import("codegen/lifecycle/callback.zig");
+pub const lifecycle_immersive = @import("codegen/lifecycle/immersive.zig");
 pub const main_template = @import("codegen/main_template.zig");
 pub const context = @import("codegen/context.zig");
 /// Hook-pipeline blocks AND the hook ordering contract

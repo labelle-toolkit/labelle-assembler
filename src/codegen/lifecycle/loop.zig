@@ -335,7 +335,7 @@ pub fn Mixin(comptime Self: type) type {
 
             // ── No Android immersive-mode call here (intentional) ────────────
             //
-            // `buildCallbackInitCode` emits `engine.android.enableImmersiveMode()`
+            // `buildImmersiveEntryCode` emits the immersive-mode call (`immersive.zig`)
             // for Android projects, but `buildSetupCode` does NOT — and that is
             // correct, not an omission. `buildSetupCode` only ever runs for the
             // loop-based backends (raylib, sdl, bgfx, wgpu), and NONE of those
