@@ -53,6 +53,7 @@ const manifest_v2 = @import("codegen/manifest_v2.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
 const provider_contracts = @import("root/provider_contracts.zig");
 const generate_phases = @import("root/generate_phases.zig");
+const path_key = @import("cache/path_key.zig");
 
 const Capability = config.Capability;
 const ProjectConfig = config.ProjectConfig;
@@ -245,9 +246,16 @@ pub fn describeWith(arena: std.mem.Allocator, cfg_in: ProjectConfig, project_dir
         .capabilities_source = .unknown,
     };
 
-    // Package location: pure path math, no fetch.
-    const pkg_dir = try backend_registry.resolveBackendPackage(arena, cfg, project_dir);
-    const state = packageState(opts.access, pkg_dir);
+    // Package location: pure path math, no fetch. A repo/version the host
+    // cannot name as a path (a `git+https:` spelling on Windows, #782) is
+    // refused by the resolver before any probe; it is reported like any
+    // other inaccessible package directory, with the resolver's own message.
+    const resolved: ?[]const u8 = backend_registry.resolveBackendPackage(arena, cfg, project_dir) catch |err| switch (err) {
+        error.UnusableCachePath => null,
+        else => return err,
+    };
+    const pkg_dir = resolved orelse "";
+    const state: PackageState = if (resolved) |p| packageState(opts.access, p) else .{ .inaccessible = error.UnusableCachePath };
     const installed = state == .installed;
     if (installed) desc.package_dir = pkg_dir;
     if (bp) |b| {
@@ -295,7 +303,10 @@ pub fn describeWith(arena: std.mem.Allocator, cfg_in: ProjectConfig, project_dir
         // Report it rather than fall back to the snapshot and answer
         // "supported" for a package describe never saw (#777).
         desc.supported = false;
-        desc.reason = try std.fmt.allocPrint(arena, "labelle-assembler: cannot access backend package directory '{s}': {s}", .{ pkg_dir, @errorName(state.inaccessible) });
+        desc.reason = if (resolved == null) blk: {
+            const why = if (bp) |b| try path_key.problem(arena, @import("builtin").os.tag, b.repo, b.version) else null;
+            break :blk try std.fmt.allocPrint(arena, "labelle-assembler: {s}", .{why orelse "the backend package cannot be used as a cache path on this system"});
+        } else try std.fmt.allocPrint(arena, "labelle-assembler: cannot access backend package directory '{s}': {s}", .{ pkg_dir, @errorName(state.inaccessible) });
         return desc;
     }
 
@@ -908,16 +919,15 @@ test "describe: a git+https spelling of the official repo is not answered from t
 
     // Not installed: previously `builtin` + supported (sameRemote accepted
     // the spelling); now unverified, exactly like any non-official repo.
-    // The probe is injected: on Windows the cache path of a `git+https:`
-    // repo holds a `:`, which Zig 0.16's Debug std turns into a panic
-    // (OBJECT_NAME_INVALID) inside `Dir.access` instead of an error.
+    // The probe is injected so this half means the same on every OS; on
+    // Windows the `:` makes the path unusable and the resolver refuses it
+    // before any probe (#782, see describe_cache_path_test.zig).
     const d = try describeWith(a, cfg, f.dir, "desktop", .{ .access = accessFileNotFound });
     try testing.expect(d.package_dir == null);
     try testing.expectEqual(CapabilitySource.unknown, d.capabilities_source);
     try testing.expect(d.backend.id == null);
 
-    // The installed half needs that path on disk — POSIX only, for the
-    // reason above.
+    // The installed half needs that path on disk — POSIX only (#782).
     if (@import("builtin").os.tag == .windows) return;
 
     // Installed with its real `labelle.sokol` id: the identity check (the

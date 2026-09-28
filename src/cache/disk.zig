@@ -12,6 +12,7 @@ const env = @import("env.zig");
 const local = @import("local.zig");
 const junction = @import("../junction.zig");
 const resolve = @import("resolve.zig");
+const path_key = @import("path_key.zig");
 
 /// Write a slot's provenance, dropping the slot if that write fails.
 ///
@@ -541,7 +542,7 @@ pub fn purgeLegacyLocalSlots(allocator: std.mem.Allocator, cfg: config.ProjectCo
         const pkg = gui.package orelse break :blk;
         const ver = gui.version orelse break :blk;
         if (pkg.len == 0 or ver.len == 0 or config.isLocalVersion(ver)) break :blk;
-        const slot = std.fs.path.join(allocator, &.{ packages_dir, "plugins", pkg, ver }) catch break :blk;
+        const slot = path_key.pluginCachePath(allocator, packages_dir, pkg, ver) catch break :blk;
         defer allocator.free(slot);
         _ = try purgeLegacyLocalSlot(allocator, slot, ver);
     }
@@ -563,7 +564,8 @@ pub fn purgeLegacyLocalSlots(allocator: std.mem.Allocator, cfg: config.ProjectCo
 
 fn purgeLegacyPluginSlot(allocator: std.mem.Allocator, packages_dir: []const u8, plugin: config.PluginDep) !void {
     if (plugin.isLocal() or plugin.repo.len == 0 or plugin.version.len == 0) return;
-    const slot = std.fs.path.join(allocator, &.{ packages_dir, "plugins", plugin.repo, plugin.version }) catch return;
+    // #782: an unnameable repo has no slot to purge; the resolver reports it.
+    const slot = path_key.pluginCachePath(allocator, packages_dir, plugin.repo, plugin.version) catch return;
     defer allocator.free(slot);
     _ = try purgeLegacyLocalSlot(allocator, slot, plugin.version);
 }
