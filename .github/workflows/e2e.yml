@@ -14,7 +14,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-test:
+  # Unit tests run per PR in ci.yml; this job only does the clean-home e2e.
+  clean-home-install:
+    name: Clean-home install (offline archives)
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -78,39 +80,8 @@ jobs:
       - name: Build
         run: zig build
 
-      - name: Test
-        run: zig build test
-
       - name: Clean-home install (offline archives)
         run: python3 test/clean_home_install_e2e.py
-
-      - name: zig-ecs adapter tests
-        run: cd ecs/zig-ecs && zig build test
-
-
-      - name: sokol backend unit tests + audio.zig compile-check
-        run: cd backends/sokol && zig build test
-
-      - name: plugins/debug tests
-        run: cd plugins/debug && zig build test
-
-      - name: Verify binary
-        run: |
-          ./zig-out/bin/labelle-assembler --protocol-version
-          ./zig-out/bin/labelle-assembler --help
-
-      # `describe` through the real binary (labelle-cli RFC #471 D1): a
-      # third-party package names the target dir after itself (finding 4),
-      # and nothing lands in the cache (offline, config-only).
-      - name: Verify describe (offline)
-        run: |
-          d=$(mktemp -d)
-          printf '.{ .name = "g", .backend_package = .{ .name = "acme", .repo = "github.com/acme/labelle-acme", .version = "1.0.0" } }\n' > "$d/project.labelle"
-          LABELLE_HOME="$d/home" ./zig-out/bin/labelle-assembler describe --project-root "$d" --target desktop --json > "$d/out.json"
-          cat "$d/out.json"
-          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['target_dir'] == '.labelle/acme_desktop', d" "$d/out.json"
-          test ! -e "$d/home"
-          test ! -e "$d/.labelle"
 
   # End-to-end usage test: check out every sibling repo the examples
   # need (labelle-cli for the binary, labelle-core/engine/gfx for the
@@ -1448,61 +1419,6 @@ jobs:
   # sokol/raylib/bgfx backends or the zig-ecs adapter — none of that ports
   # to a Windows runner as written. This job covers the assembler and its
   # test suite, which is where the portability defects live.
-  cache-windows:
-    name: Assembler test suite (Windows)
-    runs-on: windows-latest
-    # Was 25, sized for `zig build test-cache` (9 build steps). The full
-    # suite is 77 steps and compiles every test binary from cold on the
-    # runner.
-    #
-    # MEASURED, not guessed: green runs of this job on windows-latest took
-    # 6m17s and 8m34s (the narrow job was ~2-3m). That 36% spread between
-    # two runs of identical work is exactly why the cap is not trimmed to
-    # the fastest observation. 30 leaves ~3.5x headroom on the SLOWER of
-    # the two, matching the ratio `build-and-test` settled on
-    # (cap 20, ~6m30s green run) after PR #664 — where a cap trimmed close
-    # to the observed time fired on ordinary runner variance twice in a
-    # row, cancelling a job whose every real step had already passed. A cap
-    # exists to catch a hang, not to police normal spread.
-    timeout-minutes: 30
-
-    defaults:
-      run:
-        working-directory: labelle-assembler
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: labelle-assembler
-
-      # Same sibling-checkout layout as `build-and-test`: the
-      # `../labelle-gui/flow-codegen` path-dep in build.zig.zon resolves
-      # against this.
-      - name: Checkout labelle-gui (flow_codegen)
-        uses: actions/checkout@v4
-        with:
-          repository: labelle-toolkit/labelle-gui
-          ref: main
-          path: labelle-gui
-
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-
-      - name: Build
-        run: zig build
-
-      # The full suite — see the scope note above. `zig build test-cache`
-      # is a strict subset of this, so nothing is lost by widening.
-      - name: Test
-        run: zig build test --summary all
-
-      # `.exe` suffix and no `./` prefix — the POSIX spelling in
-      # `build-and-test` does not resolve under PowerShell.
-      - name: Verify binary
-        run: |
-          .\zig-out\bin\labelle-assembler.exe --protocol-version
-          .\zig-out\bin\labelle-assembler.exe --help
 
   # ── bgfx examples, resolved from the PINS they declare (#732) ────────
   #
