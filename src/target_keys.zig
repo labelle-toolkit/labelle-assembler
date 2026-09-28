@@ -10,8 +10,13 @@
 //!     ignored for this assembler's targets, with a warning. Unknown keys
 //!     are stripped BEFORE the strict typed parse (`stripUnknown`), so a
 //!     project written for a newer target set keeps generating here.
-//!   * `.platform` — deprecated. The CLI always passes `--target` /
-//!     `--platform`, so the key only ever competes with the command line.
+//!   * `.platform` — deprecated. The CLI always passes `--platform` (and,
+//!     from protocol 7, `--target`), so the key only ever competes with the
+//!     command line. The warning fires ONLY when the command line names the
+//!     target, i.e. when the key was actually overridden for this run. A
+//!     direct `generate` without `--platform` still selects its target from
+//!     `.platform`, and telling that user to remove the key would silently
+//!     move their build to desktop, so it gets no warning.
 //!
 //! The strip is silent; the warnings are a separate pass (`logWarnings`)
 //! that `generate` runs once, so commands that merely read the config
@@ -141,7 +146,8 @@ pub const Finding = union(enum) {
     web_alias,
     /// Both `.web` and `.wasm` are set; `.wasm` wins.
     web_and_wasm,
-    /// `.platform` is set.
+    /// `.platform` is set AND the command line named the target (the key
+    /// was overridden for this run).
     platform_key,
 
     pub fn write(self: Finding, w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -160,8 +166,8 @@ pub const Finding = union(enum) {
                     "(`.web` is only its alias) — drop `.web`",
             ),
             .platform_key => try w.writeAll(
-                "`.platform` is deprecated: the target comes from the command line " ++
-                    "(the labelle CLI passes `--platform` / `--target`), so remove the key",
+                "`.platform` is deprecated and was overridden by the command line for this run " ++
+                    "(the labelle CLI always passes the target); remove the key",
             ),
         }
     }
@@ -171,7 +177,14 @@ pub const Finding = union(enum) {
 /// well-formed ZON has none (the typed parse reports it). Caller frees the
 /// list with `gpa`; the key strings are copies owned by the same list's
 /// allocator and freed by `freeFindings`.
-pub fn findings(gpa: std.mem.Allocator, source: [:0]const u8) ![]Finding {
+/// Options for `findings` / `logWarnings`.
+pub const Options = struct {
+    /// The command line named the target (`--platform`, or `--target` from
+    /// protocol 7). Only then is `.platform` reported: see the module doc.
+    target_from_command_line: bool = false,
+};
+
+pub fn findings(gpa: std.mem.Allocator, source: [:0]const u8, opts: Options) ![]Finding {
     var list: std.ArrayList(Finding) = .empty;
     errdefer freeFindingsList(gpa, &list);
 
@@ -193,7 +206,7 @@ pub fn findings(gpa: std.mem.Allocator, source: [:0]const u8) ![]Finding {
         }
         if (has_web) try list.append(gpa, if (has_wasm) .web_and_wasm else .web_alias);
     }
-    if (doc.topLevel("platform") != null) try list.append(gpa, .platform_key);
+    if (opts.target_from_command_line and doc.topLevel("platform") != null) try list.append(gpa, .platform_key);
 
     return list.toOwnedSlice(gpa);
 }
@@ -217,8 +230,8 @@ pub fn freeFindings(gpa: std.mem.Allocator, fs: []Finding) void {
 /// Log every finding for `source` as a warning. `generate` calls this once
 /// per run. Never fails the run: a warning that cannot be computed (OOM) is
 /// dropped.
-pub fn logWarnings(gpa: std.mem.Allocator, source: [:0]const u8) void {
-    const fs = findings(gpa, source) catch return;
+pub fn logWarnings(gpa: std.mem.Allocator, source: [:0]const u8, opts: Options) void {
+    const fs = findings(gpa, source, opts) catch return;
     defer freeFindings(gpa, fs);
     for (fs) |f| {
         var buf: [512]u8 = undefined;
@@ -275,24 +288,24 @@ test "target keys: stripUnknown blanks unknown keys in place, keeping offsets an
 
 test "target keys: findings name unknown keys, the web alias, both spellings, and .platform" {
     const src: [:0]const u8 = ".{ .name = \"g\", .platform = .android, .asset_compression = .{ .xbox = .astc, .web = .astc } }";
-    const fs = try findings(testing.allocator, src);
+    const fs = try findings(testing.allocator, src, .{ .target_from_command_line = true });
     defer freeFindings(testing.allocator, fs);
     try testing.expectEqual(@as(usize, 3), fs.len);
     try testing.expectEqualStrings("xbox", fs[0].unknown_asset_compression_key);
     try testing.expectEqual(Finding.web_alias, fs[1]);
     try testing.expectEqual(Finding.platform_key, fs[2]);
 
-    const both = try findings(testing.allocator, ".{ .name = \"g\", .asset_compression = .{ .web = .png, .wasm = .astc } }");
+    const both = try findings(testing.allocator, ".{ .name = \"g\", .asset_compression = .{ .web = .png, .wasm = .astc } }", .{});
     defer freeFindings(testing.allocator, both);
     try testing.expectEqual(@as(usize, 1), both.len);
     try testing.expectEqual(Finding.web_and_wasm, both[0]);
 
-    const none = try findings(testing.allocator, ".{ .name = \"g\", .asset_compression = .{ .wasm = .astc } }");
+    const none = try findings(testing.allocator, ".{ .name = \"g\", .asset_compression = .{ .wasm = .astc } }", .{});
     defer freeFindings(testing.allocator, none);
     try testing.expectEqual(@as(usize, 0), none.len);
 
     // Malformed ZON yields nothing (and does not crash).
-    const bad = try findings(testing.allocator, ".{ .platform = }");
+    const bad = try findings(testing.allocator, ".{ .platform = }", .{ .target_from_command_line = true });
     defer freeFindings(testing.allocator, bad);
     try testing.expectEqual(@as(usize, 0), bad.len);
 }
@@ -379,4 +392,24 @@ test "target keys: a typo elsewhere still gets the typed parse's error on the ri
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(error.ParseZon, parseForTest(arena.allocator(), ".{ .name = \"g\", .asset_compression = .{ .android = .jpeg } }"));
+}
+
+test "target keys: .platform is reported only when the command line named the target" {
+    const src: [:0]const u8 = ".{ .name = \"g\", .platform = .android }";
+
+    // A direct `generate` with no --platform relies on the key: no nag.
+    const direct = try findings(testing.allocator, src, .{});
+    defer freeFindings(testing.allocator, direct);
+    try testing.expectEqual(@as(usize, 0), direct.len);
+
+    // The command line named the target: the key was overridden, so warn.
+    const overridden = try findings(testing.allocator, src, .{ .target_from_command_line = true });
+    defer freeFindings(testing.allocator, overridden);
+    try testing.expectEqual(@as(usize, 1), overridden.len);
+    try testing.expectEqual(Finding.platform_key, overridden[0]);
+
+    // No `.platform` key: nothing to report either way.
+    const absent = try findings(testing.allocator, ".{ .name = \"g\" }", .{ .target_from_command_line = true });
+    defer freeFindings(testing.allocator, absent);
+    try testing.expectEqual(@as(usize, 0), absent.len);
 }

@@ -61,7 +61,10 @@ with a warning, so a project written for a newer target set still
 generates. `.web` is the original spelling of `.wasm` and stays accepted
 as a warned alias; `.wasm` wins when both are set. The `.platform` key in
 `project.labelle` is deprecated: the target comes from the command line
-(the `labelle` CLI passes it), and `generate` warns when the key is set.
+(the `labelle` CLI always passes it). `generate` warns about the key only
+when `--platform` is given, since that is when the key was overridden. A
+direct `generate` without `--platform` still takes its target from
+`.platform`, with no warning.
 
 The `null` backend is a headless test/CI backend with no graphics, audio,
 input, or window subsystem — every backend module is a no-op stub. The
