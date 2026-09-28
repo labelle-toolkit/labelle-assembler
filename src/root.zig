@@ -122,6 +122,7 @@ test {
     _ = @import("codegen/core_diamond.zig");
     _ = @import("codegen/emsdk_preflight.zig");
     _ = @import("codegen/main_template.zig");
+    _ = @import("codegen/ios_selfinfo.zig");
     _ = @import("capabilities.zig");
     _ = @import("root/game_shim.zig");
     _ = @import("root/provider_contracts.zig");
