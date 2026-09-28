@@ -268,7 +268,7 @@ fn cmdGenerate(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    var cfg = readProjectConfig(arena_alloc, io, root) catch |err| {
+    var cfg = readProjectConfig(arena_alloc, io, root, .{ .target_from_command_line = platform_override != null }) catch |err| {
         std.log.err("labelle-assembler: failed to read project.labelle in '{s}': {s}", .{ root, @errorName(err) });
         std.process.exit(1);
     };
@@ -372,7 +372,7 @@ fn parseBackend(val: []const u8) ?gen.Backend {
 /// assembler binary doesn't pull in CLI-side modules. The CLI's version
 /// will route through this binary in Phase 2; this duplication is
 /// intentional and temporary.
-fn readProjectConfig(allocator: std.mem.Allocator, io: std.Io, project_dir: []const u8) !gen.ProjectConfig {
+fn readProjectConfig(allocator: std.mem.Allocator, io: std.Io, project_dir: []const u8, warn_opts: gen.target_keys.Options) !gen.ProjectConfig {
     @setEvalBranchQuota(10000);
     const labelle_path = try std.fs.path.join(allocator, &.{ project_dir, "project.labelle" });
     defer allocator.free(labelle_path);
@@ -381,6 +381,12 @@ fn readProjectConfig(allocator: std.mem.Allocator, io: std.Io, project_dir: []co
     defer allocator.free(source_raw);
 
     const source = try allocator.dupeZ(u8, source_raw);
+    // Deprecated / ignored target keys (labelle-cli#471 P1): `.platform`
+    // (only when the command line overrode it), the `.asset_compression.web`
+    // alias, and `.asset_compression` keys that name no target of this
+    // assembler. Warned here, once per `generate`; the parse itself strips the
+    // unknown keys silently.
+    gen.target_keys.logWarnings(allocator, source, warn_opts);
     // The params-tolerant parse (#591): identical to the plain typed parse
     // for every source without a `.params` bag; extracts plugin-declared
     // heterogeneous params into `PluginDep.params_bag` otherwise.

@@ -38,6 +38,7 @@ const capabilities = @import("capabilities.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
 pub const plugin_params = @import("plugin_params.zig");
+pub const target_keys = @import("target_keys.zig");
 pub const scripting_splice = @import("scripting_splice.zig");
 pub const scripting_declare = @import("scripting_declare.zig");
 pub const scripting_transpile = @import("scripting_transpile.zig");
@@ -91,6 +92,7 @@ test {
     _ = @import("language_policy.zig");
     _ = @import("plugin_params.zig");
     _ = @import("android_moved_keys.zig");
+    _ = @import("target_keys.zig");
     _ = @import("scripting_splice.zig");
     _ = @import("scripting_declare.zig");
     _ = @import("scripting_transpile.zig");

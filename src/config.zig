@@ -151,15 +151,25 @@ pub const AstcBlockSize = enum {
     @"12x12",
 };
 
-/// Per-platform `AssetFormat` selection. ASTC support is mandatory on
+/// Per-target `AssetFormat` selection. ASTC support is mandatory on
 /// Android/iOS GLES/Metal and desktop GLES/Metal/Vulkan, but spotty on the web
 /// (Safari yes, desktop browsers via extensions) — so the default is `.png`
-/// everywhere and each platform opts into `.astc` explicitly.
+/// everywhere and each target opts into `.astc` explicitly.
+///
+/// Keyed by TARGET name (labelle-cli RFC #471 P1). `project.labelle` may use
+/// any identifier key: the keys below are the targets this assembler
+/// generates for, and every other key is stripped before the strict typed
+/// parse and ignored (`target_keys.stripUnknown`, warned once per `generate`).
+/// `web` is the original spelling of the `wasm` key, kept indefinitely as a
+/// warned alias (owner decision D9); `wasm` wins when both are set.
 pub const AssetCompression = struct {
     desktop: AssetFormat = .png,
     android: AssetFormat = .png,
     ios: AssetFormat = .png,
-    web: AssetFormat = .png,
+    wasm: ?AssetFormat = null,
+    /// Alias for `wasm`. Optional so an absent key is distinguishable from
+    /// an explicit `.png`: an explicit `.wasm` always wins over it.
+    web: ?AssetFormat = null,
 
     /// The selected format for `platform`.
     pub fn formatFor(self: AssetCompression, platform: Platform) AssetFormat {
@@ -167,7 +177,7 @@ pub const AssetCompression = struct {
             .desktop => self.desktop,
             .android => self.android,
             .ios => self.ios,
-            .wasm => self.web,
+            .wasm => self.wasm orelse self.web orelse .png,
         };
     }
 };
