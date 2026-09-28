@@ -29,6 +29,7 @@ const pack = @import("plugin_manifest/pack.zig");
 
 // ── Shared constants + name validation (plugin_manifest/common.zig) ──
 pub const SUPPORTED_MANIFEST_VERSION = common.SUPPORTED_MANIFEST_VERSION;
+pub const SUPPORTED_PLUGIN_MANIFEST_VERSION = common.SUPPORTED_PLUGIN_MANIFEST_VERSION;
 pub const RESERVED_DIR_NAMES = common.RESERVED_DIR_NAMES;
 pub const isReservedDirName = common.isReservedDirName;
 pub const isSafeDirName = common.isSafeDirName;

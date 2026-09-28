@@ -14,8 +14,11 @@ const cache = @import("../cache.zig");
 const common = @import("common.zig");
 const language_policy = @import("../language_policy.zig");
 const plugin_params = @import("../plugin_params.zig");
+const plugin_build_options = @import("../plugin_build_options.zig");
 
-const SUPPORTED_MANIFEST_VERSION = common.SUPPORTED_MANIFEST_VERSION;
+// v2 adds CLI-owned provider commands/hooks; runtime declarations keep their
+// existing meaning. Pack manifests retain their independent v1 version gate.
+const SUPPORTED_MANIFEST_VERSION = common.SUPPORTED_PLUGIN_MANIFEST_VERSION;
 const RESERVED_DIR_NAMES = common.RESERVED_DIR_NAMES;
 const isReservedDirName = common.isReservedDirName;
 const isSafeDirName = common.isSafeDirName;
@@ -272,6 +275,18 @@ pub const PluginManifest = struct {
     /// module source (every plugin before #633) → byte-identical output.
     consumes_events: []const []const u8 = &.{},
 
+    /// Assembler-provided build options this plugin's `build.zig` declares
+    /// (assembler#776) — e.g. `.build_options = .{ "ios_sdk_path" }`. The
+    /// generated build.zig passes such an option to this plugin's
+    /// `b.dependency(...)` ONLY when it is listed here (or, for back-compat,
+    /// when the plugin's `build.zig` visibly declares it — see
+    /// `plugin_build_options.zig`): Zig rejects an undeclared `-D` option, so
+    /// passing it to every plugin broke any plugin that does not take it.
+    /// Validated at load against `plugin_build_options.provided` (a typo must
+    /// not silently drop the option). Empty/absent = the plugin takes none
+    /// → byte-identical output.
+    build_options: []const []const u8 = &.{},
+
     /// Allocator that owns the parsed strings and slice. Stored on
     /// the manifest so the caller doesn't have to remember to pass
     /// the right allocator to deinit.
@@ -302,6 +317,7 @@ pub const PluginManifest = struct {
         std.zon.parse.free(self.allocator, self.author);
         std.zon.parse.free(self.allocator, self.languages);
         std.zon.parse.free(self.allocator, self.consumes_events);
+        std.zon.parse.free(self.allocator, self.build_options);
         // Not parser-allocated (the strict schema walk owns its copies) but
         // shape-compatible; freed through its own helper for symmetry.
         plugin_params.freeSchema(self.allocator, self.params_schema);
@@ -322,6 +338,8 @@ pub const PluginManifest = struct {
 //   error.PluginManifestUnknownVersion     — manifest_version is < 1 or > what we support
 //   error.PluginManifestUnknownLanguage    — requires_language names a language outside
 //                                             language_policy.SUPPORTED_LANGUAGES (#584)
+//   error.PluginManifestUnknownBuildOption — a `.build_options` entry names an
+//                                             option the assembler does not supply (#776)
 //   error.PluginManifestInvalidParamsSchema — a `.params_schema` entry breaks the shape
 //                                             rules (unknown key, missing name/type,
 //                                             enum⇔values pairing, default/type mismatch,
@@ -433,7 +451,7 @@ pub fn loadFromDir(
     // same way as an unknown future version.
     if (parsed.manifest_version < 1 or parsed.manifest_version > SUPPORTED_MANIFEST_VERSION) {
         std.debug.print(
-            "labelle: plugin '{s}' has manifest_version {d}\n  but this labelle-cli release supports manifest_version 1..{d}\n  fix the plugin.labelle manifest or upgrade/downgrade labelle-cli\n",
+            "labelle: plugin '{s}' has manifest_version {d}\n  but this labelle-assembler release supports manifest_version 1..{d}\n  fix the plugin.labelle manifest or upgrade/downgrade labelle-assembler\n",
             .{ expected_name, parsed.manifest_version, SUPPORTED_MANIFEST_VERSION },
         );
         return error.PluginManifestUnknownVersion;
@@ -550,6 +568,22 @@ pub fn loadFromDir(
         }
     }
 
+    // ── Validate `.build_options` (#776) ──
+    // Each entry names an option the ASSEMBLER supplies to the plugin's
+    // `b.dependency(...)`. The vocabulary is closed: an unknown name is a
+    // typo (or an option this assembler cannot supply), and ignoring it
+    // would silently leave the plugin without the option it asked for.
+    for (parsed.build_options) |opt| {
+        if (!plugin_build_options.isProvided(opt)) {
+            std.debug.print(
+                "labelle: plugin '{s}' declares `.build_options` entry \"{s}\"\n" ++
+                    "  but the assembler supplies only: {s}\n  at {s}\n",
+                .{ expected_name, opt, plugin_build_options.provided_list, manifest_path },
+            );
+            return error.PluginManifestUnknownBuildOption;
+        }
+    }
+
     // ── Parse + validate `.params_schema` (#591) ──
     // A dedicated STRICT walk over the raw source: the typed parse above
     // deliberately ignores the key (manifest-wide forward compat — an older
@@ -574,6 +608,7 @@ pub fn loadFromDir(
         .author = parsed.author,
         .languages = parsed.languages,
         .consumes_events = parsed.consumes_events,
+        .build_options = parsed.build_options,
         .allocator = allocator,
     };
 }
@@ -603,6 +638,9 @@ const ZonManifest = struct {
     // Declared plugin-to-plugin event consumption (#633). Optional/additive —
     // absent parses to the byte-identical empty default.
     consumes_events: []const []const u8 = &.{},
+    // Assembler-provided build options the plugin declares (#776).
+    // Optional/additive — absent parses to the byte-identical empty default.
+    build_options: []const []const u8 = &.{},
 };
 
 // ============================================================================
@@ -1005,6 +1043,58 @@ test "loadFromDir: parses a valid manifest" {
     try testing.expectEqualStrings("state_machines", manifest.convention_dirs[0].name);
     try testing.expectEqualStrings(".zig", manifest.convention_dirs[0].extension.?);
     try testing.expectEqual(ConventionDirMode.copy_and_scan, manifest.convention_dirs[0].mode);
+}
+
+test "provider settings: plugin v2 keeps runtime declarations and leaves commands to CLI" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeManifestFile(tmp.dir,
+        \\.{ .name = "fixture", .manifest_version = 2,
+        \\   .command_contract = ">=1.0.0 <2.0.0", .namespace = "probe",
+        \\   .commands = .{ .{ .name = "inspect", .build_step = "tool", .executable = "bin/tool", .help = "Inspect" } },
+        \\   .convention_dirs = .{ .{ .name = "custom_data", .mode = .copy_only } },
+        \\}
+    );
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    var loaded = (try loadFromDir(testing.allocator, dir, "fixture")).?;
+    defer loaded.deinit();
+    try testing.expectEqual(@as(u8, 2), loaded.manifest_version);
+    try testing.expectEqualStrings("custom_data", loaded.convention_dirs[0].name);
+    try testing.expectEqual(@as(u8, 1), common.SUPPORTED_MANIFEST_VERSION);
+}
+
+test "provider settings: plugin v2 manifests with CLI hooks and targets still load (labelle-cli#406 phase 3a)" {
+    // labelle-cli RFC #406 phase 3a adds two CLI-only record shapes to
+    // plugin.labelle: `.hooks` (lifecycle hook records with enum-literal
+    // `.step`/`.when` and a nested `.after_hooks` tuple) and `.targets` (a
+    // tuple of strings). The assembler never reads either; both must ride
+    // the manifest-wide `ignore_unknown_fields` parse in loadFromDir with
+    // no schema change, leaving the runtime declarations intact.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeManifestFile(tmp.dir,
+        \\.{ .name = "fixture", .manifest_version = 2,
+        \\   .command_contract = ">=1.0.0 <2.0.0", .namespace = "probe",
+        \\   .commands = .{ .{ .name = "inspect", .build_step = "tool", .executable = "bin/tool", .help = "Inspect" } },
+        \\   .hooks = .{ .{ .id = "bundle", .step = .bundle, .target = "probe-target", .when = .replace, .build_step = "hook", .executable = "bin/hook", .after_hooks = .{} } },
+        \\   .targets = .{ "probe-target" },
+        \\   .convention_dirs = .{ .{ .name = "custom_data", .mode = .copy_only } },
+        \\}
+    );
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    var loaded = (try loadFromDir(testing.allocator, dir, "fixture")).?;
+    defer loaded.deinit();
+    try testing.expectEqual(@as(u8, 2), loaded.manifest_version);
+    try testing.expectEqualStrings("fixture", loaded.name);
+    try testing.expectEqual(@as(usize, 1), loaded.convention_dirs.len);
+    try testing.expectEqualStrings("custom_data", loaded.convention_dirs[0].name);
+    try testing.expectEqual(ConventionDirMode.copy_only, loaded.convention_dirs[0].mode);
+    // The ignore-unknown mechanism must not have widened the schema: the
+    // parsed manifest carries no hooks/targets declarations.
+    try testing.expect(!@hasField(ZonManifest, "hooks"));
+    try testing.expect(!@hasField(ZonManifest, "targets"));
 }
 
 test "loadFromDir: errors on name mismatch" {

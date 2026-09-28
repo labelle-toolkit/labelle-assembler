@@ -17,6 +17,7 @@ const config = @import("../config.zig");
 const env = @import("env.zig");
 const resolve = @import("resolve.zig");
 const disk = @import("disk.zig");
+const plugin_subdir = @import("plugin_subdir.zig");
 
 /// Known GitHub repos for first-party framework packages.
 const FRAMEWORK_REPOS = [_]struct { name: []const u8, repo: []const u8 }{
@@ -64,7 +65,13 @@ pub fn fetchFrameworkPackage(allocator: std.mem.Allocator, package: []const u8, 
 }
 
 /// Fetch a plugin from its source archive at a given version.
+///
+/// A `.subdir` pin (#771) still downloads the whole archive — a forge only
+/// serves whole-repo tarballs — into the same slot; the subdir must then
+/// exist inside it, or the pin names a directory the release never had.
 pub fn fetchPlugin(allocator: std.mem.Allocator, plugin: config.PluginDep) !void {
+    try plugin_subdir.validate(plugin);
+
     // #688 review: version-named slot only — see fetchFrameworkPackage.
     const target = try resolve.pluginVersionPath(allocator, plugin);
     defer allocator.free(target);
@@ -73,6 +80,16 @@ pub fn fetchPlugin(allocator: std.mem.Allocator, plugin: config.PluginDep) !void
     defer allocator.free(ref);
 
     try archiveFetch(allocator, plugin.repo, ref, target);
+
+    const root = try plugin_subdir.pluginRoot(allocator, target, plugin);
+    defer allocator.free(root);
+    if (!disk.isDirectory(root)) {
+        std.log.err(
+            "labelle: plugin '{s}': '{s}' at {s} has no directory '{s}' — check the pin's '.subdir' and '.version'",
+            .{ plugin.name, plugin.repo, ref, plugin.subdir },
+        );
+        return error.PluginSubdirNotFound;
+    }
 }
 
 // ── GUI plugin (`.package` / `.url`) resolution ──────────────────────

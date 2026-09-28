@@ -74,13 +74,21 @@ pub fn build(b: *std.Build) void {
     // 0.21.0 → 2.0.0 floor and its "scaffold core default pairs with the
     // builtin bgfx provider" test asserts the pairing; `checkTrioFloors`
     // asserts the trio.
+    //
+    // core 2.1.0 / gfx 2.2.0 / engine 3.4.1 (2026-09-27, `init` defaults to
+    // bgfx): the builtin `.bgfx` provider moved to labelle-bgfx 0.30.0,
+    // whose material path switches over core's `Blend.modulate2x` — a tag
+    // only core >= 2.1.0 declares (bgfx >= 0.26.0 pins core 2.1.0). gfx
+    // 2.2.0 and engine 3.4.1 are the latest releases on the 2.x line; their
+    // build.zig.zon pins (gfx → core 2.0.0, engine → gfx 2.0.0) sit below
+    // this set, which the trio floors allow.
     // Bump all three together when moving the engine default (their
     // build.zig.zon pins/floors must agree — read them from the tags), and
     // keep `src/init_cmd.zig`'s "scaffold pins a MUTUALLY COMPATIBLE trio"
     // test satisfied — it encodes the floors below as assertions.
-    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "2.0.0";
-    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "3.0.1";
-    const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "2.0.0";
+    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "2.1.0";
+    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "3.4.1";
+    const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "2.2.0";
     // Version this assembler binary stamps into a freshly scaffolded
     // project.labelle's `assembler_version` field.
     //
@@ -96,7 +104,7 @@ pub fn build(b: *std.Build) void {
     // A plausible-but-wrong version is worse than an obviously-fake one:
     // `0.0.0-dev` fails to resolve loudly, which is the correct outcome for
     // a scaffold produced by an unreleased binary.
-    const assembler_version: []const u8 = b.option([]const u8, "assembler_version", "Default assembler version for `init`") orelse "0.0.0-dev";
+    const assembler_version: []const u8 = b.option([]const u8, "assembler_version", "Assembler release version for scaffolding and bundled packages") orelse "0.0.0-dev";
 
     const zspec_dep = b.dependency("zspec", .{ .target = target, .optimize = optimize });
     const flow_codegen_dep = b.dependency("flow_codegen", .{ .target = target, .optimize = optimize });
@@ -167,6 +175,8 @@ pub fn build(b: *std.Build) void {
     src_tests.root_module.addImport("flow_codegen", flow_codegen_module);
     src_tests.root_module.link_libc = true; // see assembler_exe comment above
     test_step.dependOn(&b.addRunArtifact(src_tests).step);
+    const provider_settings_tests = b.addTest(.{ .root_module = src_tests.root_module, .filters = &.{ "provider settings:", "parseProjectConfig:", "loadFromDir:", "loadPack" } });
+    b.step("test-provider-config", "Test shared provider settings and plugin v2 parsing").dependOn(&b.addRunArtifact(provider_settings_tests).step);
 
     // Subcommand tests — `src/main.zig` is the binary's root and reaches
     // the subcommand modules (`init_cmd`, `cache_cmd`) that `src/root.zig`
@@ -233,24 +243,22 @@ pub fn build(b: *std.Build) void {
 
     // ── `test-cache`: the local-slot cache machinery, alone ─────────────
     //
-    // The Windows CI job runs THIS, not `test`. `zig build test` on Windows
-    // is red for ~33 pre-existing failures across the scripting-splice,
-    // panel-validate and pack-check suites (path-separator handling), which
-    // a Windows job added for #688 neither caused nor should be expected to
-    // fix — see the tracking issue linked from that PR. A job that is red
-    // for unrelated reasons guards nothing, so this step narrows to the
-    // modules the cache work touches: `cache.local`, `cache.disk` and
-    // `cache_cmd`.
+    // A narrow, fast subset: the modules the cache work touches
+    // (`cache.local`, `cache.disk`, `cache_cmd`). The Windows CI job used to
+    // run only this step while `zig build test` was red on Windows; since
+    // #699 it runs the full `test` (see the windows job in ci.yml), so this
+    // step is now a local convenience.
     //
     // `cache.resolve` is deliberately NOT in the filter: two of its
     // worktree-path tests are among the pre-existing Windows failures, and
     // they predate and are untouched by the local-slot work. Add it back
     // when those are fixed.
-    // `junction` joins them for #710: the junction code is Windows-ONLY, and
-    // this job is the only place CI runs on Windows — the unfiltered `test`
-    // step runs on ubuntu/macos, where those tests skip. Without the filter
-    // the platform-specific code would have no automated execution anywhere.
-    const cache_filters = [_][]const u8{ "cache.local", "cache.disk", "cache_cmd", "junction" };
+    // `junction` joins them for #710: the junction code is Windows-ONLY. The
+    // full `test` step now runs on the Windows CI job too, so these tests have
+    // Windows coverage; the filter stays for a fast local run of them.
+    // `plugin_subdir` / `install plugin` join them for #771/#772: plugin
+    // overrides go through the same junction-or-copy slot machinery.
+    const cache_filters = [_][]const u8{ "cache.local", "cache.disk", "cache_cmd", "junction", "plugin_subdir", "install plugin" };
     const test_cache_step = b.step("test-cache", "Run only the cache/local-slot tests");
 
     const cache_src_tests = b.addTest(.{
@@ -281,12 +289,11 @@ pub fn build(b: *std.Build) void {
     test_cache_step.dependOn(&b.addRunArtifact(cache_bin_tests).step);
 
     // The link-placement suite joins the Windows job too (#699 review). It
-    // lives in `test/`, so it rides `zig build test` — which runs on
-    // ubuntu/macos only. Yet it is precisely where the platform differs:
+    // lives in `test/`, so it rides `zig build test` on every CI OS,
+    // Windows included. It is precisely where the platform differs:
     // Windows takes the junction fallback that POSIX never reaches, and the
     // idempotence pin there is the one that catches a junction being rebuilt
-    // on every generate. Left out, the Windows-only path would again have
-    // Windows-only tests that no Windows job runs.
+    // on every generate, so it stays in this narrow step as well.
     const scanner_link_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/scanner_symlink_tests.zig"),
@@ -308,7 +315,29 @@ pub fn build(b: *std.Build) void {
     // them without further build.zig churn. flow_codegen is cheap to
     // attach (pure-Zig sub-package, no native deps) so the blanket
     // import isn't an unwanted runtime cost.
+    const apk_abi_target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .android });
+    const apk_abi_module = b.createModule(.{
+        .root_source_file = b.path("test/fixtures/apk_runtime_compile.zig"),
+        .target = apk_abi_target,
+        .optimize = optimize,
+        .pic = true,
+    });
+    apk_abi_module.addImport("apk", b.createModule(.{
+        .root_source_file = b.path("src/codegen/blocks/apk_runtime.zig"),
+        .target = apk_abi_target,
+        .optimize = optimize,
+    }));
+    const apk_abi = b.addObject(.{ .name = "apk-runtime-abi", .root_module = apk_abi_module });
+    test_step.dependOn(&apk_abi.step);
+    const apk_reader_test = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/codegen/blocks/apk_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const apk_reader_run = b.addRunArtifact(apk_reader_test);
+    test_step.dependOn(&apk_reader_run.step);
     const test_files = [_][]const u8{
+        "test/apk_assets_tests.zig",
         // BDD test suites previously concentrated in test/tests.zig
         // (3768 lines). Split by domain via #184. Shared fixtures live
         // in test/helpers.zig.
@@ -458,6 +487,12 @@ pub fn build(b: *std.Build) void {
         const run_test = b.addRunArtifact(t);
         test_step.dependOn(&run_test.step);
         if (std.mem.eql(u8, test_file, "test/build_zig_tests.zig") or std.mem.eql(u8, test_file, "test/build_zig_zon_tests.zig")) material_test_step.dependOn(&run_test.step);
+        if (std.mem.eql(u8, test_file, "test/apk_assets_tests.zig")) {
+            const apk_step = b.step("test-apk-assets", "Test Android APK resource generation");
+            apk_step.dependOn(&run_test.step);
+            apk_step.dependOn(&apk_reader_run.step);
+            apk_step.dependOn(&apk_abi.step);
+        }
         if (std.mem.eql(u8, test_file, "test/animation_assets_tests.zig")) {
             b.step("test-animation", "Test JSONC animation asset wiring").dependOn(&run_test.step);
         }

@@ -36,6 +36,7 @@ The binary is written to `zig-out/bin/labelle-assembler`.
 ./zig-out/bin/labelle-assembler --protocol-version
 ./zig-out/bin/labelle-assembler generate --project-root /path/to/game
 ./zig-out/bin/labelle-assembler routes --project-root /path/to/game
+./zig-out/bin/labelle-assembler describe --project-root /path/to/game --target desktop
 ```
 
 ### Generate options
@@ -45,7 +46,27 @@ The binary is written to `zig-out/bin/labelle-assembler`.
 | `--project-root <path>` | Path to game project (containing `project.labelle`) |
 | `--scene <name>` | Override the initial prefab |
 | `--platform <name>` | Override target platform (`desktop`, `wasm`, `ios`, `android`) |
+| `--target <name>` | Alias for `--platform`, spelled the way the CLI names targets. An unknown name exits 2 with a message naming the resolved backend and the target |
 | `--backend <name>` | Override graphics backend (`raylib`, `sokol`, `sdl`, `bgfx`, `wgpu`, `null`) |
+
+A `project.labelle` with no `.backend` (and no `.backend_package`) builds
+with **bgfx** on desktop, the same default `labelle-assembler init`
+scaffolds. Before v0.117.0 the implicit default was raylib; a project that
+relied on it must now declare `.backend = .raylib`. The bgfx default
+needs `.core_version` >= 2.1.0, and `generate` refuses an older core with a
+diagnostic that names the floor.
+
+`.asset_compression` is keyed by target name (labelle-cli RFC #471 P1):
+`.desktop`, `.android`, `.ios` and `.wasm` select `.png` (the default) or
+`.astc` for that target. Any other identifier key is accepted and ignored,
+with a warning, so a project written for a newer target set still
+generates. `.web` is the original spelling of `.wasm` and stays accepted
+as a warned alias; `.wasm` wins when both are set. The `.platform` key in
+`project.labelle` is deprecated: the target comes from the command line
+(the `labelle` CLI always passes it). `generate` warns about the key only
+when `--platform` or `--target` is given, since that is when the key was
+overridden. A direct `generate` with neither still takes its target from
+`.platform`, with no warning.
 
 The `null` backend is a headless test/CI backend with no graphics, audio,
 input, or window subsystem — every backend module is a no-op stub. The
@@ -81,6 +102,188 @@ file: no package cache, no backend, no renderer. Run `generate` first.
 documented, and keyed on the same handler identity
 (`docs/design/hook-handler-ordering.md` §2.2) that runtime tracing uses.
 See `docs/design/hook-route-inspection.md`.
+
+### Describe a backend × target (the CLI's source of backend facts)
+
+```bash
+./zig-out/bin/labelle-assembler describe --project-root /path/to/game --target android
+./zig-out/bin/labelle-assembler describe --project-root /path/to/game --target ios --json
+```
+
+`describe` is the **single source of backend and target facts for the
+`labelle` CLI** (labelle-cli RFC #471). The CLI asks it, from protocol 7 on,
+instead of re-deriving them from its own copy of the assembler's enums —
+which is how the CLI came to name a third-party
+`.backend_package = .{ .name = "acme" }` project's target dir
+`.labelle/bgfx_desktop` while `generate` wrote `.labelle/acme_desktop`.
+
+It answers with the same code `generate` runs: the `.backend` shorthand
+(`builtinProvider`), an explicit `.backend_package`, third-party packages,
+the `bgfx` default, `backendName()` for the target dir, and `.asset_compression`
+for the asset format. For `supported`, when the package is installed, it
+calls **the same provider check `generate` runs before codegen**
+(`provider_contracts.checkProvider`). That check covers:
+- the manifest requirement and version floors;
+- the v2 manifest parse;
+- lifecycle privilege, provider identity and id collision;
+- capabilities;
+- the editor-preview link path and the declared build hook;
+- the `.platforms.<target>` entry, its entry template and builtin root deps;
+- the callback-lifecycle rule.
+
+A failure there is `supported: false`, with the exact diagnostic `generate`
+prints as the `reason`.
+
+It is **offline and config-only**: it reads `project.labelle` and, when the
+backend package is already installed, that package's manifest. It fetches
+nothing, writes nothing to the cache, and generates nothing. When the package
+is not installed, a first-party backend at its default version is answered
+from a snapshot of its manifest's capabilities; any other package reads as
+supported but unverified (`capabilities_source: "unknown"`), the same
+back-compat rule `generate` applies to a provider that declares no
+capabilities. Requirements that come from a resolved GUI plugin are not part
+of the answer.
+
+`--json` emits the `labelle.describe/v1` schema. Key order is fixed;
+`package_dir` appears only when the package is installed, and `reason` only
+when `supported` is false:
+
+```json
+{
+  "schema": "labelle.describe/v1",
+  "target": "ios",
+  "target_dir": ".labelle/raylib_ios",
+  "backend": {
+    "name": "raylib",
+    "id": "labelle.raylib",
+    "repo": "github.com/labelle-toolkit/labelle-raylib",
+    "version": "0.3.0",
+    "local_path": null
+  },
+  "asset_format": "png",
+  "supported": false,
+  "reason": "backend provider 'labelle.raylib' does not support capability 'ios' required by target 'ios'",
+  "capabilities_source": "builtin"
+}
+```
+
+| Key | Meaning |
+|-----|---------|
+| `target_dir` | `.labelle/<backend name>_<target>`, relative to the project root — the dir `generate` creates |
+| `backend.name` | `backendName()`: the package name (`bgfx`, `acme`) |
+| `backend.id` | Canonical provider id: from the installed manifest once it passes `generate`'s identity check (a reserved, drifted or malformed id is `supported: false` with that check's reason instead), derived as `labelle.<name>` for a first-party backend, else `null` |
+| `backend.repo`, `backend.version` | The resolved package's pin |
+| `backend.local_path` | The resolved directory of a `local:` / `@` package, else `null` |
+| `package_dir` | The package's directory, only when it is on disk |
+| `asset_format` | `png` or `astc`, from `.asset_compression` for this target |
+| `supported`, `reason` | Whether this backend can generate for this target, and why not |
+| `capabilities_source` | `manifest` (parsed from the installed v2 manifest), `builtin` (first-party snapshot), or `unknown` (nothing read: not installed, or installed without a readable v2 manifest) |
+
+Exit codes: 0 whenever an answer was produced, `supported: false` included
+(`describe` is a query, not a gate); 1 when `project.labelle` cannot be read
+or parsed; 2 on a usage error. An unknown target is `supported: false` with
+a reason naming the backend and the target.
+
+### Upgrade the backend
+
+```bash
+./zig-out/bin/labelle-assembler upgrade --project-root /path/to/game backend          # to this assembler's default
+./zig-out/bin/labelle-assembler upgrade --project-root /path/to/game backend 0.31.0   # to a given release
+```
+
+`upgrade backend [version]` bumps the backend provider pin in
+`project.labelle` (labelle-cli RFC #471, D2). The `labelle` CLI's
+`upgrade all` delegates the backend half of its work to it. The command is
+offline: it reads and rewrites `project.labelle` and fetches nothing.
+
+The edit is minimal. Only the version string changes, or the one field that
+is added; comments, ordering and spacing are kept. Each rewrite is parsed
+back before it is written, and one that does not resolve to the same
+backend at the requested version is refused, not written.
+
+| Project has | No version given | A version given |
+|---|---|---|
+| `.backend = .<tag>` only (or no `.backend`, i.e. the default `bgfx`) | No-op: the shorthand already resolves to this assembler's default (`builtinProvider`) and follows it on every assembler upgrade | The default version is a no-op. Any other version adds an explicit `.backend_package = .{ .name, .repo, .version }` for the same first-party package, next to `.backend`. With no `.backend`, it also adds `.backend = .bgfx`, so the resolved backend tag and the gamepad default don't change. Delete `.backend_package` to go back to following the default |
+| An explicit first-party `.backend_package` | `.version` set to this assembler's default for that backend (inserted when the package has no `.version`). A pin already newer than the default is left alone (never downgraded) | `.version` set to it (inserted when the package omits it) |
+| A third-party `.backend_package` | No-op with a note: there is no builtin default for it | `.version` set to it |
+| A `local:` / `@` `.backend_package` | No-op: it builds from its checkout | Refused (exit 2) |
+
+The prospective pins go through the same `version_floors` gate as
+`generate` and `upgrade core|engine|gfx`. A backend version whose floor on
+`.core_version` is a compile break is refused (exit 2) with the floor's own
+message, and nothing is written; upgrade core first (`upgrade core <ver>` or
+`upgrade all`). A curated floor warns and proceeds. The command doesn't move
+core, engine or gfx: an incoherent trio is only warned about, and a no-op
+still warns when the current pairing is already below a floor. Versions must be
+strict semver; anything else (`1.2`, `1.2.3.4`, `v1.2.3`) is refused (exit 2).
+A pre-release or build suffix (`1.2.3-rc.1`, `1.2.3+b.5`) is written as
+given. It is fetched as the tag of the same name (`v1.2.3-rc.1`, build
+metadata kept), and the floors judge it as its `MAJOR.MINOR.PATCH`
+(assembler#783).
+
+### Plugin build options supplied by the assembler
+
+Some `-D` options only the assembler knows the value of. Today that's
+`ios_sdk_path`, the iOS SDK root that a plugin compiling C needs for system
+headers. On an iOS generate, the assembler passes it to a plugin's
+`b.dependency(...)` **only when the plugin takes it**. Zig rejects a `-D`
+option that the dependency's `build.zig` doesn't declare, so passing it to
+every plugin broke the others (#776). A plugin takes it when either of these
+is true:
+
+- its `plugin.labelle` declares it. This is the contract; an unknown name
+  fails the manifest load:
+
+  ```zig
+  .build_options = .{ "ios_sdk_path" },
+  ```
+
+- its `build.zig` declares the option: a `b.option(<type>, "ios_sdk_path", ...)`
+  call with that string literal as the second argument. This keeps existing
+  plugins such as labelle-box2d working unchanged. The string anywhere else
+  (a comment, a constant, a message) doesn't count; a plugin that passes the
+  name indirectly, or declares it in an imported file, must use the manifest
+  key.
+
+### Plugins that live in a monorepo directory (`.subdir`)
+
+A plugin doesn't need a repo of its own. `.subdir` pins one directory of a
+tagged repo, so a game can use the assembler's debug overlay
+(`plugins/debug`) with no sibling `labelle-assembler` checkout (#771):
+
+```zig
+.plugins = .{
+    .{ .name = "debug", .repo = "github.com/labelle-toolkit/labelle-assembler",
+       .version = "0.118.0", .subdir = "plugins/debug" },
+},
+```
+
+The tag's source archive is cached whole under
+`~/.labelle/packages/plugins/<repo>/<version>/`, and the plugin is built from
+`<that>/<subdir>`. Two plugins from the same repo and version share one
+download. `.subdir` must be a relative, `/`-separated path inside the repo (no `..`, no
+absolute path), and it only applies to a remote `.repo`. A `local:`/`@` repo
+already names the plugin directory.
+
+### Build one plugin from a local checkout (`install plugin`)
+
+To work on one plugin against a game that pins everything to releases,
+override it outside the committed files (#772):
+
+```bash
+labelle install plugin debug local:../labelle-assembler/plugins/debug
+labelle install plugin debug            # is it overridden, and by what?
+labelle install plugin debug --unlink   # back to the pinned release
+```
+
+(`labelle install …` forwards to `labelle-assembler install …`.) The checkout
+is linked into `~/.labelle/packages/local/plugins/`. Every build, by any
+assembler, then uses it instead of the pinned release and prints a warning.
+Nothing in `project.labelle` or `labelle.lock` changes, so the override can't
+be committed by accident. The path is the plugin directory (the one with its
+`build.zig.zon`), even for a `.subdir` pin. A relative path resolves against
+`--project-root` if you pass one, else the working directory.
+`labelle-assembler clean` drops every override.
 
 ### Run tests
 

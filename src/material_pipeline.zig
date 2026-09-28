@@ -21,7 +21,7 @@ pub const schema = @import("material_schema.zig");
 /// `.raylib` default is rejected; declare `.backend = .bgfx` alongside the
 /// package. There is no material capability in the provider manifest yet.
 pub fn requireBackend(cfg: config.ProjectConfig) error{UnsupportedMaterialBackend}!void {
-    switch (cfg.backend) {
+    switch (cfg.effectiveBackend()) {
         .bgfx, .null => {},
         else => return error.UnsupportedMaterialBackend,
     }
@@ -55,19 +55,20 @@ pub const min_bgfx_for_api161 = "0.24.0";
 /// The material shaderc + GLSL profile for this project's bgfx.
 ///
 /// Official labelle-bgfx with a semver pin: API 161 from 0.24.0, API 142
-/// below. Anything else follows the builtin provider's default pin, so a
+/// below (a pre-release/build pin judged as its `MAJOR.MINOR.PATCH`,
+/// `config.parsePin`, #783). Anything else follows the builtin provider's default pin, so a
 /// project that doesn't pin bgfx gets the toolchain matching what it links.
 /// A custom provider or a non-semver (commit / `local:`) pin can't be judged
 /// here; it gets the newest toolchain, and the runtime's container check is
 /// the backstop.
 pub fn toolchain(cfg: config.ProjectConfig) schema.Toolchain {
     const bp = cfg.effectiveBackendPackage() orelse return schema.toolchain_api161;
-    if (!isOfficialBgfx(bp) or !config.isSemverVersion(bp.version)) return schema.toolchain_api161;
+    if (!isOfficialBgfx(bp) or !config.isTagVersion(bp.version)) return schema.toolchain_api161;
     const new = config.pinAtLeast(bp.version, min_bgfx_for_api161) catch return schema.toolchain_api161;
     return if (new) schema.toolchain_api161 else schema.toolchain_api142;
 }
 pub fn contractViolation(cfg: config.ProjectConfig) error{UnparsableVersionPin}!?ContractViolation {
-    if (cfg.backend != .bgfx) return null;
+    if (cfg.effectiveBackend() != .bgfx) return null;
     if (cfg.effectiveBackendPackage()) |bp| {
         // The 0.21.0 floor is a fact about the OFFICIAL labelle-bgfx release
         // train only. A custom provider (`.backend_package` on another repo)
@@ -76,10 +77,10 @@ pub fn contractViolation(cfg: config.ProjectConfig) error{UnparsableVersionPin}!
         // labelle-bgfx (#733 review, round 3). Such a provider is validated
         // by the generated module's `MATERIAL_CONTRACT_VERSION == 2` guard,
         // which covers arbitrary providers.
-        if (isOfficialBgfx(bp) and config.isSemverVersion(bp.version) and !try config.pinAtLeast(bp.version, min_bgfx_for_materials))
+        if (isOfficialBgfx(bp) and config.isTagVersion(bp.version) and !try config.pinAtLeast(bp.version, min_bgfx_for_materials))
             return .{ .what = "labelle-bgfx", .pinned = bp.version, .floor = min_bgfx_for_materials };
     }
-    if (config.isSemverVersion(cfg.core_version) and !try config.pinAtLeast(cfg.core_version, min_core_for_materials))
+    if (config.isTagVersion(cfg.core_version) and !try config.pinAtLeast(cfg.core_version, min_core_for_materials))
         return .{ .what = "labelle-core", .pinned = cfg.core_version, .floor = min_core_for_materials };
     return null;
 }

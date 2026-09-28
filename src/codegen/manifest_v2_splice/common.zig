@@ -188,9 +188,11 @@ pub fn platformEntry(
 ///
 /// Desktop's `.binary` recipe is a NO-OP, so this is safe to call
 /// unconditionally on the PR-3 desktop path without disturbing its byte anchor.
-/// Android/wasm entries (PRs 5/7) carry `.apk`/`.web` recipes that emit the
-/// apk-staging / emcc packaging block here, byte-identical to the enum path's
-/// `.android_package` / `.wasm_footer` sections (design §7).
+/// Wasm entries carry a `.web` recipe that emits the emcc packaging block here,
+/// byte-identical to the enum path's `.wasm_footer` section (design §7).
+/// Android's `.apk` recipe is a no-op too since labelle-cli#405: the
+/// labelle-android provider packages the APK, so no `zig build package` step
+/// is generated.
 pub fn renderPackageV2(
     m: BackendManifestV2,
     platform: config.Platform,
@@ -297,9 +299,13 @@ test "depOptionValue: gamepad_enabled routes through effectiveGamepad (assembler
 
 test "depOptionValue: closed predicate set matches the v1 paramValue predicates" {
     const base_cfg = ProjectConfig{ .name = "g" };
-    // Default backend is raylib; absent `.gamepad` resolves to .auto →
-    // gamepad_enabled true; hidapi false; no gui → false.
-    try testing.expectEqualStrings("true", depOptionValue(.gamepad_enabled, base_cfg));
+    // Default backend is bgfx (an absent `.backend` since 2026-09-27); an
+    // absent `.gamepad` on bgfx resolves to .none → gamepad_enabled false;
+    // hidapi false; no gui → false.
+    try testing.expectEqual(config.Backend.bgfx, base_cfg.effectiveBackend());
+    try testing.expectEqualStrings("false", depOptionValue(.gamepad_enabled, base_cfg));
+    // An explicit raylib keeps the historical `.auto` → true.
+    try testing.expectEqualStrings("true", depOptionValue(.gamepad_enabled, ProjectConfig{ .name = "g", .backend = .raylib }));
     try testing.expectEqualStrings("false", depOptionValue(.gamepad_hidapi, base_cfg));
     try testing.expectEqualStrings("false", depOptionValue(.gui_is_imgui, base_cfg));
     try testing.expectEqualStrings("true", depOptionValue(.true_literal, base_cfg));
@@ -416,7 +422,8 @@ test "emitCoreDiamondWalk emits the PR-2 generic walk source (drift guard)" {
 }
 
 // A minimal v2 manifest exercising all four platform packaging recipes: desktop
-// `.binary` (no-op), android `.apk`, wasm `.web`; ios absent (unsupported).
+// `.binary` (no-op), android `.apk` (no-op since cli#405), wasm `.web`; ios
+// absent (unsupported).
 fn packagingManifest() BackendManifestV2 {
     const entry = struct {
         fn e(pkg: BackendManifestV2.Package) BackendManifestV2.PlatformEntry {
@@ -449,10 +456,10 @@ test "renderPackageV2: desktop .binary is a no-op (preserves the byte anchor)" {
     try testing.expectEqual(@as(usize, 0), out.len);
 }
 
-test "renderPackageV2: android delegates to the packager apk recipe" {
+test "renderPackageV2: android .apk emits no package step (labelle-cli#405)" {
     const out = try renderPackageToOwned(packagingManifest(), .android);
     defer testing.allocator.free(out);
-    try testing.expectEqualStrings(packager.apk_package_zig, out);
+    try testing.expectEqual(@as(usize, 0), out.len);
 }
 
 test "renderPackageV2: wasm delegates to the packager web recipe" {

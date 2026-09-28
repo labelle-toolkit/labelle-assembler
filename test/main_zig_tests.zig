@@ -216,7 +216,9 @@ pub const MAIN_ZIG = struct {
         defer std.testing.allocator.free(main_zig);
 
         // The UI-thread hide is registered with the shell.
-        const reg = "android_app.setImmersiveCallback(&engine.android.applyImmersiveUiThread);";
+        // No `android` plugin in this config, so the snippet takes the
+        // engine fallback (`immersive.zig`); the registration shape is the same.
+        const reg = "android_app.setImmersiveCallback(&labelle_immersive.apply);";
         const reg_idx = std.mem.indexOf(u8, main_zig, reg);
         try std.testing.expect(reg_idx != null);
 
@@ -365,6 +367,184 @@ pub const MAIN_ZIG = struct {
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerAndroidBackend") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "enableImmersiveMode") == null);
+    }
+
+    // ── iOS: Zig 0.16 SelfInfo override (#774) ──────────────────────────
+
+    fn genSokolMain(platform: generate.Platform, lifecycle: []const u8) ![]const u8 {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
+        return generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .sokol,
+            .platform = platform,
+            .ecs = .mock,
+        }, lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+    }
+
+    const selfinfo_decl = "pub const debug = if (@import(\"builtin\").target.os.tag == .ios) struct {\n    pub const SelfInfo = void;\n} else struct {};";
+
+    test "ios main.zig carries the root debug.SelfInfo = void override (#774)" {
+        const main_zig = try genSokolMain(.ios, sokol_mobile_lifecycle);
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, main_zig, selfinfo_decl));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, main_zig, "pub const debug ="));
+        // Golden: the whole iOS main.zig, so the override's placement (module
+        // root, next to the imports) is reviewed, not just its presence.
+        try std.testing.expectEqualStrings(@embedFile("goldens/sokol_ios_main.zig"), main_zig);
+    }
+
+    test "ios main.zig: a backend template that already declares root `debug` keeps the only copy (#774)" {
+        // labelle-sokol v0.8.1's mobile.txt ships its own override; emitting
+        // ours too would be a duplicate root decl (a compile error).
+        const with_own = sokol_mobile_lifecycle ++
+            \\// backend-owned override
+            \\pub const debug = if (@import("builtin").target.os.tag == .ios) struct {
+            \\    pub const SelfInfo = void;
+            \\} else struct {};
+            \\
+        ;
+        const main_zig = try genSokolMain(.ios, with_own);
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, main_zig, "pub const debug ="));
+        // ...and it is the backend's (the assembler's comment is absent).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "// backend-owned override") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "labelle-assembler#774") == null);
+    }
+
+    test "ios main.zig with labelle-sokol v0.8.1's real mobile.txt (own override) has exactly one root debug (#774)" {
+        // Verbatim copy of labelle-sokol v0.8.1 `templates/mobile.txt`: the
+        // released template that already carries the override. No duplicate.
+        const main_zig = try genSokolMain(.ios, @embedFile("fixtures/sokol_v0.8.1_mobile.txt"));
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, main_zig, "pub const debug ="));
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "labelle-assembler#774") == null);
+    }
+
+    test "ios main.zig: a template root `debug` WITHOUT SelfInfo fails generate with a clear error (#774)" {
+        // The assembler cannot add a second root `debug`, and skipping its
+        // override would leave the iOS link broken — so it refuses.
+        const without = sokol_mobile_lifecycle ++
+            \\pub const debug = struct {
+            \\    pub const log_level = 3;
+            \\};
+            \\
+        ;
+        try std.testing.expectError(error.IosRootDebugWithoutSelfInfo, genSokolMain(.ios, without));
+        // Off iOS the same template is not judged (the override is iOS-only).
+        const desktop = try genSokolMain(.desktop, without);
+        defer std.testing.allocator.free(desktop);
+        try std.testing.expect(std.mem.indexOf(u8, desktop, "SelfInfo") == null);
+    }
+
+    test "ios main.zig: SelfInfo in a nested type or private does not count — generate fails (#774)" {
+        // `root.debug.SelfInfo` must be a DIRECT `pub` member; these root
+        // `debug`s have none, and a second root `debug` cannot be added.
+        const nested = sokol_mobile_lifecycle ++
+            \\pub const debug = struct {
+            \\    pub const Inner = struct {
+            \\        pub const SelfInfo = void;
+            \\    };
+            \\};
+            \\
+        ;
+        try std.testing.expectError(error.IosRootDebugWithoutSelfInfo, genSokolMain(.ios, nested));
+        const private = sokol_mobile_lifecycle ++
+            \\pub const debug = struct {
+            \\    const SelfInfo = void;
+            \\};
+            \\
+        ;
+        try std.testing.expectError(error.IosRootDebugWithoutSelfInfo, genSokolMain(.ios, private));
+    }
+
+    test "ios main.zig: backend AND engine templates both owning root debug.SelfInfo fail as duplicate owners (#774)" {
+        const owner =
+            \\pub const debug = if (@import("builtin").target.os.tag == .ios) struct {
+            \\    pub const SelfInfo = void;
+            \\} else struct {};
+            \\
+        ;
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
+        try std.testing.expectError(error.IosDuplicateRootDebug, generate.generateMainZigFromTemplate(std.testing.allocator, engine_template ++ owner, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .sokol,
+            .platform = .ios,
+            .ecs = .mock,
+        }, sokol_mobile_lifecycle ++ owner, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions));
+        // One owner (the engine's) is fine: the assembler emits none.
+        const one = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template ++ owner, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .sokol,
+            .platform = .ios,
+            .ecs = .mock,
+        }, sokol_mobile_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(one);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, one, "pub const debug ="));
+        try std.testing.expect(std.mem.indexOf(u8, one, "labelle-assembler#774") == null);
+    }
+
+    fn genIosMainWith(engine_tmpl: []const u8, lifecycle: []const u8) ![]const u8 {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
+        return generate.generateMainZigFromTemplate(std.testing.allocator, engine_tmpl, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .sokol,
+            .platform = .ios,
+            .ecs = .mock,
+        }, lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+    }
+
+    test "ios main.zig: a template `debug` inside a block that renders away does not count — the override IS emitted (#774)" {
+        // `has_gui` is false for this project, so the engine block holding
+        // the `debug` renders to nothing; ownership is judged on the
+        // rendered main.zig, where there is no root `debug` at all.
+        const engine_with_gated_debug = engine_template ++
+            \\{{#if has_gui}}pub const debug = struct {
+            \\    pub const SelfInfo = void;
+            \\};
+            \\{{/if}}
+        ;
+        const main_zig = try genIosMainWith(engine_with_gated_debug, sokol_mobile_lifecycle);
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, main_zig, "pub const debug ="));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, main_zig, selfinfo_decl));
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "labelle-assembler#774") != null);
+        // The slot never survives into the output.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "ios-selfinfo-slot") == null);
+    }
+
+    test "ios main.zig: SelfInfo only in the branch iOS does NOT take fails generate (#774)" {
+        const wrong_branch = sokol_mobile_lifecycle ++
+            \\pub const debug = if (@import("builtin").target.os.tag == .ios) struct {} else struct {
+            \\    pub const SelfInfo = void;
+            \\};
+            \\
+        ;
+        try std.testing.expectError(error.IosRootDebugWithoutSelfInfo, genSokolMain(.ios, wrong_branch));
+    }
+
+    test "ios main.zig: a private root `debug` fails generate, even with SelfInfo (#774)" {
+        const private_debug = sokol_mobile_lifecycle ++
+            \\const debug = struct {
+            \\    pub const SelfInfo = void;
+            \\};
+            \\
+        ;
+        try std.testing.expectError(error.IosRootDebugWithoutSelfInfo, genSokolMain(.ios, private_debug));
+    }
+
+    test "non-iOS main.zig has no SelfInfo override (#774)" {
+        inline for (.{ generate.Platform.android, generate.Platform.desktop }) |p| {
+            const main_zig = try genSokolMain(p, sokol_mobile_lifecycle);
+            defer std.testing.allocator.free(main_zig);
+            try std.testing.expect(std.mem.indexOf(u8, main_zig, "SelfInfo") == null);
+        }
     }
 
     // ── RFC-Y-AXIS-CONVENTION (#370) ────────────────────────────────────

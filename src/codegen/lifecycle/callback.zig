@@ -37,6 +37,8 @@ const std = @import("std");
 const config = @import("../../config.zig");
 const scan = @import("../scan.zig");
 const asset_wiring = @import("../blocks/asset_wiring.zig");
+const apk_assets = @import("../blocks/apk_assets.zig");
+const immersive = @import("immersive.zig");
 const resource_loader = @import("../blocks/resource_loader.zig");
 const tilemap_assets = @import("../blocks/tilemap_assets.zig");
 const post_fx_block = @import("../blocks/post_fx.zig");
@@ -124,7 +126,7 @@ pub fn Mixin(comptime Self: type) type {
                     // at startup. Must match the fallback in buildSetupCode.
                     // The sokol-callback host has no error channel to unwind
                     // into, so we use `.catch_panic_style` instead of `try`.
-                    try emitResourceLoad(w, res, .catch_panic_style);
+                    if (apk_assets.enabled(cfg)) try apk_assets.emit(w, res, .catch_panic_style) else try emitResourceLoad(w, res, .catch_panic_style);
                 }
                 try w.writeByte('\n');
             }
@@ -268,7 +270,7 @@ pub fn Mixin(comptime Self: type) type {
 
             // ── Android immersive mode ──────────────────────────────────────
             //
-            // The `engine.android.enableImmersiveMode()` call is NOT emitted
+            // The immersive-mode call is NOT emitted
             // here. It must run on the Android UI thread, which the render-
             // thread `init` callback is not — so it is emitted into
             // `sokol_main()` instead (see `buildImmersiveEntryCode`). The
@@ -299,8 +301,8 @@ pub fn Mixin(comptime Self: type) type {
         ///      build, even when immersive mode is off, because gamepad
         ///      detection needs it too.
         ///   2. **Immersive mode (`.android.immersive_mode`).** The
-        ///      `engine.android.enableImmersiveMode()` call (only when opted
-        ///      in).
+        ///      labelle-android `immersive.enable` call (only when opted in;
+        ///      `immersive.zig`).
         ///
         /// **Why `sokol_main()` and not `init()`:** the legacy
         /// `Theme.NoTitleBar.Fullscreen` manifest theme `labelle-cli`
@@ -352,21 +354,10 @@ pub fn Mixin(comptime Self: type) type {
                 \\
             );
 
-            // (2) Immersive mode — only when opted in.
-            const immersive = if (cfg.android) |a| a.immersive_mode else false;
-            if (immersive) {
-                try w.writeAll(
-                    \\    // Android immersive mode (project.labelle `.android.immersive_mode`):
-                    \\    // hide the status + navigation bars (immersive-sticky). Called from
-                    \\    // `sokol_main()` — the UI thread, before sokol registers its own
-                    \\    // ANativeActivity callbacks — so the hook catches the window's
-                    \\    // first focus and the bars are hidden at launch. The helper only
-                    \\    // installs a UI-thread callback hook; the JNI decor-view call runs
-                    \\    // on the UI thread. See labelle-engine src/android.zig.
-                    \\    engine.android.enableImmersiveMode();
-                    \\
-                );
-            }
+            // (2) Immersive mode — only when opted in. The call goes to
+            //     labelle-android's `immersive` service (labelle-engine#902);
+            //     see `immersive.zig` for the transition fallbacks.
+            try w.writeAll(immersive.snippet(cfg, .sokol_enable));
 
             var arr_list = alloc_writer.toArrayList();
             return arr_list.toOwnedSlice(allocator);

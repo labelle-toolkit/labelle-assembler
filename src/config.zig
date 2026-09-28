@@ -151,15 +151,25 @@ pub const AstcBlockSize = enum {
     @"12x12",
 };
 
-/// Per-platform `AssetFormat` selection. ASTC support is mandatory on
+/// Per-target `AssetFormat` selection. ASTC support is mandatory on
 /// Android/iOS GLES/Metal and desktop GLES/Metal/Vulkan, but spotty on the web
 /// (Safari yes, desktop browsers via extensions) — so the default is `.png`
-/// everywhere and each platform opts into `.astc` explicitly.
+/// everywhere and each target opts into `.astc` explicitly.
+///
+/// Keyed by TARGET name (labelle-cli RFC #471 P1). `project.labelle` may use
+/// any identifier key: the keys below are the targets this assembler
+/// generates for, and every other key is stripped before the strict typed
+/// parse and ignored (`target_keys.stripUnknown`, warned once per `generate`).
+/// `web` is the original spelling of the `wasm` key, kept indefinitely as a
+/// warned alias (owner decision D9); `wasm` wins when both are set.
 pub const AssetCompression = struct {
     desktop: AssetFormat = .png,
     android: AssetFormat = .png,
     ios: AssetFormat = .png,
-    web: AssetFormat = .png,
+    wasm: ?AssetFormat = null,
+    /// Alias for `wasm`. Optional so an absent key is distinguishable from
+    /// an explicit `.png`: an explicit `.wasm` always wins over it.
+    web: ?AssetFormat = null,
 
     /// The selected format for `platform`.
     pub fn formatFor(self: AssetCompression, platform: Platform) AssetFormat {
@@ -167,7 +177,7 @@ pub const AssetCompression = struct {
             .desktop => self.desktop,
             .android => self.android,
             .ios => self.ios,
-            .wasm => self.web,
+            .wasm => self.wasm orelse self.web orelse .png,
         };
     }
 };
@@ -220,8 +230,21 @@ pub const GFX_VERSION = @import("build_options").gfx_version;
 
 /// This assembler binary's own version — stamped into `assembler_version`
 /// of a freshly scaffolded project.labelle by the `init` subcommand.
-/// Defaults to the package version (build.zig.zon) via build options.
+/// Release builds stamp the tag via build options; other builds use 0.0.0-dev.
 pub const ASSEMBLER_VERSION = @import("build_options").assembler_version;
+
+/// Bundled adapter sources belong to the assembler release, not the CLI.
+/// Keep explicit release/local pins; unpinned projects use this binary's stamp.
+pub fn assemblerPackageVersion(pin: ?[]const u8) []const u8 {
+    return pin orelse ASSEMBLER_VERSION;
+}
+
+test "assembler package selection is independent of the CLI version" {
+    const cfg = ProjectConfig{ .name = "clean-home", .labelle_version = "1.61.2" };
+    try std.testing.expectEqualStrings(ASSEMBLER_VERSION, assemblerPackageVersion(cfg.assembler_version));
+    try std.testing.expectEqualStrings("0.116.0", assemblerPackageVersion("0.116.0"));
+    try std.testing.expectEqualStrings("local:../assembler", assemblerPackageVersion("local:../assembler"));
+}
 
 /// A plugin dependency declared in project.labelle.
 /// Plugins are external packages with a repo URL and version tag.
@@ -230,6 +253,19 @@ pub const PluginDep = struct {
     name: []const u8,
     repo: []const u8 = "",
     version: []const u8 = "",
+    /// Directory INSIDE the fetched `.repo` archive that holds the plugin
+    /// (#771), for a plugin that lives in a monorepo rather than at the root
+    /// of a repo of its own — e.g. the assembler's imgui debug overlay:
+    ///
+    ///     .{ .name = "debug", .repo = "github.com/labelle-toolkit/labelle-assembler",
+    ///        .version = "0.118.0", .subdir = "plugins/debug" },
+    ///
+    /// The archive is still fetched and cached whole at
+    /// `packages/plugins/<repo>/<version>`; only the plugin ROOT moves to
+    /// `<that>/<subdir>`. Empty = the repo root (every entry before #771).
+    /// Remote pins only: a `local:`/`@` repo already names the plugin
+    /// directory itself. Validated by `cache/plugin_subdir.zig`.
+    subdir: []const u8 = "",
     /// Game states this plugin runs in. Empty = all states (plugin default).
     /// Overrides the plugin's own `Systems.game_states` if set.
     states: []const []const u8 = &.{},
@@ -332,8 +368,9 @@ pub const PluginDep = struct {
 
 /// Screen-orientation policy for the mobile platforms.
 ///
-/// The CLI maps these onto `android:screenOrientation` / the iOS
-/// `UISupportedInterfaceOrientations` plist array; this enum only has to
+/// The CLI maps these onto the iOS `UISupportedInterfaceOrientations` plist
+/// array (Android orientation moved to `providers/android.json`, owned by the
+/// labelle-android provider — labelle-cli#405); this enum only has to
 /// *parse* — `project.labelle` is parsed strictly, so a value the CLI knows
 /// and the assembler doesn't fails at generate time before the CLI ever sees
 /// it. Both copies must move together (labelle-cli#341/#342).
@@ -375,42 +412,27 @@ pub const I18nConfig = struct {
     strict: bool = false,
 };
 
+/// The project.labelle `.android` block: ONLY the keys the assembler's
+/// codegen reads (labelle-cli#405, plan decision D4). Every APK-packaging key
+/// (`package_name`, `app_name`, `min_sdk_version`, `orientation`,
+/// `debuggable`, `version_name`, signing, …) lives in `providers/android.json`,
+/// owned by the labelle-android provider; a strict parse that meets one fails
+/// with a "move it" hint (`android_moved_keys.zig`).
 pub const AndroidConfig = struct {
-    app_name: []const u8 = "",
-    package_name: []const u8 = "", // e.g. "com.labelle.mygame"
-    min_sdk_version: u32 = 28, // Android 9 (Pie) — NativeActivity + GLES3
+    /// Load resources from APK assets on acquisition (#763).
+    /// Requires a packager that consumes apk_assets.json and deflates its files.
+    /// Opt-in until labelle-android packaging supports that contract.
+    load_assets_from_apk: bool = false,
+    /// The NDK link level of the generated `build.zig`
+    /// (`manifest_v2_splice/android.zig`). The provider reads its own
+    /// `target_sdk_version` for the APK manifest.
     target_sdk_version: u32 = 34, // Android 14
-    orientation: Orientation = .all,
-    /// Launch the game fullscreen with the status bar and title bar
-    /// hidden, via the built-in `Theme.NoTitleBar.Fullscreen` Android
-    /// framework theme (no custom APK resources required).
-    ///
-    /// Scope: this covers the **status bar** and title bar only. It does
-    /// NOT hide the Android **navigation bar** (the on-screen
-    /// back/home/recents buttons) — true immersive-sticky nav-bar hiding
-    /// requires runtime native code (JNI `WindowInsetsController` calls)
-    /// and is a planned follow-up.
+    /// Launch the game fullscreen. The assembler emits a call to
+    /// labelle-android's `immersive` service into the generated `main.zig`
+    /// (`lifecycle/immersive.zig`; it needs the `android` plugin since
+    /// labelle-engine#902); the labelle-android provider reads the same key
+    /// for the fullscreen theme.
     immersive_mode: bool = false,
-    /// Build the APK `android:debuggable` (labelle-assembler#737).
-    ///
-    /// OPT-IN, off by default — a shipping build must never carry it. Its only
-    /// purpose is on-device VERIFICATION: an activity launched normally inherits
-    /// zygote's environment, so the `LABELLE_*` knobs the desktop path already
-    /// honours (`LABELLE_FIXED_DT`, `LABELLE_SCREENSHOT_PATH`) cannot reach the
-    /// process at all. The platform's `wrap.<package>` property CAN give the
-    /// process a real environment, but it is honoured only for a debuggable app.
-    ///
-    /// With this set, `adb shell setprop wrap.<package> 'LABELLE_FIXED_DT=… '`
-    /// pins the simulation timestep and `LABELLE_SCREENSHOT_PATH` makes the
-    /// engine-owned capture path write a frame the harness can `adb pull` —
-    /// which is what makes two captures at the same simulated time byte-identical.
-    /// Without it, on-device checking falls back to `adb screencap` at wall-clock
-    /// times: a display colour transform on some devices, and ~1s of latency.
-    ///
-    /// The flag only reaches the generated `AndroidManifest.xml` (labelle-cli);
-    /// the generated `main.zig` reads the env vars unconditionally, because on a
-    /// non-debuggable APK they are simply never set.
-    debuggable: bool = false,
 };
 
 pub const LayerSpace = enum { world, screen, screen_fill };
@@ -665,6 +687,19 @@ pub const ResourceDef = struct {
     /// with labelle-cli's `ResourceDef.astc_block`.
     astc_block: ?AstcBlockSize = null,
 
+    /// DERIVED, assembler-internal — never authored (labelle-bgfx#134).
+    /// On a `.wasm` target the ASTC swap (`swapAstcTexturePaths` /
+    /// `preferCompressedPackTextures`) records the atlas's ORIGINAL `.png`
+    /// here when it points `.texture` at the `.astc` sibling: browser ASTC
+    /// support depends on the GPU, so the generated code embeds both and
+    /// picks at runtime (`pickCompressedTexture`, see `resource_loader`).
+    /// Always null off wasm, so an Android APK never carries the PNG.
+    ///
+    /// The typed ZON parse would accept the key, so `generate` rejects (first thing,
+    /// `rejectInternalResourceFields`) a game resource that arrives with it set
+    /// (`error.InternalResourceField`); the pack merge never copies it.
+    texture_fallback: ?[]const u8 = null,
+
     /// Classify which kind of asset this resource declares, based on
     /// which path fields are populated. Returns `.invalid` for empty
     /// or multi-kind entries — call `validate()` for the structured
@@ -731,9 +766,9 @@ pub fn localVersionPath(version: []const u8) []const u8 {
 }
 
 /// Whether `version` looks like a semantic version number — i.e. it starts
-/// with a digit (`1.2.3`, `0.31.0`, `2`). Used to decide how a version maps
-/// to a git ref: semver-shaped versions are published as `v`-prefixed tags
-/// (`v1.2.3`), while anything else is treated as a branch / ref name.
+/// with a digit (`1.2.3`, `0.31.0`, `2`). This is the RELEASE predicate the
+/// version gates compare; the git-ref mapping (`isTagVersion`) also
+/// accepts pre-release/build-suffixed semver (#783).
 pub fn isSemverVersion(version: []const u8) bool {
     // A package release version is digits and dots only, with at least
     // one dot (`1.13.0`, `0.31.0`). "Starts with a digit" was too loose
@@ -763,12 +798,26 @@ pub fn isSemverVersion(version: []const u8) bool {
 /// appending `.0`, and this does the same rather than inventing a second
 /// convention.
 ///
+/// A pre-release or build-suffixed pin (`0.31.0-rc.1`, `2.0.0+ci.5` — a
+/// fetchable tag since #783, see `isTagVersion`) is judged as its
+/// `MAJOR.MINOR.PATCH`: the suffix is dropped. For build metadata that is
+/// the spec (it does not affect precedence). For a pre-release it is the
+/// gates' deliberate choice: as a floor's SUBJECT it can only fire a floor
+/// early (conservative); as a REQUIREMENT, `2.1.0-rc.1` passes a
+/// `>= 2.1.0` floor (permissive, like every other dev pin) while
+/// `2.0.0-rc.1` still fails it.
+///
 /// A dotted string that is still unparsable after padding (`1.2.3.4`, which
 /// `isSemverVersion` also admits) returns `error.UnparsableVersionPin` with
 /// the offending value named — a readable failure instead of the
 /// `catch unreachable` crash this used to take (#683 review).
 pub fn parsePin(version: []const u8) error{UnparsableVersionPin}!std.SemanticVersion {
-    if (std.SemanticVersion.parse(version)) |v| return v else |_| {}
+    if (std.SemanticVersion.parse(version)) |parsed| {
+        var v = parsed;
+        v.pre = null;
+        v.build = null;
+        return v;
+    } else |_| {}
     var buf: [64]u8 = undefined;
     const padded = std.fmt.bufPrint(&buf, "{s}.0", .{version}) catch {
         std.debug.print("version pin '{s}' is too long to normalize\n", .{version});
@@ -902,45 +951,14 @@ test "normalizeRemote/sameRemote fold every spelling of one remote, keep distinc
     try std.testing.expect(!sameRemote("local:github.com/labelle-toolkit/labelle-bgfx", canonical));
 }
 
-/// Map a package `version` string to the git ref to clone.
-///
-/// A semver-shaped version (`1.2.3`) maps to the published release tag
-/// `v1.2.3`. Anything else — `dev`, `main`, a feature-branch name — is a
-/// ref in its own right and is used verbatim. Blindly prepending `v` to a
-/// non-numeric version produced bogus refs like `vdev` that failed deep
-/// inside `git clone` (issue #159).
-///
-/// Returns an allocator-owned slice; the caller frees it.
-pub fn versionToGitRef(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
-    if (isSemverVersion(version)) {
-        return std.fmt.allocPrint(allocator, "v{s}", .{version});
-    }
-    return allocator.dupe(u8, version);
-}
+/// Package `version` → git ref, and the predicate behind it (#159, #783).
+/// See `version_ref.zig`.
+pub const versionToGitRef = version_ref.versionToGitRef;
+pub const isTagVersion = version_ref.isTagVersion;
+const version_ref = @import("version_ref.zig");
 
-test "versionToGitRef: semver versions get a `v` prefix" {
-    const alloc = std.testing.allocator;
-    inline for (.{
-        .{ "1.2.3", "v1.2.3" },
-        .{ "0.31.0", "v0.31.0" },
-        .{ "1.13.0", "v1.13.0" },
-    }) |case| {
-        const ref = try versionToGitRef(alloc, case[0]);
-        defer alloc.free(ref);
-        try std.testing.expectEqualStrings(case[1], ref);
-    }
-}
-
-test "versionToGitRef: non-numeric versions are used verbatim as a ref" {
-    const alloc = std.testing.allocator;
-    // The #159 regression: `dev` must not become `vdev`. Digit-leading
-    // branch refs (`159-fix`, `2026/dev`) must also pass through verbatim
-    // — they are not semver despite the leading digit.
-    inline for (.{ "dev", "main", "feature/foo", "159-fix", "2026/dev" }) |branch| {
-        const ref = try versionToGitRef(alloc, branch);
-        defer alloc.free(ref);
-        try std.testing.expectEqualStrings(branch, ref);
-    }
+test {
+    _ = version_ref;
 }
 
 // ── Per-feature engine-version gates ────────────────────────────────────
@@ -970,12 +988,12 @@ pub const FeatureSupport = enum {
 /// not to punish a deliberate dev setup — such pins come back
 /// `unverifiable`, never `no`.
 pub fn engineFeatureSupport(engine_version: []const u8, comptime min: []const u8) FeatureSupport {
-    // Classify with the repo's own release predicate FIRST: a
-    // digit-leading branch pin like `2.10.0-feature` is resolved verbatim
-    // as a git ref by `versionToGitRef`, yet `SemanticVersion.parse` would
-    // happily read it as a prerelease below the minimum and hard-reject a
-    // dev branch that may well carry the feature (codex round 3 on #650).
-    // Only true release pins are compared.
+    // Classify with the repo's own release predicate FIRST: a pre-release
+    // pin like `2.10.0-feature` (fetched as the tag `v2.10.0-feature`,
+    // #783) sorts below its release, yet a pre-release is how a feature is
+    // used before it ships — comparing it would hard-reject a pin that may
+    // well carry the feature (codex round 3 on #650). Only true release
+    // pins are compared.
     if (!isSemverVersion(engine_version)) return .unverifiable;
     const min_ver = std.SemanticVersion.parse(min) catch unreachable;
     // A release-shaped pin that SemanticVersion cannot parse is the
@@ -1196,7 +1214,12 @@ pub const ProjectConfig = struct {
     width: u32 = 800,
     height: u32 = 600,
     target_fps: u32 = 60,
-    backend: Backend = .raylib,
+    /// The built-in backend tag. OPTIONAL so an ABSENT `.backend` is
+    /// distinguishable from an explicit one: read it through
+    /// `effectiveBackend()`, never directly. An absent `.backend` (and no
+    /// `.backend_package`) resolves to `default_backend` — bgfx since
+    /// 2026-09-27; it was raylib before. See `effectiveBackend`.
+    backend: ?Backend = null,
     /// External graphics backend declared by NAME + package (epic #386 Phase 5,
     /// the open-config seam). When set, the backend is *external*: it is named
     /// and located through the plugin-resolution infra (the registry +
@@ -1335,6 +1358,8 @@ pub const ProjectConfig = struct {
     /// When true, embed scene files into the binary via @embedFile (for release builds).
     /// Plugins — each declares its repo and version. Empty = no plugin deps.
     plugins: []const PluginDep = &.{},
+    /// Provider-owned JSON settings; shared with the CLI project schema.
+    provider_config: []const @import("provider_settings.zig").Entry = &.{},
 
     /// Game states for the state machine. Scripts in `scripts/<state>/` only run
     /// when that state is active. First element is the initial state.
@@ -1451,7 +1476,16 @@ pub const ProjectConfig = struct {
             // `.backend_package` explicitly (<= 0.20.0) rather than ride the
             // default — and cannot own materials (`material_pipeline`
             // rejects that pairing at generate time).
-            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.22.0" },
+            //
+            // 0.30.0 (the default `init` backend since 2026-09-27): bgfx
+            // >= 0.26.0 switches exhaustively over core's material `Blend`
+            // with a `.modulate2x` arm (`materialBlendState`), a tag only
+            // core >= v2.1.0 declares, and pins core 2.1.0 in its
+            // build.zig.zon — so the scaffold trio moved to core 2.1.0 /
+            // engine 3.4.1 / gfx 2.2.0 in the same change, and
+            // `version_floors.bgfx_core_floors` carries the 0.26.0 → 2.1.0
+            // floor.
+            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.30.0" },
             .wgpu => .{ .name = "wgpu", .repo = "github.com/labelle-toolkit/labelle-wgpu", .version = "0.3.0" },
             .null => .{ .name = "null", .repo = "github.com/labelle-toolkit/labelle-null", .version = "0.3.0" },
             .sdl => .{ .name = "sdl", .repo = "github.com/labelle-toolkit/labelle-sdl", .version = "0.3.1" },
@@ -1474,7 +1508,16 @@ pub const ProjectConfig = struct {
             // v1.25.0) and everything it needs from a LATER core carries its own
             // comptime probe, so 0.6.0 compiles against old and new core alike —
             // labelle-sokol's own examples still pin core 1.24.0.
-            .sokol => .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.6.1" },
+            //
+            // 0.7.0 adds only the Android launch-intent `LABELLE_*` extras
+            // (labelle-sokol#26); same core/gfx pins as 0.6.x.
+            //
+            // 0.8.0 adopts labelle-android v0.2.0 (shared AAudio + launch
+            // intent) and the `android` provider flow; its build hook links ONE
+            // `labelle_android` when the project lists the `android` plugin
+            // (cli#405 D11). Same core (1.32.0) / gfx (1.28.1) pins as 0.7.0,
+            // so no `version_floors` entry. Needs assembler >= 0.116.1.
+            .sokol => .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.8.0" },
         };
     }
 
@@ -1486,7 +1529,31 @@ pub const ProjectConfig = struct {
     /// `backend_registry.resolveBackendPackage` all agree on whether a backend
     /// is external and which package it is.
     pub fn effectiveBackendPackage(self: ProjectConfig) ?PluginDep {
-        return self.backend_package orelse builtinProvider(self.backend);
+        return self.backend_package orelse builtinProvider(self.effectiveBackend());
+    }
+
+    /// The backend a project with NO `.backend` key (and no
+    /// `.backend_package`) gets: desktop + bgfx, the same default
+    /// `labelle-assembler init` scaffolds. BREAKING vs. the old implicit
+    /// raylib default — a project that relied on it must add
+    /// `.backend = .raylib`.
+    pub const default_backend: Backend = .bgfx;
+
+    /// The enum tag this config selects. THE accessor for `.backend` —
+    /// every reader goes through it:
+    ///
+    ///   * an explicit `.backend = .<tag>` wins;
+    ///   * absent, with an explicit `.backend_package`: the tag is IGNORED
+    ///     (the package names the backend, #386 Phase 5) and reads as the
+    ///     legacy `.raylib` sentinel, exactly as it did before the default
+    ///     moved — so a third-party provider's `effectiveGamepad` /
+    ///     `isEnumTagBacked` / `material_pipeline.requireBackend` behaviour
+    ///     is unchanged by the default flip;
+    ///   * absent, with no package: `default_backend` (bgfx).
+    pub fn effectiveBackend(self: ProjectConfig) Backend {
+        if (self.backend) |b| return b;
+        if (self.backend_package != null) return .raylib;
+        return default_backend;
     }
 
     /// The canonical backend NAME as a string (e.g. "bgfx").
@@ -1499,7 +1566,7 @@ pub const ProjectConfig = struct {
     /// enum tag that resolves to a provider) it's the provider name.
     pub fn backendName(self: ProjectConfig) []const u8 {
         if (self.effectiveBackendPackage()) |bp| return bp.name;
-        return @tagName(self.backend);
+        return @tagName(self.effectiveBackend());
     }
 
     /// Resolve the effective desktop gamepad source, applying the backend-aware
@@ -1548,7 +1615,7 @@ pub const ProjectConfig = struct {
     /// routes through here so they can never disagree. Never read `.gamepad`
     /// directly.
     pub fn effectiveGamepad(self: ProjectConfig) GamepadSource {
-        return self.gamepad orelse (if (self.backend == .bgfx) .none else .auto);
+        return self.gamepad orelse (if (self.effectiveBackend() == .bgfx) .none else .auto);
     }
 
     /// True when the backend resolves from a PACKAGE (external) rather than the
@@ -1580,7 +1647,7 @@ pub const ProjectConfig = struct {
     /// raylib-shaped wiring. This is the ONE remaining place the enum tag is read
     /// as an *identity*; a non-enum name never consults it.
     pub fn isEnumTagBacked(self: ProjectConfig) bool {
-        return std.mem.eql(u8, self.backendName(), @tagName(self.backend));
+        return std.mem.eql(u8, self.backendName(), @tagName(self.effectiveBackend()));
     }
 
     /// The unset-`.y_axis` build guard (RFC-Y-AXIS-CONVENTION Migration §,
@@ -1775,25 +1842,39 @@ test "effectiveGamepad: bgfx defaults to .none, other backends to .auto, explici
     }
 }
 
-test "AndroidConfig.debuggable is off by default and parses from the android block (#737)" {
-    // Off by default: a shipping APK must never carry `android:debuggable`.
-    try std.testing.expect(!(AndroidConfig{}).debuggable);
+test "AndroidConfig: exactly the three codegen keys parse, with their defaults (labelle-cli#405)" {
     const alloc = std.testing.allocator;
-    const on = try std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, ".{ .package_name = \"com.labelle.t\", .debuggable = true }", null, .{});
-    defer std.zon.parse.free(alloc, on);
-    try std.testing.expect(on.debuggable);
-    // Projects that never mention it keep the release shape.
-    const off = try std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, ".{ .package_name = \"com.labelle.t\" }", null, .{});
-    defer std.zon.parse.free(alloc, off);
-    try std.testing.expect(!off.debuggable);
+    try std.testing.expectEqual(@as(usize, 3), @typeInfo(AndroidConfig).@"struct".fields.len);
+    const d: AndroidConfig = .{};
+    try std.testing.expect(!d.immersive_mode);
+    try std.testing.expect(!d.load_assets_from_apk);
+    try std.testing.expectEqual(@as(u32, 34), d.target_sdk_version);
+
+    const a = try std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, ".{ .immersive_mode = true, .target_sdk_version = 35, .load_assets_from_apk = true }", null, .{});
+    defer std.zon.parse.free(alloc, a);
+    try std.testing.expect(a.immersive_mode);
+    try std.testing.expect(a.load_assets_from_apk);
+    try std.testing.expectEqual(@as(u32, 35), a.target_sdk_version);
 }
 
-test "Orientation: every value parses from ZON on BOTH the android and ios blocks (labelle-cli#341)" {
+test "AndroidConfig: a removed packaging key is a strict parse error (labelle-cli#405)" {
+    const alloc = std.testing.allocator;
+    inline for (.{ "package_name = \"com.labelle.t\"", "app_name = \"G\"", "min_sdk_version = 28", "orientation = .landscape", "debuggable = true" }) |kv| {
+        var diag: std.zon.parse.Diagnostics = .{};
+        defer diag.deinit(alloc);
+        try std.testing.expectError(
+            error.ParseZon,
+            std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, ".{ ." ++ kv ++ " }", &diag, .{}),
+        );
+    }
+}
+
+test "Orientation: every value parses from ZON on the ios block (labelle-cli#341)" {
     // The assembler parses `project.labelle` strictly, so it is the gate: a
     // value the CLI's manifest emitter understands but this enum lacks fails
-    // at generate time, before the CLI is ever reached. Pin all four on both
-    // structs so the two copies of `Orientation` can't drift apart silently.
-    // Arena, not `std.zon.parse.free`: both structs carry `[]const u8` fields
+    // at generate time, before the CLI is ever reached. (Android orientation
+    // moved to providers/android.json, labelle-cli#405.)
+    // Arena, not `std.zon.parse.free`: IosConfig carries `[]const u8` fields
     // that default to a static `""`, and freeing those through the testing
     // allocator aborts on a bad free.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1806,9 +1887,6 @@ test "Orientation: every value parses from ZON on BOTH the android and ios block
         .{ "all", Orientation.all },
     }) |case| {
         const src: [:0]const u8 = ".{ .orientation = ." ++ case[0] ++ " }";
-        const android = try std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, src, null, .{});
-        try std.testing.expectEqual(case[1], android.orientation);
-
         const ios = try std.zon.parse.fromSliceAlloc(IosConfig, alloc, src, null, .{});
         try std.testing.expectEqual(case[1], ios.orientation);
     }
@@ -1816,13 +1894,12 @@ test "Orientation: every value parses from ZON on BOTH the android and ios block
 
 test "Orientation: defaults stay `.all` and an unknown value is a hard parse error" {
     const alloc = std.testing.allocator;
-    try std.testing.expectEqual(Orientation.all, (AndroidConfig{}).orientation);
     try std.testing.expectEqual(Orientation.all, (IosConfig{}).orientation);
 
     var diag: std.zon.parse.Diagnostics = .{};
     defer diag.deinit(alloc);
     try std.testing.expectError(
         error.ParseZon,
-        std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, ".{ .orientation = .sensorLandscape }", &diag, .{}),
+        std.zon.parse.fromSliceAlloc(IosConfig, alloc, ".{ .orientation = .sensorLandscape }", &diag, .{}),
     );
 }

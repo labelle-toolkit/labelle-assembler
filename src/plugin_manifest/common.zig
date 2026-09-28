@@ -2,14 +2,15 @@
 //! `plugin_manifest.zig` (behavior-preserving split, mirrors #539).
 //!
 //! Both the `plugin.labelle` (`plugin.zig`) and `pack.labelle`
-//! (`pack.zig`) paths depend on these — the supported-version gate, the
+//! (`pack.zig`) paths depend on these — independent version gates, the
 //! reserved convention-dir names, and the reserved/safe name checks.
 //! Re-exported unchanged from the `plugin_manifest.zig` barrel.
 const std = @import("std");
 
-/// Highest manifest_version this CLI release understands. Bump when
-/// adding a new field that older CLIs cannot safely ignore.
+/// Highest pack manifest_version understood by the assembler.
 pub const SUPPORTED_MANIFEST_VERSION: u8 = 1;
+/// Plugin v2 adds CLI-owned provider declarations; pack schema stays at v1.
+pub const SUPPORTED_PLUGIN_MANIFEST_VERSION: u8 = 2;
 
 /// Reserved convention directory names. A plugin manifest may not
 /// declare any of these — they are owned by the hardcoded copy/scan

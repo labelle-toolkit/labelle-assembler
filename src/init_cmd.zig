@@ -38,6 +38,16 @@ fn writeStderr(io: std.Io, msg: []const u8) void {
     std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
 }
 
+/// The backend a bare `labelle-assembler init <name>` scaffolds. Named so
+/// the help text, `InitOptions`, and the tests share one literal.
+pub const DEFAULT_BACKEND = "bgfx";
+
+comptime {
+    // A typo here would scaffold a project no later command can parse.
+    if (std.meta.stringToEnum(config.Backend, DEFAULT_BACKEND) == null)
+        @compileError("init DEFAULT_BACKEND is not a config.Backend tag");
+}
+
 const init_usage =
     \\labelle-assembler init — scaffold a new project directory
     \\
@@ -49,7 +59,7 @@ const init_usage =
     \\layout, a scenes/main.jsonc, and a .gitignore.
     \\
     \\Flags:
-    \\  --backend=X            Graphics backend (default raylib)
+    \\  --backend=X            Graphics backend (default bgfx)
     \\  --ecs=X                ECS choice (default zig_ecs)
     \\  --gui=X                GUI plugin path (default none)
     \\  --core-version=X       Pin labelle-core version
@@ -68,7 +78,12 @@ pub const InitOptions = struct {
     name: []const u8,
     /// Target directory; defaults to `name` when the caller leaves it null.
     dir: ?[]const u8 = null,
-    backend: []const u8 = "raylib",
+    /// Desktop + bgfx is the default new project (2026-09-27). Desktop is
+    /// the core CLI's own host, so the default proposes no provider
+    /// (web/android); the backend resolves through
+    /// `ProjectConfig.builtinProvider(.bgfx)`. `--backend=raylib` (or any
+    /// other tag) still selects the old choice explicitly.
+    backend: []const u8 = DEFAULT_BACKEND,
     ecs: []const u8 = "zig_ecs",
     gui: ?[]const u8 = null,
     core_version: []const u8 = gen.CORE_VERSION,
@@ -80,10 +95,20 @@ pub const InitOptions = struct {
     assembler_version: []const u8 = gen.ASSEMBLER_VERSION,
 };
 
-/// `init` subcommand entry point. Parses argv, then delegates to
-/// `scaffold`. Exits non-zero on a bad invocation; `scaffold` exits
-/// non-zero on a filesystem failure.
-pub fn cmdInit(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+/// What `parseArgs` made of argv. Split from `cmdInit` so the parsed
+/// options (the defaults included) are testable without an
+/// `Args.Iterator` or a process exit.
+pub const ParseResult = union(enum) {
+    opts: InitOptions,
+    help,
+    unknown_flag: []const u8,
+    unexpected_argument: []const u8,
+    missing_name,
+};
+
+/// Parse `init`'s argv (after the subcommand) from any iterator with a
+/// `next() ?[]const u8`-shaped method. Pure: no I/O, no exit.
+pub fn parseArgs(args: anytype) ParseResult {
     var name: ?[]const u8 = null;
     var opts: InitOptions = .{ .name = "" };
 
@@ -105,26 +130,46 @@ pub fn cmdInit(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args
         } else if (std.mem.startsWith(u8, arg, "--assembler-version=")) {
             opts.assembler_version = arg["--assembler-version=".len..];
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            writeStderr(io, init_usage);
-            return;
+            return .help;
         } else if (std.mem.startsWith(u8, arg, "--")) {
-            std.log.err("labelle-assembler init: unknown flag '{s}'", .{arg});
-            std.process.exit(2);
+            return .{ .unknown_flag = arg };
         } else if (name == null) {
             name = arg;
         } else if (opts.dir == null) {
             opts.dir = arg;
         } else {
-            std.log.err("labelle-assembler init: unexpected argument '{s}'", .{arg});
-            writeStderr(io, "\n" ++ init_usage);
-            std.process.exit(2);
+            return .{ .unexpected_argument = arg };
         }
     }
 
-    opts.name = name orelse {
-        std.log.err("labelle-assembler init: missing project name", .{});
-        writeStderr(io, "\n" ++ init_usage);
-        std.process.exit(2);
+    opts.name = name orelse return .missing_name;
+    return .{ .opts = opts };
+}
+
+/// `init` subcommand entry point. Parses argv, then delegates to
+/// `scaffold`. Exits non-zero on a bad invocation; `scaffold` exits
+/// non-zero on a filesystem failure.
+pub fn cmdInit(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const opts: InitOptions = switch (parseArgs(args)) {
+        .opts => |o| o,
+        .help => {
+            writeStderr(io, init_usage);
+            return;
+        },
+        .unknown_flag => |arg| {
+            std.log.err("labelle-assembler init: unknown flag '{s}'", .{arg});
+            std.process.exit(2);
+        },
+        .unexpected_argument => |arg| {
+            std.log.err("labelle-assembler init: unexpected argument '{s}'", .{arg});
+            writeStderr(io, "\n" ++ init_usage);
+            std.process.exit(2);
+        },
+        .missing_name => {
+            std.log.err("labelle-assembler init: missing project name", .{});
+            writeStderr(io, "\n" ++ init_usage);
+            std.process.exit(2);
+        },
     };
 
     // #736 review (CodeRabbit): refuse a backend name the `Backend` enum does
@@ -584,4 +629,162 @@ test "scaffold writes a parseable project.labelle for a name with a quote" {
     const cfg = try std.zon.parse.fromSliceAlloc(config.ProjectConfig, arena.allocator(), src, null, .{});
     try std.testing.expectEqualStrings("ev\"il\\game", cfg.name);
     try std.testing.expectEqualStrings("1.0\"0", cfg.core_version);
+}
+
+// ── default backend: desktop + bgfx (2026-09-27) ─────────────────────
+
+/// A `parseArgs` iterator over a fixed argv slice.
+const SliceArgs = struct {
+    items: []const []const u8,
+    i: usize = 0,
+    fn next(self: *SliceArgs) ?[]const u8 {
+        if (self.i >= self.items.len) return null;
+        defer self.i += 1;
+        return self.items[self.i];
+    }
+};
+
+fn parseSlice(argv: []const []const u8) ParseResult {
+    var it: SliceArgs = .{ .items = argv };
+    return parseArgs(&it);
+}
+
+test "init with no --backend parses to bgfx; --backend=raylib still parses to raylib" {
+    // The mechanism: the PARSED options carry the backend, through the same
+    // `parseArgs` `cmdInit` runs — not just the struct field default.
+    const bare = parseSlice(&.{"foo"});
+    try std.testing.expect(bare == .opts);
+    try std.testing.expectEqualStrings("bgfx", bare.opts.backend);
+    try std.testing.expectEqualStrings("foo", bare.opts.name);
+    try std.testing.expect(bare.opts.dir == null);
+    try std.testing.expectEqual(config.Backend.bgfx, try checkBackendName(bare.opts.backend));
+
+    const explicit = parseSlice(&.{ "foo", "--backend=raylib", "dir" });
+    try std.testing.expect(explicit == .opts);
+    try std.testing.expectEqualStrings("raylib", explicit.opts.backend);
+    try std.testing.expectEqualStrings("dir", explicit.opts.dir.?);
+    try std.testing.expectEqual(config.Backend.raylib, try checkBackendName(explicit.opts.backend));
+
+    // The help text advertises the same default.
+    try std.testing.expect(std.mem.indexOf(u8, init_usage, "(default " ++ DEFAULT_BACKEND ++ ")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, init_usage, "default raylib") == null);
+}
+
+test "parseArgs reports help, unknown flags, stray args and a missing name" {
+    try std.testing.expect(parseSlice(&.{"--help"}) == .help);
+    try std.testing.expect(parseSlice(&.{ "foo", "-h" }) == .help);
+    try std.testing.expectEqualStrings("--bogus", parseSlice(&.{ "foo", "--bogus" }).unknown_flag);
+    try std.testing.expectEqualStrings("c", parseSlice(&.{ "a", "b", "c" }).unexpected_argument);
+    try std.testing.expect(parseSlice(&.{}) == .missing_name);
+    try std.testing.expect(parseSlice(&.{"--backend=bgfx"}) == .missing_name);
+}
+
+test "the default bgfx backend passes the backend/core and trio floors with the default pins" {
+    // The builtin bgfx provider carries real core floors (compile breaks
+    // below core 2.0.0 for bgfx >= 0.21.0); the new default must clear
+    // every one of them with the scaffold's own core, or a bare `init`
+    // would refuse to run.
+    const bare = parseSlice(&.{"foo"}).opts;
+    const provider = config.ProjectConfig.builtinProvider(.bgfx) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try config.pinAtLeast(provider.version, "0.21.0")); // the floors are live, not vacuous
+    try std.testing.expectEqual(@as(?FloorViolation, null), try backendCoreFloorViolation(bare.backend, bare.core_version));
+    try std.testing.expectEqual(@as(?TrioViolation, null), try trioFloorViolation(bare.core_version, bare.engine_version, bare.gfx_version));
+    // Control: the same check DOES fire for bgfx below its hard floor.
+    const low = (try backendCoreFloorViolation(bare.backend, "1.26.0")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(FloorSeverity.compile_break, low.severity);
+}
+
+test "scaffold with the default options writes `.backend = .bgfx` (golden)" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = config.globalIo();
+
+    try tmp.dir.createDirPath(io, "init-default");
+    const project_dir = try tmp.dir.realPathFileAlloc(io, "init-default", alloc);
+    defer alloc.free(project_dir);
+
+    var opts = parseSlice(&.{"init-default"}).opts;
+    opts.dir = project_dir;
+    try scaffold(alloc, io, opts);
+
+    const labelle = try tmp.dir.readFileAlloc(io, "init-default/project.labelle", alloc, .limited(4096));
+    defer alloc.free(labelle);
+
+    // Golden: the whole scaffolded project.labelle. Versions come from this
+    // build's pins so a release stamp does not break it; everything else is
+    // byte-exact. Desktop + bgfx: no provider (web/android), no
+    // `.backend_package` — the tag resolves through `builtinProvider`.
+    const expected = try std.fmt.allocPrint(alloc,
+        \\.{{
+        \\    .name = "init-default",
+        \\    .title = "init-default",
+        \\    .width = 800,
+        \\    .height = 600,
+        \\    .target_fps = 60,
+        \\    .backend = .bgfx,
+        \\    // Logical Y-axis convention (RFC-Y-AXIS-CONVENTION). `.down` is
+        \\    // the screen-native default for new projects (y=0 at the top,
+        \\    // +Y down); use `.up` for the math-/platformer-natural bottom
+        \\    // origin. This key is REQUIRED — an absent `.y_axis` is a hard
+        \\    // build error during the convention transition.
+        \\    .y_axis = .down,
+        \\    .ecs = .zig_ecs,
+        \\    .plugins = .{{}},
+        \\    .layers = .{{
+        \\        .{{ .name = "background", .order = 0, .space = .screen }},
+        \\        .{{ .name = "world", .order = 1, .space = .world }},
+        \\        .{{ .name = "ui", .order = 2, .space = .screen }},
+        \\    }},
+        \\    .core_version = "{s}",
+        \\    .engine_version = "{s}",
+        \\    .gfx_version = "{s}",
+        \\    .labelle_version = "{s}",
+        \\    .assembler_version = "{s}",
+        \\}}
+        \\
+    , .{ gen.CORE_VERSION, gen.ENGINE_VERSION, gen.GFX_VERSION, gen.CLI_VERSION, gen.ASSEMBLER_VERSION });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, labelle);
+
+    // And it parses back to the bgfx tag, which resolves to the builtin
+    // bgfx provider package (the mechanism the generator uses).
+    const src = try alloc.dupeZ(u8, labelle);
+    defer alloc.free(src);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const cfg = try std.zon.parse.fromSliceAlloc(config.ProjectConfig, arena.allocator(), src, null, .{});
+    try std.testing.expectEqual(config.Backend.bgfx, cfg.backend.?);
+    try std.testing.expect(cfg.backend_package == null);
+    try std.testing.expectEqualStrings("bgfx", cfg.backendName());
+}
+
+test "scaffold with --backend=raylib writes `.backend = .raylib`" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = config.globalIo();
+
+    try tmp.dir.createDirPath(io, "init-raylib");
+    const project_dir = try tmp.dir.realPathFileAlloc(io, "init-raylib", alloc);
+    defer alloc.free(project_dir);
+
+    var opts = parseSlice(&.{ "init-raylib", "--backend=raylib" }).opts;
+    opts.dir = project_dir;
+    try scaffold(alloc, io, opts);
+
+    const labelle = try tmp.dir.readFileAlloc(io, "init-raylib/project.labelle", alloc, .limited(4096));
+    defer alloc.free(labelle);
+
+    const src = try alloc.dupeZ(u8, labelle);
+    defer alloc.free(src);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const cfg = try std.zon.parse.fromSliceAlloc(config.ProjectConfig, arena.allocator(), src, null, .{});
+    try std.testing.expectEqual(config.Backend.raylib, cfg.backend.?);
+    try std.testing.expect(std.mem.indexOf(u8, labelle, ".backend = .raylib,") != null);
 }

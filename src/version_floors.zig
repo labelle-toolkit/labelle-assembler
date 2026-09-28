@@ -91,7 +91,20 @@ const BackendCoreFloor = struct {
 /// `MATERIAL_CONTRACT_VERSION == 2`; core 2.0.0 is the release that
 /// declares both. The scaffold trio (core 2.0.0 / gfx 2.0.0 / engine
 /// 3.0.0) and this default moved together for that reason.
+///
+/// bgfx >= 0.26.0 floors core >= 2.1.0 — a COMPILE break: the material
+/// submit path (`materialBlendState`) switches exhaustively over core's
+/// shader-material `Blend` with a `.modulate2x` arm, a tag only core
+/// >= 2.1.0 declares (labelle-bgfx#137; the backend's build.zig.zon pins
+/// core 2.1.0 from 0.26.0 on). The builtin provider default is 0.30.0 and
+/// the scaffold trio's core is 2.1.0 — they move together.
 const bgfx_core_floors = [_]BackendCoreFloor{
+    .{
+        .backend_at_least = "0.26.0",
+        .core_at_least = "2.1.0",
+        .severity = .compile_break,
+        .why = "the backend's material blend switch names core's `Blend.modulate2x`, which only core >= 2.1.0 declares — it fails to compile",
+    },
     .{
         .backend_at_least = "0.21.0",
         .core_at_least = "2.0.0",
@@ -163,7 +176,7 @@ fn providerCoreFloorViolation(backend: config.Backend, backend_version: []const 
         .bgfx => &bgfx_core_floors,
         else => return null,
     };
-    if (!config.isSemverVersion(core_version)) return null;
+    if (!config.isTagVersion(core_version)) return null;
 
     var worst: ?FloorViolation = null;
     for (floors) |f| {
@@ -347,8 +360,8 @@ pub const TrioViolation = struct {
 /// compile break beats a curated floor; among equals the first (strictest)
 /// wins.
 ///
-/// A pin that is not a release version (`local:…`, a branch name) is
-/// resolved elsewhere and cannot be compared, so the rules that READ it are
+/// A pin that is not a version (`local:…`, a branch name; `isTagVersion`)
+/// is resolved elsewhere and cannot be compared, so the rules that READ it are
 /// skipped — but ONLY those (#746 review). A blanket early return on any
 /// unparseable pin suppressed every rule in the table, including rules whose
 /// subject and requirement are both known releases: `core_version =
@@ -364,8 +377,8 @@ pub fn trioFloorViolation(core_version: []const u8, engine_version: []const u8, 
         // This rule's own two pins. A rule is decidable iff BOTH are
         // release-shaped; the third pin is only ever quoted in the
         // diagnostic and never compared.
-        if (!config.isSemverVersion(v.pinOf(f.subject))) continue;
-        if (!config.isSemverVersion(v.pinOf(f.requires))) continue;
+        if (!config.isTagVersion(v.pinOf(f.subject))) continue;
+        if (!config.isTagVersion(v.pinOf(f.requires))) continue;
         if (!try pinAtLeast(v.pinOf(f.subject), f.subject_at_least)) continue;
         if (try pinAtLeast(v.pinOf(f.requires), f.floor)) continue;
         if (worst == null or (f.severity == .compile_break and worst.?.floor.severity != .compile_break)) worst = v;
@@ -410,7 +423,9 @@ test "the 2.x core line floors an OLD engine/gfx pinned under it — #742" {
     // The exact command that survived the front-door proof: BOTH overrides
     // explicit, the core left at its 2.0.0 default. Every pre-#742 rule
     // keyed off a NEW gfx or engine, so this scaffolded clean.
-    const v = (try trioFloorViolation(config.CORE_VERSION, "2.12.2", "1.30.1")) orelse return error.TestUnexpectedResult;
+    // (The core default has since moved to 2.1.0; the 2.0.0 literal keeps
+    // the exact pre-#742 command.)
+    const v = (try trioFloorViolation("2.0.0", "2.12.2", "1.30.1")) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(FloorSeverity.compile_break, v.severity());
     try std.testing.expectEqual(TrioPackage.core, v.floor.subject);
     try std.testing.expectEqual(TrioPackage.engine, v.floor.requires);
@@ -500,14 +515,16 @@ pub fn isOfficialProvider(bp: config.PluginDep) bool {
 /// explicit `.backend_package` when there is one, else the builtin provider
 /// the `.backend` enum tag is shorthand for — and `init` has no
 /// `--backend-package` flag, so an explicit package is only ever seen here
-/// (#739). A non-official provider and a non-release pin are left alone.
+/// (#739). A non-official provider and a pin that is not a version
+/// (`local:`, a branch) are left alone; a pre-release/build-suffixed pin is
+/// judged as its `MAJOR.MINOR.PATCH` (`config.parsePin`, #783).
 ///
 /// The floor TABLE is chosen by the backend the PACKAGE identifies, never
 /// by `cfg.backend` — see `officialBackendOf`.
 pub fn configBackendCoreFloorViolation(cfg: config.ProjectConfig) error{UnparsableVersionPin}!?FloorViolation {
     const bp = cfg.effectiveBackendPackage() orelse return null;
     const backend = officialBackendOf(bp) orelse return null;
-    if (!config.isSemverVersion(bp.version)) return null;
+    if (!config.isTagVersion(bp.version)) return null;
     return providerCoreFloorViolation(backend, bp.version, cfg.core_version);
 }
 
@@ -618,12 +635,14 @@ pub fn enforce(cfg: config.ProjectConfig, ctx: []const u8) EnforceError!void {
 }
 
 test "the resolved-config gate judges an explicit .backend_package init can never see — #739" {
+    // The curated set: the builtin bgfx provider (0.30.0) hard-floors core
+    // >= 2.1.0, so `base` rides the scaffold trio rather than a literal.
     const base: config.ProjectConfig = .{
         .name = "g",
         .backend = .bgfx,
-        .core_version = "2.0.0",
-        .engine_version = "3.0.0",
-        .gfx_version = "2.0.0",
+        .core_version = config.CORE_VERSION,
+        .engine_version = config.ENGINE_VERSION,
+        .gfx_version = config.GFX_VERSION,
     };
 
     // The BUILTIN provider (no `.backend_package`): the enum-as-shorthand
@@ -635,7 +654,7 @@ test "the resolved-config gate judges an explicit .backend_package init can neve
     builtin_old_core.gfx_version = "1.30.1";
     const v = (try configBackendCoreFloorViolation(builtin_old_core)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(FloorSeverity.compile_break, v.severity);
-    try std.testing.expectEqualStrings("2.0.0", v.core_floor);
+    try std.testing.expectEqualStrings("2.1.0", v.core_floor);
     try std.testing.expect((try verdict(builtin_old_core)).refused());
     // ...and the trio ITSELF is coherent there, so the refusal comes from
     // the backend table, not the trio one (assert which path ran).
@@ -729,7 +748,7 @@ test "init refuses --engine-version=2.12.2 under the 2.0.0 core/gfx defaults wit
     try std.testing.expectEqual(TrioPackage.engine, v.floor.requires);
     try std.testing.expectEqualStrings("3.0.0", v.floor.floor);
     const msg = v.describe(&buf);
-    try std.testing.expect(std.mem.startsWith(u8, msg, "labelle-gfx 2.0.0 requires labelle-engine >= 3.0.0; got core 2.0.0 / engine 2.12.2 / gfx 2.0.0 ("));
+    try std.testing.expect(std.mem.startsWith(u8, msg, "labelle-gfx " ++ config.GFX_VERSION ++ " requires labelle-engine >= 3.0.0; got core " ++ config.CORE_VERSION ++ " / engine 2.12.2 / gfx " ++ config.GFX_VERSION ++ " ("));
     try std.testing.expect(std.mem.indexOf(u8, msg, "PixelWater") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "Pass --engine-version=" ++ config.ENGINE_VERSION) != null);
 
@@ -797,7 +816,8 @@ test "curated-trio floors reject each incoherent combination — #683 review" {
     // The floors themselves, against synthetic trios: the test above can
     // only ever see whatever `build.zig` defaults to today, so without
     // these a floor could be silently dropped and still go green.
-    try checkTrioFloors("2.0.0", "3.0.0", "2.0.0"); // the current curated set (PR #733)
+    try checkTrioFloors("2.1.0", "3.4.1", "2.2.0"); // the current curated set (init defaults to bgfx)
+    try checkTrioFloors("2.0.0", "3.0.0", "2.0.0"); // the PR #733 curated set — still coherent
     try checkTrioFloors("1.32.0", "2.12.2", "1.30.1"); // the #736 curated set — still coherent
     try checkTrioFloors("1.28.0", "2.12.2", "1.30.1"); // the pre-#731 curated set — still coherent
 
@@ -840,8 +860,24 @@ test "scaffold core default pairs with the builtin bgfx provider — #731 review
     try checkBgfxProviderFloors(config.CORE_VERSION, bgfx.version);
 }
 
+test "builtin sokol 0.8.0 carries no core floor — same core/gfx pins as 0.7.0" {
+    // labelle-sokol v0.8.0 only adds labelle-android v0.2.0; its build.zig.zon
+    // keeps core 1.32.0 / gfx 1.28.1 and its material seam is probe-gated from
+    // core 1.25.0 up, so neither the scaffold core nor an older pin is floored.
+    const sokol = config.ProjectConfig.builtinProvider(.sokol) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("0.8.0", sokol.version);
+    try std.testing.expect((try backendCoreFloorViolation("sokol", config.CORE_VERSION)) == null);
+    try std.testing.expect((try backendCoreFloorViolation("sokol", "1.32.0")) == null);
+}
+
 test "bgfx-provider floors reject the #731 pairings" {
-    try checkBgfxProviderFloors("2.0.0", "0.21.0"); // the curated pairing (PR #733)
+    try checkBgfxProviderFloors("2.1.0", "0.30.0"); // the curated pairing (init defaults to bgfx)
+    try checkBgfxProviderFloors("2.1.0", "0.26.0"); // the first provider on the 2.1.0 floor
+    try checkBgfxProviderFloors("2.0.0", "0.25.2"); // the last provider below it — still coherent
+    try checkBgfxProviderFloors("2.0.0", "0.21.0"); // the PR #733 curated pairing — still coherent
+    // bgfx >= 0.26.0 names core's `Blend.modulate2x`: core 2.0.0 is a compile break.
+    try std.testing.expectError(error.TestUnexpectedResult, checkBgfxProviderFloors("2.0.0", "0.26.0"));
+    try std.testing.expectError(error.TestUnexpectedResult, checkBgfxProviderFloors("2.0.0", "0.30.0"));
     try checkBgfxProviderFloors("1.32.0", "0.20.0"); // the #736 curated pairing — still coherent
     // bgfx >= 0.21.0 is contract-v2: the hard floor is core 2.0.0, so the
     // #736 core is rejected under the new provider default.
@@ -856,7 +892,7 @@ test "bgfx-provider floors reject the #731 pairings" {
     try checkBgfxProviderFloors("1.26.0", "0.13.1");
 }
 
-test "init refuses --backend=bgfx --core-version=1.26.0 with a named diagnostic, accepts 2.0.0 — #736 review" {
+test "init refuses --backend=bgfx --core-version=1.26.0 with a named diagnostic, accepts 2.1.0 — #736 review" {
     const bgfx = config.ProjectConfig.builtinProvider(.bgfx) orelse return error.TestUnexpectedResult;
     var buf: [512]u8 = undefined;
     var want_buf: [128]u8 = undefined;
@@ -864,23 +900,29 @@ test "init refuses --backend=bgfx --core-version=1.26.0 with a named diagnostic,
     // The front-door failure: the hard floor is the one reported (it is the
     // actionable one), the diagnostic names backend + REAL provider version,
     // the floor, the requested core, and recommends the curated core. Under
-    // the contract-v2 default (bgfx 0.21.0, PR #733) the strictest hard
-    // floor is core 2.0.0 and every 1.x core trips it.
+    // the default provider (bgfx 0.30.0) the strictest hard floor is core
+    // 2.1.0 (`Blend.modulate2x`, bgfx >= 0.26.0) and every older core trips it.
     const v = (try backendCoreFloorViolation("bgfx", "1.26.0")) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(FloorSeverity.compile_break, v.severity);
-    try std.testing.expectEqualStrings("2.0.0", v.core_floor);
-    try std.testing.expectEqualStrings("2.0.0", v.recommended_core);
+    try std.testing.expectEqualStrings("2.1.0", v.core_floor);
+    try std.testing.expectEqualStrings("2.1.0", v.recommended_core);
     const msg = v.describe(&buf);
-    const want = try std.fmt.bufPrint(&want_buf, "bgfx {s} requires labelle-core >= 2.0.0; got 1.26.0 (", .{bgfx.version});
+    const want = try std.fmt.bufPrint(&want_buf, "bgfx {s} requires labelle-core >= 2.1.0; got 1.26.0 (", .{bgfx.version});
     try std.testing.expect(std.mem.startsWith(u8, msg, want));
-    try std.testing.expect(std.mem.indexOf(u8, msg, "shader_material") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "--core-version=2.0.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "modulate2x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "--core-version=2.1.0") != null);
 
     // The #736 curated core is now a compile break too (not a warning): the
     // default provider no longer compiles on it.
     const c = (try backendCoreFloorViolation("bgfx", "1.32.0")) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(FloorSeverity.compile_break, c.severity);
-    try std.testing.expectEqualStrings("2.0.0", c.core_floor);
+    try std.testing.expectEqualStrings("2.1.0", c.core_floor);
+    // ...and so is the PR #733 curated core 2.0.0 under the 0.30.0 default:
+    // it predates `Blend.modulate2x`.
+    const v2 = (try backendCoreFloorViolation("bgfx", "2.0.0")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(FloorSeverity.compile_break, v2.severity);
+    try std.testing.expectEqualStrings("2.1.0", v2.core_floor);
+    try std.testing.expect(std.mem.indexOf(u8, v2.describe(&buf), "modulate2x") != null);
 
     // The CURATED (warn-and-scaffold) severity still exists for the older
     // provider: bgfx 0.20.0 over core 1.28.0 builds, so it is a WARNING.
@@ -892,7 +934,7 @@ test "init refuses --backend=bgfx --core-version=1.26.0 with a named diagnostic,
     try std.testing.expect(std.mem.indexOf(u8, wmsg, "requires") == null);
 
     // Accepted: the curated core, the scaffold's own default, and anything newer.
-    try std.testing.expect((try backendCoreFloorViolation("bgfx", "2.0.0")) == null);
+    try std.testing.expect((try backendCoreFloorViolation("bgfx", "2.1.0")) == null);
     try std.testing.expect((try backendCoreFloorViolation("bgfx", config.CORE_VERSION)) == null);
     try std.testing.expect((try backendCoreFloorViolation("bgfx", "2.1")) == null);
 
@@ -925,4 +967,90 @@ test "pinAtLeast normalizes the abbreviated `X.Y` pin form, and names a bad one 
 
     // And an abbreviated pin flows through the real guard.
     try checkTrioFloors("1.28", "2.13", "1.30");
+}
+
+// ── absent `.backend` defaults to bgfx (2026-09-27) ──────────────────
+
+test "a project.labelle with NO .backend resolves to bgfx and the builtin bgfx 0.30.0 package" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    // Parse a real project.labelle source with the key absent, so the test
+    // covers the ZON default and not just a struct literal.
+    const src: [:0]const u8 =
+        \\.{ .name = "g", .y_axis = .down, .core_version = "2.1.0", .engine_version = "3.4.1", .gfx_version = "2.2.0" }
+    ;
+    const cfg = try std.zon.parse.fromSliceAlloc(config.ProjectConfig, arena.allocator(), src, null, .{});
+
+    // Mechanism: the key really is ABSENT (null), and it is
+    // `effectiveBackend`'s no-package branch that picks bgfx — not an
+    // explicit tag and not the `.backend_package` sentinel branch.
+    try std.testing.expect(cfg.backend == null);
+    try std.testing.expect(cfg.backend_package == null);
+    try std.testing.expectEqual(config.ProjectConfig.default_backend, cfg.effectiveBackend());
+    try std.testing.expectEqual(config.Backend.bgfx, cfg.effectiveBackend());
+
+    // ...and it resolves to the builtin official bgfx provider at 0.30.0.
+    const bp = cfg.effectiveBackendPackage() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("bgfx", bp.name);
+    try std.testing.expectEqualStrings("github.com/labelle-toolkit/labelle-bgfx", bp.repo);
+    try std.testing.expectEqualStrings("0.30.0", bp.version);
+    try std.testing.expectEqual(config.Backend.bgfx, officialBackendOf(bp).?);
+    try std.testing.expectEqualStrings("bgfx", cfg.backendName());
+    try std.testing.expect(cfg.isEnumTagBacked());
+    // bgfx's gamepad default applies (no SDL pulled in).
+    try std.testing.expectEqual(config.GamepadSource.none, cfg.effectiveGamepad());
+    // The curated set passes the gate clean.
+    try std.testing.expect(!(try verdict(cfg)).refused());
+    try std.testing.expect(!(try verdict(cfg)).warned());
+
+    // Controls: an explicit `.backend = .raylib` still selects raylib, and
+    // an explicit `.backend_package` with no `.backend` keeps the legacy
+    // (ignored) `.raylib` sentinel — the default flip does not touch
+    // package-selected backends.
+    const ray: config.ProjectConfig = .{ .name = "g", .backend = .raylib };
+    try std.testing.expectEqual(config.Backend.raylib, ray.effectiveBackend());
+    try std.testing.expectEqualStrings("raylib", ray.backendName());
+    const pkg: config.ProjectConfig = .{ .name = "g", .backend_package = .{ .name = "acme_foo", .repo = "github.com/acme/foo", .version = "0.1.0" } };
+    try std.testing.expectEqual(config.Backend.raylib, pkg.effectiveBackend());
+    try std.testing.expectEqualStrings("acme_foo", pkg.backendName());
+    try std.testing.expect(!pkg.isEnumTagBacked());
+    try std.testing.expectEqual(config.GamepadSource.auto, pkg.effectiveGamepad());
+}
+
+test "a project with NO .backend and a core below bgfx's floor is refused with a named diagnostic" {
+    // BREAKING for projects that relied on the implicit raylib default: the
+    // same file now resolves to bgfx 0.30.0, whose hard floor is core 2.1.0.
+    // `generate`/`check` run `enforce`, which must refuse BEFORE the build
+    // with a message naming bgfx, the floor, and the fix — not let the
+    // project die in the backend's material switch.
+    const cfg: config.ProjectConfig = .{
+        .name = "g",
+        .core_version = "2.0.0",
+        .engine_version = "3.0.1",
+        .gfx_version = "2.0.0",
+    };
+    try std.testing.expect(cfg.backend == null);
+    const vd = try verdict(cfg);
+    try std.testing.expect(vd.refused());
+    // WHICH table refused: the backend one (the 2.0.0 trio itself is coherent).
+    try std.testing.expect(vd.trio == null);
+    const v = vd.backend orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(FloorSeverity.compile_break, v.severity);
+    try std.testing.expectEqualStrings("bgfx", v.backend);
+    try std.testing.expectEqualStrings("0.30.0", v.backend_version);
+    try std.testing.expectEqualStrings("2.1.0", v.core_floor);
+    var buf: [512]u8 = undefined;
+    const msg = v.describe(&buf);
+    try std.testing.expect(std.mem.startsWith(u8, msg, "bgfx 0.30.0 requires labelle-core >= 2.1.0; got 2.0.0 ("));
+    try std.testing.expect(std.mem.indexOf(u8, msg, "--core-version=2.1.0") != null);
+    // (`enforce` is `verdict` + the log line; calling it here would log an
+    // error, which the test runner counts as a failure.)
+
+    // The same pins with `.backend = .raylib` added — the migration the
+    // release notes tell such projects to make — pass.
+    var ray = cfg;
+    ray.backend = .raylib;
+    try std.testing.expect(!(try verdict(ray)).refused());
 }

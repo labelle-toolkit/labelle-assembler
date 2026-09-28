@@ -72,6 +72,9 @@
 
 const std = @import("std");
 const config = @import("config.zig");
+const provider_settings = @import("provider_settings.zig");
+const android_moved_keys = @import("android_moved_keys.zig");
+const target_keys = @import("target_keys.zig");
 
 // ============================================================================
 // Types
@@ -432,20 +435,68 @@ fn extractParamsBags(gpa: std.mem.Allocator, source: [:0]const u8) !?ExtractedBa
 /// parser's owned unexpected-field note is never freed (a std.zon quirk
 /// already noted in `config.zig`'s `PluginDep` tests).
 fn parseTyped(gpa: std.mem.Allocator, source: [:0]const u8) !config.ProjectConfig {
+    // `.asset_compression` accepts any identifier key (labelle-cli#471 P1):
+    // keys naming no target of this assembler are blanked before the strict
+    // parse, offsets and lines preserved, so every diagnostic still points at
+    // the user's file. `generate` warns about them once
+    // (`target_keys.logWarnings`); every other reader parses silently. The
+    // stripped copy outlives `diag`, whose AST points into it.
+    const stripped = try target_keys.stripUnknown(gpa, source);
+    defer if (stripped) |s| gpa.free(s);
+    var diag: std.zon.parse.Diagnostics = .{};
+    defer diag.deinit(gpa);
+    return parseTypedDiag(gpa, stripped orelse source, &diag) catch |err| switch (err) {
+        error.ParseZon => {
+            // `warn`, not `err`: this is the DETAIL of a failure the command
+            // layer reports as an error (naming the file and the error). Logging
+            // it at `.err` here would also fail every test that deliberately
+            // parses a malformed config — Zig's test runner fails any test that
+            // logs an error.
+            std.log.warn("project.labelle: {f}", .{&diag});
+            return err;
+        },
+        else => return err,
+    };
+}
+
+/// The parse behind `parseTyped`, taking the caller's `Diagnostics` so a
+/// test can assert the typed parser's location/message actually lands there
+/// (#761 review). `parseTyped` is its only production caller.
+///
+/// The shared provider rules (`provider_settings.validateProject`) run
+/// BEFORE the typed parse: their intermediates are `zon.parse.free`-safe,
+/// unlike a parsed `ProjectConfig`, whose static defaults (e.g.
+/// `.states = &.{"running"}`) cannot be released on a later rejection. A
+/// `ParseZon` from that pass is deliberately NOT reported here: the same
+/// defect — malformed ZON anywhere in the file, or a type/unknown-field
+/// error inside `.provider_config` — fails the strict typed parse below,
+/// which owns the diagnostic (`line:col: error: …`) the command layer
+/// shows. Short-circuiting on it is what threw that diagnostic away.
+fn parseTypedDiag(
+    gpa: std.mem.Allocator,
+    source: [:0]const u8,
+    diag: *std.zon.parse.Diagnostics,
+) !config.ProjectConfig {
     // The typed ProjectConfig parse is comptime-heavy; the quota is
     // per-function-scope, so it has to live with the parse call itself.
     @setEvalBranchQuota(10000);
-    var diag: std.zon.parse.Diagnostics = .{};
-    defer diag.deinit(gpa);
-    return std.zon.parse.fromSliceAlloc(config.ProjectConfig, gpa, source, &diag, .{}) catch |err| {
-        // `warn`, not `err`: this is the DETAIL of a failure the command
-        // layer reports as an error (naming the file and the error). Logging
-        // it at `.err` here would also fail every test that deliberately
-        // parses a malformed config — Zig's test runner fails any test that
-        // logs an error.
-        std.log.warn("project.labelle: {f}", .{&diag});
-        return err;
+    provider_settings.validateProject(gpa, source) catch |err| switch (err) {
+        error.ParseZon => {},
+        else => return err,
     };
+    // `.android` packaging keys moved to providers/android.json
+    // (labelle-cli#405): name the key and its new home instead of the typed
+    // parse's bare "unexpected field". Malformed ZON is left to the typed parse.
+    try android_moved_keys.check(gpa, source);
+    const cfg = try std.zon.parse.fromSliceAlloc(config.ProjectConfig, gpa, source, diag, .{});
+    // Defensive: the pre-pass only ever drops a ParseZon the typed parse
+    // reproduces, so a source that reaches here has already passed the
+    // cross-field rules. Re-checking on the parsed rows (no allocation)
+    // guarantees that a source the pre-pass could not read never sneaks
+    // past validation. This is not expected to fire; if it ever does, `cfg`
+    // is not released (see the static-defaults note above).
+    try provider_settings.validate(cfg.provider_config, cfg.plugins);
+    return cfg;
 }
 
 /// Parse a `project.labelle` source into a `ProjectConfig`, tolerating
@@ -1464,6 +1515,39 @@ test "parseProjectConfig: a syntax error defers to the typed parser's own diagno
     try testing.expectError(error.ParseZon, parseProjectConfig(testing.allocator, src));
 }
 
+test "parseProjectConfig: a malformed source still reaches the typed parser's diagnostic (#761 review)" {
+    // Both shapes make the pre-parse provider pass return a bare ParseZon:
+    // an unknown field INSIDE `.provider_config`, and broken ZON syntax
+    // elsewhere in the file. Before the fix `validateProject` short-circuited
+    // `parseTyped`, so the typed parse never ran and its Diagnostics stayed
+    // EMPTY — the command layer showed only the generic read failure. The
+    // mechanism under test is therefore "the typed parse ran and populated
+    // `diag`", not merely the error value (which was ParseZon both ways).
+    const cases = [_]struct { src: [:0]const u8, want: []const u8 }{
+        .{
+            .src = ".{ .name = \"g\", .plugins = .{ .{ .name = \"fixture\" } }, .provider_config = .{ .{ .package = \"fixture\", .file = \"p.json\", .typo = true } } }",
+            .want = "typo",
+        },
+        .{
+            .src = ".{ .name = \"broken\" .plugins = .{} }",
+            .want = ": error: ",
+        },
+    };
+    for (cases) |case| {
+        var diag: std.zon.parse.Diagnostics = .{};
+        defer diag.deinit(testing.allocator);
+        try testing.expectError(error.ParseZon, parseTypedDiag(testing.allocator, case.src, &diag));
+        const rendered = try std.fmt.allocPrint(testing.allocator, "{f}", .{&diag});
+        defer testing.allocator.free(rendered);
+        // `Diagnostics.format` renders `line:col: error: message` per error.
+        try testing.expect(std.mem.startsWith(u8, rendered, "1:"));
+        try testing.expect(std.mem.indexOf(u8, rendered, ": error: ") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, case.want) != null);
+        // And the public entry still reports the same failure for the source.
+        try testing.expectError(error.ParseZon, parseProjectConfig(testing.allocator, case.src));
+    }
+}
+
 // ── layer 2: schema parse ────────────────────────────────────────────
 
 test "parseSchemaFromManifestSource: absent key → empty schema (byte-identity default)" {
@@ -1796,4 +1880,63 @@ test "stagedName agrees with the build.zig emitter's b.path spelling" {
     const name = try stagedName(testing.allocator, "pathfinder");
     defer testing.allocator.free(name);
     try testing.expectEqualStrings("plugin_pathfinder_params.zig", name);
+}
+
+test "provider settings: real project parser preserves mapping through params extraction" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source = ".{ .name = \"game\", .plugins = .{ .{ .name = \"fixture\", .repo = \"local:../fixture\", .params = .{ .count = 3 } } }, .provider_config = .{ .{ .package = \"fixture\", .file = \"providers/tool.json\" } } }";
+    const cfg = try parseProjectConfig(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 1), cfg.provider_config.len);
+    try std.testing.expectEqualStrings("providers/tool.json", cfg.provider_config[0].file);
+    const typo = try std.mem.replaceOwned(u8, arena.allocator(), source, ".file =", ".filename =");
+    try std.testing.expectError(error.ParseZon, parseProjectConfig(arena.allocator(), try arena.allocator().dupeZ(u8, typo)));
+    const bad = try std.mem.replaceOwned(u8, arena.allocator(), source, "providers/tool.json", "../tool.json");
+    try std.testing.expectError(error.InvalidProviderConfigPath, parseProjectConfig(arena.allocator(), try arena.allocator().dupeZ(u8, bad)));
+    const missing = try parseProjectConfig(arena.allocator(), ".{ .name = \"game\" }");
+    try std.testing.expectEqual(@as(usize, 0), missing.provider_config.len);
+}
+
+test "parseProjectConfig: a moved `.android` packaging key fails with the provider hint (labelle-cli#405)" {
+    // The mechanism under test is the moved-key pre-pass, not merely "the
+    // parse failed": the typed parse would reject these keys too, but as a
+    // bare ParseZon. A distinct error proves the hinting path ran.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const removed = [_][:0]const u8{
+        ".{ .name = \"g\", .android = .{ .package_name = \"com.labelle.g\" } }",
+        ".{ .name = \"g\", .android = .{ .app_name = \"G\" } }",
+        ".{ .name = \"g\", .android = .{ .min_sdk_version = 28 } }",
+        ".{ .name = \"g\", .android = .{ .orientation = .landscape } }",
+        ".{ .name = \"g\", .android = .{ .debuggable = true } }",
+        ".{ .name = \"g\", .android = .{ .version_name = \"1.0\" } }",
+        ".{ .name = \"g\", .android = .{ .immersive_mode = true, .signing = .{ .keystore = \"k.jks\" } } }",
+        // Also through the `.params` extraction path.
+        ".{ .name = \"g\", .plugins = .{ .{ .name = \"p\", .version = \"1.0.0\", .params = .{ .x = 1 } } }, .android = .{ .package_name = \"com.labelle.g\" } }",
+    };
+    for (removed) |src| {
+        try testing.expectError(error.AndroidKeyMovedToProvider, parseProjectConfig(arena.allocator(), src));
+    }
+}
+
+test "parseProjectConfig: the three kept `.android` codegen keys still parse (labelle-cli#405)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src: [:0]const u8 =
+        \\.{
+        \\    .name = "android-game",
+        \\    .android = .{ .immersive_mode = true, .target_sdk_version = 35, .load_assets_from_apk = true },
+        \\}
+    ;
+    const cfg = try parseProjectConfig(arena.allocator(), src);
+    const android = cfg.android.?;
+    try testing.expect(android.immersive_mode);
+    try testing.expect(android.load_assets_from_apk);
+    try testing.expectEqual(@as(u32, 35), android.target_sdk_version);
+
+    // A typo that was never a packaging key keeps the typed parse's error.
+    try testing.expectError(
+        error.ParseZon,
+        parseProjectConfig(arena.allocator(), ".{ .name = \"g\", .android = .{ .immersiv_mode = true } }"),
+    );
 }

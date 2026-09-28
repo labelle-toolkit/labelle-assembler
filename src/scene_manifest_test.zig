@@ -1197,8 +1197,8 @@ test "801: the JSON-escaped @ spelling still trips the gate" {
 
 test "801: digit-leading branch pins stay permissive; deep nesting fails closed" {
     const supports = scene_manifest.engineSupportsTargetOverrides;
-    // `2.10.0-feature` is a BRANCH ref (isSemverVersion=false), not a
-    // release below the minimum — permissive (codex round 3).
+    // `2.10.0-feature` is a PRE-RELEASE pin (isSemverVersion=false), not
+    // a release below the minimum — permissive (codex round 3).
     try std.testing.expect(supports("2.10.0-feature"));
     try std.testing.expect(!supports("2.10.0"));
 

@@ -177,8 +177,11 @@ pub const MANIFEST_V2_ANDROID_GOLDEN = struct {
         try std.testing.expect(std.mem.indexOf(u8, out, "sokol_clib.root_module.pic = true;") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "lib.root_module.linkSystemLibrary(\"GLESv3\", .{})") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "lib.root_module.link_libc = true;") != null);
-        // APK packaging delegated to the shared packager (byte-identical section).
-        try std.testing.expect(std.mem.indexOf(u8, out, "Package and sign Android APK") != null);
+        // No generated APK packaging: the labelle-android provider packages
+        // (labelle-cli#405), so there is no `zig build package` step.
+        try std.testing.expect(std.mem.indexOf(u8, out, "Package and sign Android APK") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.step(\"package\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "apksigner") == null);
         // The enum-path inline NDK detection is GONE from the generated build.zig —
         // it lives in the hook now (the documented enum-vs-v2 boundary).
         try std.testing.expect(std.mem.indexOf(u8, out, "fn getAndroidNdkSysroot(") == null);
@@ -329,6 +332,55 @@ pub const MANIFEST_V2_IOS_GOLDEN = struct {
         try std.testing.expect(std.mem.indexOf(u8, out, "fn getIosSdkPath(") == null);
         try std.testing.expect(std.mem.indexOf(u8, out, "fn linkIosFrameworks(") == null);
         try std.testing.expect(std.mem.indexOf(u8, out, "configureSdkPaths(") == null);
+    }
+
+    // #776: `-Dios_sdk_path` goes ONLY to plugins that take it. Zig rejects
+    // an option a dependency's build.zig does not declare, so handing it to
+    // every plugin broke the iOS build of any plugin without it.
+    fn genIosWithPlugins(sdk_plugins: []const []const u8) ![]const u8 {
+        return h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "anchor-game",
+            .backend = .sokol,
+            .platform = .ios,
+            .ecs = .mock,
+            .plugins = &.{
+                .{ .name = "fsm", .repo = "github.com/labelle-toolkit/labelle-fsm", .version = "1.0.0" },
+                .{ .name = "box2d", .repo = "github.com/labelle-toolkit/labelle-box2d", .version = "1.0.0" },
+            },
+        }, .{ .ios_sdk_path_plugins = sdk_plugins });
+    }
+
+    test "ios: a plugin that does not take ios_sdk_path is not passed it; one that does is (#776)" {
+        const out = try genIosWithPlugins(&.{"box2d"});
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "    const plugin_fsm_dep = b.dependency(\"labelle_fsm\", .{ .target = target, .optimize = optimize });\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "    const plugin_box2d_dep = b.dependency(\"labelle_box2d\", .{ .target = target, .optimize = optimize, .ios_sdk_path = @as(?[]const u8, sdk_path) });\n") != null);
+        // Exactly one plugin dep carries it.
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, ".ios_sdk_path = @as(?[]const u8, sdk_path)"));
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "ios: with no plugin taking ios_sdk_path, no plugin dep is passed it (#776)" {
+        const out = try genIosWithPlugins(&.{});
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, out, ".ios_sdk_path = @as(?[]const u8, sdk_path)"));
+        // The backend hook still receives the SDK path (unchanged).
+        try std.testing.expect(std.mem.indexOf(u8, out, ".ios_sdk_path = sdk_path,") != null);
+    }
+
+    test "desktop: ios_sdk_path_plugins is ignored off iOS (#776)" {
+        const out = try h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "anchor-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .plugins = &.{.{ .name = "box2d", .repo = "github.com/labelle-toolkit/labelle-box2d", .version = "1.0.0" }},
+        }, .{ .ios_sdk_path_plugins = &.{"box2d"} });
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "ios_sdk_path") == null);
     }
 };
 
@@ -1044,7 +1096,8 @@ pub const BUILD_ZIG = struct {
     test "bgfx android builds a NativeActivity shared library, not a glfw exe" {
         // Drives the v2 bgfx-Android codegen (the enum path is gone). The bgfx v2
         // fixture ships the android platform entry (`android_app` extra module
-        // aliased to `backend_app`, the NDK system libs, apk packaging).
+        // aliased to `backend_app`, the NDK system libs, the `.apk` recipe —
+        // a no-op since labelle-cli#405).
         const build_zig = try h.genBgfxV2BuildZig(std.testing.allocator, .{
             .name = "test-game",
             .platform = .android,
@@ -1070,8 +1123,10 @@ pub const BUILD_ZIG = struct {
 
         // Desktop-only zglfw must NOT appear — it doesn't build for Android.
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "glfw_artifact") == null);
-        // And the APK packaging step is wired in.
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "Package and sign Android APK") != null);
+        // And NO APK packaging step: the labelle-android provider packages
+        // (labelle-cli#405).
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.step(\"package\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "apksigner") == null);
     }
 
     test "external backend named ONLY by string (no matching tag) still needs a manifest (#386)" {
@@ -1973,8 +2028,11 @@ pub const MANIFEST_V2_BGFX_ANDROID_GOLDEN = struct {
         try std.testing.expect(std.mem.indexOf(u8, out, "lib.root_module.linkSystemLibrary(\"aaudio\", .{})") != null);
         // NO glfw on android (zglfw is desktop-only, #303).
         try std.testing.expect(std.mem.indexOf(u8, out, "artifact(\"glfw\")") == null);
-        // APK packaging delegated to the shared packager (byte-identical section).
-        try std.testing.expect(std.mem.indexOf(u8, out, "Package and sign Android APK") != null);
+        // No generated APK packaging: the labelle-android provider packages
+        // (labelle-cli#405), so there is no `zig build package` step.
+        try std.testing.expect(std.mem.indexOf(u8, out, "Package and sign Android APK") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.step(\"package\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "apksigner") == null);
         // The enum-path inline NDK detection is GONE — it lives in the hook now.
         try std.testing.expect(std.mem.indexOf(u8, out, "fn getAndroidNdkSysroot(") == null);
     }

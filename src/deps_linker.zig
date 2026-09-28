@@ -24,7 +24,7 @@ pub const DepEntry = struct {
 /// assembler#533). An EXTERNAL backend is self-contained — it stages none of these
 /// sub-packages (it declares its own gamepad source in its staged zon), so the
 /// gate is OFF regardless of the enum. This is the exact predicate the
-/// `if (!cfg.isExternal()) switch (cfg.backend)` site below uses, factored out
+/// `if (!cfg.isExternal()) switch (cfg.effectiveBackend())` site below uses, factored out
 /// so it's unit-testable without disk I/O.
 ///
 /// DEFENSIVE DEAD CODE (post-#386 Phase 6c): every `Backend` tag now resolves to
@@ -35,7 +35,7 @@ pub const DepEntry = struct {
 /// (assembler#501 forbids enum growth).
 pub fn stagesSdlGamepad(cfg: ProjectConfig) bool {
     if (cfg.isExternal()) return false;
-    return switch (cfg.backend) {
+    return switch (cfg.effectiveBackend()) {
         // Route through the resolver (never read `cfg.gamepad` directly): a bgfx
         // project with an ABSENT `.gamepad` resolves to `.none` (assembler#533),
         // so it stages no SDL, while raylib/sokol keep the `.auto` default.
@@ -46,7 +46,7 @@ pub fn stagesSdlGamepad(cfg: ProjectConfig) bool {
 
 /// Whether the shared Android gamepad sub-package (`backends/android_gamepad`)
 /// is staged for `cfg`. Built-in-specific: sokol/bgfx. OFF for an external
-/// backend (self-contained). Mirrors the gated `switch (cfg.backend)` site below.
+/// backend (self-contained). Mirrors the gated `switch (cfg.effectiveBackend())` site below.
 ///
 /// DEFENSIVE DEAD CODE (post-#386 Phase 6c): every `Backend` tag now resolves to
 /// an external provider via `builtinProvider`, so `isExternal()` is true for
@@ -56,7 +56,7 @@ pub fn stagesSdlGamepad(cfg: ProjectConfig) bool {
 /// (assembler#501 forbids enum growth).
 pub fn stagesAndroidGamepad(cfg: ProjectConfig) bool {
     if (cfg.isExternal()) return false;
-    return switch (cfg.backend) {
+    return switch (cfg.effectiveBackend()) {
         .sokol, .bgfx => true,
         else => false,
     };
@@ -120,7 +120,7 @@ pub fn createDepsLinks(
     // `resolveBundledPackage` call (#688 review). Probing the slot through
     // the same resolver the deps use keeps the two in step.
     {
-        const asm_ver = cfg.assembler_version orelse cfg.labelle_version;
+        const asm_ver = config.assemblerPackageVersion(cfg.assembler_version);
         if (!config.isLocalVersion(asm_ver)) {
             const bundled = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, "backends");
             defer allocator.free(bundled);
@@ -176,7 +176,7 @@ pub fn createDepsLinks(
         // the SDL HIDAPI source fixes that, mirroring raylib/sokol.)
         // Built-in-specific sub-package: skipped entirely for an EXTERNAL
         // backend, which is self-contained — its staged `build.zig.zon`
-        // declares whatever gamepad source it needs. (`switch (cfg.backend)` is
+        // declares whatever gamepad source it needs. (`switch (cfg.effectiveBackend())` is
         // meaningless for an external backend with no enum tag.)
         if (stagesSdlGamepad(cfg)) {
             const gp_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, "backends/sdl_gamepad");
@@ -716,9 +716,9 @@ test "rewriteZonPaths: rewrites relative path deps" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io,"project/libs/needs_machine");
-    try tmp.dir.createDirPath(std.testing.io,"project/.labelle/deps/labelle-needs_machine");
-    try tmp.dir.createDirPath(std.testing.io,"labelle-fsm");
+    try tmp.dir.createDirPath(std.testing.io, "project/libs/needs_machine");
+    try tmp.dir.createDirPath(std.testing.io, "project/.labelle/deps/labelle-needs_machine");
+    try tmp.dir.createDirPath(std.testing.io, "labelle-fsm");
 
     const zon_content =
         \\.{
@@ -761,8 +761,8 @@ test "rewriteZonPaths: skips files without .path deps" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io,"src");
-    try tmp.dir.createDirPath(std.testing.io,"dest");
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.createDirPath(std.testing.io, "dest");
 
     const zon_content =
         \\.{
@@ -803,7 +803,7 @@ test "hardlinkTree: errors on missing source" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io,"dest_parent");
+    try tmp.dir.createDirPath(std.testing.io, "dest_parent");
     const dest_parent = try tmp.dir.realPathFileAlloc(std.testing.io, "dest_parent", alloc);
     defer alloc.free(dest_parent);
 

@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) void {
     unifyCoreDiamond(b.allocator, backend_audio, core_mod, gfx_mod, &core_diamond_visited);
     unifyCoreDiamond(b.allocator, backend_window, core_mod, gfx_mod, &core_diamond_visited);
     const exe = b.addExecutable(.{
-        .name = "game",
+        .name = "anchor-game",
         .root_module = b.createModule(.{
             .root_source_file = b.path("main.zig"),
             .target = ios_target,

@@ -883,6 +883,15 @@ pub const BuildZigOptions = struct {
     /// the plugin read `@import("plugin_params")` comptime. Defaults to
     /// empty — params-less projects keep a byte-identical build.zig.
     plugin_params: []const plugin_params.ResolvedPluginParams = &.{},
+    /// Plugins that take the assembler-provided `ios_sdk_path` build option
+    /// (labelle-assembler#776): their manifest lists it in
+    /// `.build_options`, or their build.zig declares it
+    /// (`plugin_build_options.pluginsTakingOption`). On an iOS generate
+    /// ONLY these get `.ios_sdk_path = …` in their `b.dependency` args —
+    /// Zig rejects an undeclared option, so passing it to every plugin
+    /// broke the build for any plugin that does not take it. Ignored off
+    /// iOS. Defaults to empty.
+    ios_sdk_path_plugins: []const []const u8 = &.{},
 
     pub const ScriptingDep = struct {
         plugin_name: []const u8,
@@ -900,6 +909,11 @@ pub const BuildZigOptions = struct {
         hot_reload: bool = false,
     };
 };
+
+fn takesIosSdkPath(opts: BuildZigOptions, plugin_name: []const u8) bool {
+    for (opts.ios_sdk_path_plugins) |n| if (std.mem.eql(u8, n, plugin_name)) return true;
+    return false;
+}
 
 /// True when the DESKTOP build should take the manifest-v2 GENERIC declarative
 /// path (loop-form `unifyCoreDiamond` walk + manifest-driven artifact/framework
@@ -1119,8 +1133,10 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             const hot: []const u8 = if (s.hot_reload) ", .hot_reload = optimize == .Debug" else "";
             break :blk std.fmt.bufPrint(&scripting_lang_buf, ", .language = .{s}{s}", .{ s.language, hot }) catch unreachable;
         };
-        if (cfg.platform == .ios) {
-            // Pass iOS SDK path to plugins so C dependencies can find system headers
+        if (cfg.platform == .ios and takesIosSdkPath(opts, plugin.name)) {
+            // Pass the iOS SDK path so a plugin's C dependencies find system
+            // headers — ONLY to a plugin that takes it (#776): Zig rejects an
+            // option the dependency's build.zig does not declare.
             try w.print("    const plugin_{s}_dep = b.dependency(\"labelle_{s}\", .{{ .target = target, .optimize = optimize{s}, .ios_sdk_path = @as(?[]const u8, sdk_path) }});\n", .{ plugin.name, plugin.name, scripting_lang_arg });
         } else {
             try w.print("    const plugin_{s}_dep = b.dependency(\"labelle_{s}\", .{{ .target = target, .optimize = optimize{s} }});\n", .{ plugin.name, plugin.name, scripting_lang_arg });
@@ -1338,8 +1354,12 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // core-diamond walk (labelle-assembler#492).
         try emsdk_preflight.emitHelperFn(w);
     } else if (cfg.platform == .ios) {
-        // iOS: build executable for simulator, link frameworks manually
-        try tpl.writeSection(build_zig_tmpl, "ios_exe_start", w);
+        // iOS: build executable for simulator, link frameworks manually.
+        // Named after the project like the desktop binary (#362, #774); the
+        // labelle-ios provider wraps whichever single exe `zig-out/bin` holds.
+        const exe_name = try sanitizeExeName(allocator, cfg.name);
+        defer allocator.free(exe_name);
+        try tpl.renderSection(build_zig_tmpl, "ios_exe_start", .{ .exe_name = exe_name }, w);
 
         for (cfg.plugins) |plugin| {
             try w.print("                .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
@@ -1447,7 +1467,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             }
         }
 
-        // Packaging: v2 delegates the `.apk` recipe to the shared packager.
+        // Packaging: v2 delegates the `.apk` recipe to the shared packager,
+        // which emits nothing for it — the labelle-android provider packages
+        // the APK (labelle-cli#405).
         try manifest_v2_splice.renderPackageV2(manifest, cfg.platform, w);
         try tpl.writeSection(build_zig_tmpl, "android_footer", w);
 

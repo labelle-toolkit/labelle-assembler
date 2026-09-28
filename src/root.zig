@@ -30,6 +30,7 @@ const constants_phase = @import("constants_phase.zig");
 // the generated module's [:0] contract (flying-platform#786 friction #3).
 pub const i18n_phase = @import("i18n_phase.zig");
 const plugin_build_hook = @import("plugin_build_hook.zig");
+const plugin_build_options = @import("plugin_build_options.zig");
 pub const plugin_build_steps = @import("plugin_build_steps.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
 pub const manifest_v2 = @import("codegen/manifest_v2.zig");
@@ -38,6 +39,7 @@ const capabilities = @import("capabilities.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
 pub const plugin_params = @import("plugin_params.zig");
+pub const target_keys = @import("target_keys.zig");
 pub const scripting_splice = @import("scripting_splice.zig");
 pub const scripting_declare = @import("scripting_declare.zig");
 pub const scripting_transpile = @import("scripting_transpile.zig");
@@ -67,10 +69,14 @@ const tilemap_phase = @import("root/tilemap_phase.zig");
 // any compiled function path during `addTest` runs.
 test {
     _ = @import("config.zig");
+    // Only aliased below (`resolveGuiPlugin`), and its one caller is in
+    // main.zig code a test build never analyzes, so its tests need this.
+    _ = @import("gui_resolve.zig");
     _ = @import("zon_escape.zig");
     _ = @import("junction.zig");
     _ = @import("plugin_manifest.zig");
     _ = @import("plugin_build_hook.zig");
+    _ = @import("plugin_build_options.zig");
     _ = @import("plugin_build_steps.zig");
     // Pulls in the build_files/ sub-modules' inline tests (its own `test`
     // block references build_zig.zig + build_zig_zon.zig). Was missing —
@@ -90,6 +96,8 @@ test {
     _ = @import("pack_resources.zig");
     _ = @import("language_policy.zig");
     _ = @import("plugin_params.zig");
+    _ = @import("android_moved_keys.zig");
+    _ = @import("target_keys.zig");
     _ = @import("scripting_splice.zig");
     _ = @import("scripting_declare.zig");
     _ = @import("scripting_transpile.zig");
@@ -107,6 +115,9 @@ test {
     // model/build/render, none of which is reached by a compiled function
     // path until `generate` runs.
     _ = @import("hook_routes.zig");
+    _ = @import("describe.zig");
+    _ = @import("prerelease_pins_test.zig");
+    _ = @import("describe_cache_path_test.zig");
     _ = @import("codegen/idents.zig");
     _ = @import("codegen/validate.zig");
     _ = @import("codegen/manifest_splice.zig");
@@ -116,6 +127,7 @@ test {
     _ = @import("codegen/core_diamond.zig");
     _ = @import("codegen/emsdk_preflight.zig");
     _ = @import("codegen/main_template.zig");
+    _ = @import("codegen/ios_selfinfo.zig");
     _ = @import("capabilities.zig");
     _ = @import("root/game_shim.zig");
     _ = @import("root/provider_contracts.zig");
@@ -185,6 +197,8 @@ pub const HookOrderEntry = config.HookOrderEntry;
 /// `generate` writes `<game>/.labelle/hook_routes.json`; the `routes`
 /// subcommand renders it.
 pub const hook_routes = @import("hook_routes.zig");
+/// `describe` (labelle-cli#471 D1): backend/target facts for the CLI.
+pub const describe = @import("describe.zig");
 pub const generation = @import("generation.zig");
 pub const HookRouteReport = hook_routes.Report;
 pub const generateBuildZig = build_files.generateBuildZig;
@@ -288,6 +302,18 @@ fn filterStepsByOs(
 
 // ── Provider-contract checks (root/provider_contracts.zig) ──────────
 pub const validateProviderContracts = provider_contracts.validateProviderContracts;
+pub const checkProvider = provider_contracts.checkProvider;
+
+/// Print a `checkProvider` problem. `std.debug.print` under test (the test
+/// runner fails any test that logs an error, even an asserted one), a
+/// `std.log.err` otherwise.
+fn reportProviderProblem(message: []const u8) void {
+    if (@import("builtin").is_test) {
+        std.debug.print("{s}\n", .{message});
+    } else {
+        std.log.err("{s}", .{message});
+    }
+}
 
 // ── Backend manifest-v2 detection + overrides (root/manifest_detect.zig) ─
 pub const resolveLoopStyleOverride = manifest_detect.resolveLoopStyleOverride;
@@ -329,6 +355,11 @@ pub fn generate(
     defer allocator.free(mutable_resources);
     cfg.resources = mutable_resources;
 
+    // Refuse an authored `.texture_fallback` (labelle-bgfx#134) before ANY
+    // phase can write to the target — grid expansion writes `__grid_*.json`
+    // long before the wasm ASTC swap that derives the field.
+    try generate_phases.rejectInternalResourceFields(mutable_resources);
+
     // ── Editor-preview activation (labelle-studio Play mode) ─────────────
     // The studio spawns `labelle build --platform=wasm` with
     // `LABELLE_EDITOR_PREVIEW=1` in the environment; the env propagates
@@ -367,7 +398,6 @@ pub fn generate(
     // v2-ONLY external backend (no legacy `backend.manifest.zon`) must not be
     // rejected as manifest-less (the requirement keys off THIS name).
     const backend_manifest_name = manifest_detect.detectV2ManifestName(allocator, cfg, game_dir);
-    try manifest_splice.requireManifestIfExternal(allocator, cfg, game_dir, backend_manifest_name);
 
     // ── cross-package version floors (labelle-assembler#739) ─────────────
     // `init` refuses a backend/core or core/engine/gfx pairing that cannot
@@ -390,9 +420,6 @@ pub fn generate(
     // discovered on the next run. The surrounding invariant is that
     // configuration errors that invalidate the provider outright precede
     // errors about how the provider is pinned.
-    try version_floors.enforce(cfg, "labelle-assembler generate");
-
-    try validateProviderContracts(allocator, cfg, game_dir, backend_manifest_name, is_tests_target);
 
     // ── Editor-preview link-path gate (#526 review, codex P2) ────────────
     // The `editor_*` exports reach the emcc link ONLY through the manifest-v2
@@ -407,7 +434,22 @@ pub fn generate(
     // template-hole check uses. (The tests target never trips this: it is
     // forced to `.desktop`, so the wasm-only normalization above already
     // cleared the flag.)
-    try generate_phases.checkEditorPreviewLinkPath(allocator, cfg, game_dir, backend_manifest_name);
+    //
+    // ── ONE provider/manifest check (labelle-cli#471 D1) ─────────────────
+    // Every check above — the manifest requirement, version floors, the
+    // provider contracts, the editor-preview link path — plus the platform
+    // entry and the callback rule the template load and `main.zig` render
+    // make later, run in that order in `provider_contracts.checkProvider`,
+    // the same function `describe` calls. Same errors as before.
+    {
+        var check_arena = std.heap.ArenaAllocator.init(allocator);
+        defer check_arena.deinit();
+        const verdict = try provider_contracts.checkProvider(check_arena.allocator(), cfg, game_dir, .{ .is_tests_target = is_tests_target });
+        if (verdict.problem) |p| {
+            reportProviderProblem(p.message);
+            return p.err;
+        }
+    }
 
     const cwd = std.Io.Dir.cwd();
 
@@ -671,6 +713,8 @@ pub fn generate(
         resource_entries.items,
         game_dir,
         cfg.asset_compression.formatFor(cfg.platform) == .astc,
+        // labelle-bgfx#134: keep the PNG beside the ASTC on web only.
+        cfg.platform == .wasm,
     );
 
     // ── Generation token, advanced BEFORE any output changes (#724) ──────
@@ -2057,6 +2101,15 @@ pub fn generate(
     // modules (`pack__<prefix>_mod`, #498 PR 2) ride `pack_modules`
     // instead — a third wiring category driven by `pack_scans`, never by
     // `cfg.plugins`.
+    // Plugins that take the assembler-provided `ios_sdk_path` option
+    // (#776): manifest `.build_options` opt-in, or a build.zig that declares
+    // it. Only an iOS generate passes the option at all.
+    const ios_sdk_path_plugins: []const []const u8 = if (cfg_modules.platform == .ios)
+        try plugin_build_options.pluginsTakingOption(allocator, cfg_modules, game_dir, plugin_build_options.ios_sdk_path)
+    else
+        &.{};
+    defer if (cfg_modules.platform == .ios) allocator.free(ios_sdk_path_plugins);
+
     const build_zig = try build_files.generateBuildZig(allocator, cfg_modules, .{
         .materials = material_names,
         .material_toolchain = material_toolchain,
@@ -2067,6 +2120,7 @@ pub fn generate(
         .promoted_scripts = promoted_scripts,
         .pack_modules = pack_modules.items,
         .plugin_hooks = plugin_hooks,
+        .ios_sdk_path_plugins = ios_sdk_path_plugins,
         // Declarative plugin build steps (#586): system-command + artifact
         // link wiring emitted after the game artifact is assembled. Empty
         // when no plugin declares `.build` — byte-identical build.zig.
@@ -2695,6 +2749,17 @@ pub fn generate(
         );
         defer allocator.free(main_zig_content);
         try scanner.writeFile(target_dir, "main.zig", main_zig_content);
+        const apk_assets = @import("codegen/blocks/apk_assets.zig");
+        if (apk_assets.enabled(cfg)) {
+            try scanner.writeFile(target_dir, "apk_assets.zig", apk_assets.runtime_source);
+            const asset_manifest = try apk_assets.manifest(allocator, cfg.resources);
+            defer allocator.free(asset_manifest);
+            try scanner.writeFile(target_dir, "apk_assets.json", asset_manifest);
+        } else {
+            // Overwrite the contract when a target is regenerated with the
+            // option disabled; stale manifests must not duplicate embedded data.
+            try scanner.writeFile(target_dir, "apk_assets.json", "{\"version\":1,\"compression\":\"deflate\",\"files\":[]}\n");
+        }
 
         // Hook-route sidecar (labelle-assembler#724, child of the hooks
         // epic labelle-engine#854). `<game>/.labelle/hook_routes.json`:
@@ -2832,7 +2897,7 @@ test "testsTargetConfig: never resolves gamepad .auto — tests must not link SD
     }
     // And the other overrides hold: null backend, host platform.
     const c = testsTargetConfig(.{ .name = "g", .backend = .bgfx, .platform = .android });
-    try std.testing.expectEqual(config.Backend.null, c.backend);
+    try std.testing.expectEqual(config.Backend.null, c.effectiveBackend());
     try std.testing.expectEqual(config.Platform.desktop, c.platform);
 }
 

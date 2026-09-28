@@ -32,7 +32,9 @@ const scan = @import("scan.zig");
 const validate = @import("validate.zig");
 const context = @import("context.zig");
 const hooks_block = @import("blocks/hooks.zig");
+const resource_loader = @import("blocks/resource_loader.zig");
 const manifest_v2 = @import("manifest_v2.zig");
+const ios_selfinfo = @import("ios_selfinfo.zig");
 
 /// Manifest-driven run-loop splice (pluggable-backends RFC, assembler#378).
 /// When non-null, the run-loop style was resolved from the backend manifest's
@@ -321,6 +323,8 @@ pub fn generateMainZigWithAnimations(
         // does not). Only consulted on wasm.
         .wasm_template_provides_panic = cfg.platform == .wasm and
             std.mem.indexOf(u8, lifecycle_tmpl, "pub const panic") != null,
+        // ios-only (#774): skip the assembler's SelfInfo override when a
+        // template already declares a root `debug`.
     };
 
     var data = tpl.TemplateData{
@@ -404,11 +408,18 @@ pub fn generateMainZigWithAnimations(
 
     // Resource registry block — resources are now loaded at runtime via
     // @embedFile + loadAtlasFromMemory, so the comptime registry is empty.
-    // The block is kept as an empty string for template compatibility.
+    // The slot is file-scope, so it now carries the wasm-only
+    // `pickCompressedTexture` helper (labelle-bgfx#134) — and stays an empty
+    // string whenever no resource has a PNG fallback (every non-wasm build).
     {
-        const empty = try allocator.dupe(u8, "");
-        allocs.appendAssumeCapacity(empty);
-        try data.scalars.put("resource_registry_block", empty);
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, _: *[256]u8) !void {
+                if (@import("blocks/apk_assets.zig").enabled(c.cfg)) {
+                    try w.writeAll("const ApkAssets = @import(\"apk_assets.zig\").Runtime(engine, @import(\"labelle-core\").android_backend);\n");
+                } else try resource_loader.writeCompressedTexturePicker(w, c.cfg.resources);
+            }
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("resource_registry_block", b);
     }
 
     // AllHookPayloads block — merge engine payloads with game events
@@ -582,7 +593,13 @@ pub fn generateMainZigWithAnimations(
     // `requireYAxis` first enforces the unset-guard — an absent `.y_axis` is a
     // hard error so no existing game silently flips.
     const y_axis = try cfg.requireYAxis();
-    return injectYAxis(allocator, rendered, y_axis);
+    const with_axis = try injectYAxis(allocator, rendered, y_axis);
+    if (cfg.platform != .ios) return with_axis;
+    // iOS (#774): the SelfInfo override's owner is decided on the FINAL
+    // rendered text — `ios_selfinfo.finalize` resolves the slot the hook
+    // imports block wrote (override, nothing, or a clear error).
+    defer allocator.free(with_axis);
+    return ios_selfinfo.finalize(allocator, with_axis);
 }
 
 /// Override the value of the engine template's single source-of-truth
