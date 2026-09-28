@@ -113,6 +113,7 @@ test {
     // path until `generate` runs.
     _ = @import("hook_routes.zig");
     _ = @import("describe.zig");
+    _ = @import("describe_cache_path_test.zig");
     _ = @import("codegen/idents.zig");
     _ = @import("codegen/validate.zig");
     _ = @import("codegen/manifest_splice.zig");
