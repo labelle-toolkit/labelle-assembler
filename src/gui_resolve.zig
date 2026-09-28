@@ -397,7 +397,10 @@ test "resolveGuiPackage: a release version maps to the packages/plugins cache sl
 
     // Same layout regular declared plugins use: plugins/{repo}/{version}.
     try std.testing.expect(std.mem.indexOf(u8, dir, "plugins") != null);
-    try std.testing.expect(std.mem.endsWith(u8, dir, "github.com/labelle-toolkit/labelle-imgui/0.3.0"));
+    // Built with the host separator: the cache path uses backslashes on Windows.
+    const tail = try std.fs.path.join(alloc, &.{ "github.com", "labelle-toolkit", "labelle-imgui", "0.3.0" });
+    defer alloc.free(tail);
+    try std.testing.expect(std.mem.endsWith(u8, dir, tail));
 }
 
 test "getBridgeForBackendName: external backend selects its bridge by NAME, not the enum default" {
