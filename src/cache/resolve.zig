@@ -477,7 +477,11 @@ pub fn isPluginCached(allocator: std.mem.Allocator, plugin: config.PluginDep) !b
     defer allocator.free(archive);
     const path = plugin_subdir.pluginRoot(allocator, archive, plugin) catch return false;
     defer allocator.free(path);
-    return @import("disk.zig").dirExists(path);
+    // A subdir naming a regular FILE of an already-cached archive must miss
+    // too, so the fetch path's directory check reports it (Codex review).
+    const disk = @import("disk.zig");
+    if (plugin.subdir.len > 0) return disk.isDirectory(path);
+    return disk.dirExists(path);
 }
 
 /// Validate that all dependencies in a project config are cached.

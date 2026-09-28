@@ -31,20 +31,18 @@ pub fn problem(plugin: config.PluginDep) ?[]const u8 {
     if (sub.len == 0) return null;
     if (plugin.isLocal())
         return "'.subdir' only applies to a remote '.repo' — a 'local:'/'@' repo already names the plugin directory, so point it there instead";
-    if (sub[0] == '/' or sub[0] == '\\') return "'.subdir' must be relative to the repo root, not absolute";
-    if (sub.len >= 2 and sub[1] == ':') return "'.subdir' must be relative to the repo root, not a drive path";
-    // Judged by Windows' rules on EVERY host (#782's `path_key`): the pin is
-    // committed, and a byte Win32 cannot name would make Zig panic in
-    // `Dir.access` for every Windows developer of the game.
+    // Forward slashes only, whatever the host: the pin is committed, and on
+    // POSIX `path.join` keeps a `\` as part of one directory NAME, so a
+    // `plugins\debug` written on Windows would miss on Linux (Codex review).
+    if (std.mem.indexOfScalar(u8, sub, '\\') != null) return "'.subdir' must use '/' as its separator";
+    if (sub[0] == '/') return "'.subdir' must be relative to the repo root, not absolute";
+    // Judged by Windows' rules on EVERY host (#782's `path_key`), for the same
+    // reason; this also rejects a drive letter (`C:`).
     if (path_key.firstBadByte(sub, .windows) != null)
         return "'.subdir' contains a character a Windows path cannot hold (<>:\"|?* or a control byte)";
-    var parts = std.mem.splitAny(u8, sub, "/\\");
+    var parts = std.mem.splitScalar(u8, sub, '/');
     while (parts.next()) |part| {
-        if (part.len == 0) {
-            // A single trailing separator is harmless (`plugins/debug/`).
-            if (parts.peek() == null) break;
-            return "'.subdir' has an empty path component";
-        }
+        if (part.len == 0) return "'.subdir' has an empty path component";
         if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, ".."))
             return "'.subdir' may not contain '.' or '..' components — it must stay inside the repo";
     }
@@ -65,9 +63,8 @@ pub fn validate(plugin: config.PluginDep) Error!void {
 /// archive root itself when there is no subdir. Caller owns the result.
 pub fn pluginRoot(allocator: std.mem.Allocator, archive_root: []const u8, plugin: config.PluginDep) ![]const u8 {
     if (problem(plugin) != null) return error.InvalidPluginSubdir;
-    const sub = std.mem.trimEnd(u8, plugin.subdir, "/\\");
-    if (sub.len == 0) return allocator.dupe(u8, archive_root);
-    return std.fs.path.join(allocator, &.{ archive_root, sub });
+    if (plugin.subdir.len == 0) return allocator.dupe(u8, archive_root);
+    return std.fs.path.join(allocator, &.{ archive_root, plugin.subdir });
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -87,7 +84,7 @@ test "plugin_subdir: a nested subdir is joined under the archive root" {
         .name = "debug",
         .repo = "github.com/labelle-toolkit/labelle-assembler",
         .version = "0.118.0",
-        .subdir = "plugins/debug/",
+        .subdir = "plugins/debug",
     };
     try std.testing.expect(problem(p) == null);
     const root = try pluginRoot(alloc, "archive", p);
@@ -99,7 +96,7 @@ test "plugin_subdir: a nested subdir is joined under the archive root" {
 
 test "plugin_subdir: traversal, absolute paths and local repos are rejected" {
     const alloc = std.testing.allocator;
-    const bad = [_][]const u8{ "plugins/a:b", "plugins/de?bug", "../x", "plugins/../../x", "/abs", "\\abs", "C:\\x", "plugins//debug", "./plugins", "plugins/." };
+    const bad = [_][]const u8{ "plugins/a:b", "plugins/de?bug", "../x", "plugins/../../x", "/abs", "\\abs", "C:\\x", "plugins//debug", "./plugins", "plugins/.", "plugins/debug/", "plugins\\debug" };
     for (bad) |sub| {
         const p: config.PluginDep = .{ .name = "d", .repo = "github.com/acme/mono", .version = "1.0.0", .subdir = sub };
         try std.testing.expect(problem(p) != null);
@@ -138,4 +135,30 @@ test "plugin_subdir: the #685 purge keeps a monorepo archive whose root zon vers
     const root_plugins = [_]config.PluginDep{root_pin};
     try disk.purgeLegacyLocalSlots(alloc, .{ .name = "g", .plugins = &root_plugins });
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, rel, .{}));
+}
+
+test "plugin_subdir: a subdir naming a FILE in a cached archive is not a cache hit" {
+    const alloc = std.testing.allocator;
+    const env = @import("env.zig");
+    const resolve = @import("resolve.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const rel = "home/packages/plugins/github.com/acme/mono/1.0.0";
+    try tmp.dir.createDirPath(std.testing.io, rel ++ "/plugins/real");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = rel ++ "/plugins/file", .data = "not a dir" });
+    const home_z = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
+    defer alloc.free(home_z);
+    env.setCacheRootForTesting(home_z);
+    defer env.setCacheRootForTesting(null);
+
+    const real: config.PluginDep = .{ .name = "real", .repo = "github.com/acme/mono", .version = "1.0.0", .subdir = "plugins/real" };
+    try std.testing.expect(try resolve.isPluginCached(alloc, real));
+    var file = real;
+    file.name = "file";
+    file.subdir = "plugins/file";
+    try std.testing.expect(!try resolve.isPluginCached(alloc, file));
+    var missing = real;
+    missing.subdir = "plugins/nope";
+    try std.testing.expect(!try resolve.isPluginCached(alloc, missing));
 }

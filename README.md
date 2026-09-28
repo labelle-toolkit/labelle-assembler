@@ -261,7 +261,7 @@ tagged repo, so a game can use the assembler's debug overlay
 The tag's source archive is cached whole under
 `~/.labelle/packages/plugins/<repo>/<version>/`, and the plugin is built from
 `<that>/<subdir>`. Two plugins from the same repo and version share one
-download. `.subdir` must be a relative path inside the repo (no `..`, no
+download. `.subdir` must be a relative, `/`-separated path inside the repo (no `..`, no
 absolute path), and it only applies to a remote `.repo`. A `local:`/`@` repo
 already names the plugin directory.
 
