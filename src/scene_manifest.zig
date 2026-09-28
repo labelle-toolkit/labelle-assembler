@@ -15,6 +15,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const tilemap_scene_scan = @import("tilemap_scene_scan.zig");
+const scene_keys = @import("scene_keys.zig");
 
 /// Write a formatted diagnostic directly to stderr, matching the
 /// repo-wide convention (see `flow_scanner.reportFlowError`,
@@ -28,7 +29,7 @@ const tilemap_scene_scan = @import("tilemap_scene_scan.zig");
 /// this file plus a reasonably long scene path; if a path is so
 /// pathological that it overflows we fall back to streaming the
 /// format string verbatim so the user still sees *something*.
-fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
+pub fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
     const io = config.globalIo();
     const stderr = std.Io.File.stderr();
     var buf: [4096]u8 = undefined;
@@ -116,36 +117,23 @@ const ALLOWED_TOP_LEVEL_KEYS: []const []const u8 = &.{
     "meta",
 };
 
-/// True if a key's first byte is an ASCII upper-case letter — the
-/// PascalCase convention promoted to a parser rule by RFC #596 axis 2.
-/// Component keys live under PascalCase; structural keys are lowercase.
-/// The assembler scan uses this to recognize flat-form component
-/// references at both the file's top level and inside entity objects.
-fn isPascalCase(key: []const u8) bool {
-    if (key.len == 0) return false;
-    const c = key[0];
-    return c >= 'A' and c <= 'Z';
-}
-
-/// `"@<ref>"` target-override key (labelle-engine#801). Rides the flat
-/// shape exactly like a PascalCase component key: it is patch CONTENT, so
-/// it participates in flat-form detection and the hybrid-form gate.
-fn isTargetKey(key: []const u8) bool {
-    return key.len > 1 and key[0] == '@';
-}
+/// Key classification (PascalCase, pack-namespaced `<prefix>__<Pascal>`,
+/// `@` target) is the engine's, shared with every scene walker through
+/// `scene_keys.zig` (labelle-assembler#651, #652). Keys here come out of
+/// `std.json` already decoded; `parseSceneSource` first rejects any escape
+/// the engine's parser would not decode the same way, so these decoded
+/// keys are exactly the ones the engine classifies.
+const isFlatComponentKey = scene_keys.isFlatComponentKey;
 
 fn isAllowedTopLevelKey(key: []const u8) bool {
-    // RFC #596 axis 2: PascalCase keys at the file's top level are
-    // component declarations on the flat-form root entity. The audit
-    // and the loader (engine #597) catch unknown PascalCase names at
-    // runtime — the assembler scan can't see the component registry
-    // here, so we accept any PascalCase key and rely on the loader's
-    // warn-once path. This matches the audit's option C resolution.
-    if (isPascalCase(key)) return true;
-    // `@` target-override keys on a flat-form reference root
-    // (labelle-engine#801) — content, not structure; the engine
-    // validates the ref names at load.
-    if (isTargetKey(key)) return true;
+    // Flat content keys at the file's top level are the flat-form root
+    // entity's patch: PascalCase components (RFC #596 axis 2),
+    // pack-namespaced `<prefix>__<Pascal>` components (engine#806,
+    // labelle-assembler#652), and `@` target overrides (engine#801). The
+    // loader warn-onces unknown component names at runtime; the scan
+    // can't see the component registry here, so any component-SHAPED key
+    // is accepted (the audit's option C resolution).
+    if (isFlatComponentKey(key)) return true;
     for (ALLOWED_TOP_LEVEL_KEYS) |allowed| {
         if (std.mem.eql(u8, key, allowed)) return true;
     }
@@ -278,8 +266,9 @@ pub const MAX_CHILDREN_DEPTH: u32 = 64;
 /// Covers two RFC generations:
 ///   - RFC #594 phase 2 / engine #595: lowercase `components`,
 ///     `children`, `prefab`, `overrides`.
-///   - RFC #596 / engine #597 axis 2: any PascalCase key (a component
-///     reference or declaration sitting as a sibling of `prefab`).
+///   - RFC #596 / engine #597 axis 2: any flat content key: PascalCase
+///     or pack-namespaced `<prefix>__<Pascal>` component (engine#806), or
+///     `@` target (engine#801), sitting as a sibling of `prefab`.
 ///
 /// File-level metadata keys (`name`, `assets`, `include`, `scripts`,
 /// `initial_state`, `meta`) deliberately don't count — a file that
@@ -300,8 +289,7 @@ fn hasFlatEntityShapeKey(obj: std.json.ObjectMap) bool {
     var iter = obj.iterator();
     while (iter.next()) |entry| {
         const key = entry.key_ptr.*;
-        if (isPascalCase(key)) return true;
-        if (isTargetKey(key)) return true;
+        if (isFlatComponentKey(key)) return true;
         if (std.mem.eql(u8, key, "components")) return true;
         if (std.mem.eql(u8, key, "children")) return true;
         if (std.mem.eql(u8, key, "prefab")) return true;
@@ -316,7 +304,7 @@ fn hasFlatEntityShapeKey(obj: std.json.ObjectMap) bool {
 /// internally consistent.
 ///
 /// A file or entity that carries BOTH an `overrides:` / `components:`
-/// wrapper AND PascalCase siblings is malformed: the walker can only
+/// wrapper AND flat content siblings (component-shaped or `@` keys) is malformed: the walker can only
 /// descend one of the two, and silently dropping the other would lose
 /// data for users mid-migration (RFC #596 axis 2; engine #597 mirrors
 /// the same gate at every entity site).
@@ -334,7 +322,7 @@ pub fn checkHybridForm(obj: std.json.ObjectMap) ?[]const u8 {
     var iter = obj.iterator();
     while (iter.next()) |entry| {
         const key = entry.key_ptr.*;
-        if (isPascalCase(key) or isTargetKey(key)) {
+        if (isFlatComponentKey(key)) {
             has_pascal = true;
         } else if (std.mem.eql(u8, key, "overrides")) {
             has_overrides = true;
@@ -719,6 +707,20 @@ pub fn parseSceneSource(
     display_path: []const u8,
     source: []const u8,
 ) ParseError!SceneManifest {
+    // The engine's JSONC parser decodes only `\n \t \r \b \f \\ \" \/` and
+    // fails the whole file on any other escape (`\uXXXX` included), while
+    // `std.json` below decodes `\u`. Without this check a key spelled
+    // `"\u0057orker"` would pass as a component here and then fail to load
+    // at runtime (labelle-assembler#651).
+    if (scene_keys.firstInvalidEscape(source)) |off| {
+        const loc = @import("scene_name_lint.zig").locOf(source, off);
+        stderrPrint(
+            "labelle-assembler: scene '{s}' line {d} col {d}: unsupported string escape. The engine's JSONC parser accepts only \\n \\t \\r \\b \\f \\\\ \\\" \\/ (no \\uXXXX) and would fail to load this file.\n",
+            .{ display_path, loc.line, loc.col },
+        );
+        return error.InvalidSceneJson;
+    }
+
     const stripped = stripJsonc(allocator, source) catch return error.OutOfMemory;
     defer allocator.free(stripped);
 
@@ -807,7 +809,7 @@ pub fn parseSceneSource(
                 "labelle-assembler: unknown top-level key '{s}' in scene '{s}'.\n" ++
                     "  Allowed lowercase keys: name, assets, include, entities, root, scripts, initial_state,\n" ++
                     "    components, children, prefab, overrides (flat-form per RFC #594), meta (RFC #596).\n" ++
-                    "  PascalCase keys are accepted as flat-form components (RFC #596 axis 2).\n" ++
+                    "  PascalCase and <pack>__PascalCase keys are accepted as flat-form components (RFC #596 axis 2).\n" ++
                     "  (Did-you-mean suggestions land in labelle-assembler#47.)\n",
                 .{ entry.key_ptr.*, display_path },
             );
@@ -938,120 +940,15 @@ pub fn freeManifests(allocator: std.mem.Allocator, manifests: []const SceneManif
 }
 
 // ── `@` target-override version gate (labelle-engine#801) ───────────────
+// Lives in `scene_target_gate.zig` (split out to keep this file under the
+// repo's 1000-line limit); re-exported so callers keep their paths.
 
-/// True iff `src` uses `@` target-override syntax (labelle-engine#801).
-/// Delegates to `scene_name_lint.sourceUsesTargetKeys` — the scope-aware
-/// walker — so opaque component-payload keys (`{ "Config": { "@id": … } }`)
-/// and `@ref` VALUES never count, while flat/wrapped `@` keys (including
-/// the JSON-escaped `"\u0040…"` spelling) do.
-pub fn sourceUsesTargetKeys(src: []const u8) bool {
-    return @import("scene_name_lint.zig").sourceUsesTargetKeys(src);
-}
-
-/// First engine release that understands `@` target-override keys
-/// (labelle-engine#801). Bump ONLY if the engine-side feature slips to a
-/// later minor.
-pub const MIN_ENGINE_FOR_TARGET_OVERRIDES = "2.11.0";
-
-/// True iff the pinned engine version understands `@` target overrides.
-/// PERMISSIVE on anything unparseable (`local:` overrides, branch pins):
-/// the gate exists to catch the "new assembler, old engine pin" skew where
-/// an old engine silently drops `@` keys — a pin we cannot parse is a
-/// deliberate dev setup, not that trap. Compat checking is MAJOR-only
-/// (labelle-cli#269), so this per-feature minimum is the only guard. The
-/// comparison itself (release-vs-dev classification, `X.Y` normalization,
-/// fail-closed on garbage) lives in `config.engineFeatureSupport`, shared
-/// with the external-tileset gate in `tilemap_scan`.
-pub fn engineSupportsTargetOverrides(engine_version: []const u8) bool {
-    return config.engineFeatureSupport(engine_version, MIN_ENGINE_FOR_TARGET_OVERRIDES) != .no;
-}
-
-/// Scan every `<name>.jsonc` under `dir` for `@` target-override keys;
-/// returns the first file (allocator-owned name) that uses them, or null.
-/// Missing/unreadable files are skipped — this is a version gate, not a
-/// file validator (the real parse reports real errors) — EXCEPT an
-/// oversized file (`error.StreamTooLong`): a file too big to scan may
-/// contain the keys the gate exists to catch, so skipping it would bypass
-/// the gate (CodeRabbit on #650). The 16 MiB ceiling is far above any
-/// real scene/prefab; each buffer is freed before the next file is read
-/// so peak memory stays one file, not the sum (codex P2 on #650).
-pub fn findTargetKeyUsage(
-    allocator: std.mem.Allocator,
-    dir: []const u8,
-    names: []const []const u8,
-) !?[]const u8 {
-    for (names) |name| {
-        const rel = try std.fmt.allocPrint(allocator, "{s}/{s}.jsonc", .{ dir, name });
-        errdefer allocator.free(rel);
-        const source = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), rel, allocator, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
-            error.StreamTooLong => {
-                stderrPrint(
-                    "labelle-assembler: '{s}' exceeds the 16 MiB scan ceiling for the target-override version gate — cannot verify it is free of `@` keys.\n",
-                    .{rel},
-                );
-                return err;
-            },
-            else => {
-                allocator.free(rel);
-                continue;
-            },
-        };
-        const used = sourceUsesTargetKeys(source);
-        allocator.free(source);
-        if (used) return rel;
-        allocator.free(rel);
-    }
-    return null;
-}
-
-/// `findTargetKeyUsage` over every `.jsonc` in a directory TREE — used for
-/// pack source dirs, whose file lists are not staged yet when the gate
-/// runs (codex P1 / CodeRabbit on #650). A missing directory is fine
-/// (packs need not ship prefabs or scenes). Returns the first offending
-/// path (allocator-owned), or null.
-pub fn findTargetKeyUsageInTree(
-    allocator: std.mem.Allocator,
-    dir_path: []const u8,
-) !?[]const u8 {
-    const io = config.globalIo();
-    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return null;
-    defer dir.close(io);
-
-    var iter = dir.iterate();
-    while (iter.next(io) catch return null) |entry| {
-        switch (entry.kind) {
-            .directory => {
-                const sub = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
-                defer allocator.free(sub);
-                if (try findTargetKeyUsageInTree(allocator, sub)) |hit| return hit;
-            },
-            .file => {
-                if (!std.mem.endsWith(u8, entry.name, ".jsonc")) continue;
-                const rel = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
-                errdefer allocator.free(rel);
-                const source = std.Io.Dir.cwd().readFileAlloc(io, rel, allocator, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
-                    error.StreamTooLong => {
-                        stderrPrint(
-                            "labelle-assembler: '{s}' exceeds the 16 MiB scan ceiling for the target-override version gate — cannot verify it is free of `@` keys.\n",
-                            .{rel},
-                        );
-                        return err;
-                    },
-                    else => {
-                        allocator.free(rel);
-                        continue;
-                    },
-                };
-                const used = sourceUsesTargetKeys(source);
-                allocator.free(source);
-                if (used) return rel;
-                allocator.free(rel);
-            },
-            else => {},
-        }
-    }
-    return null;
-}
+const target_gate = @import("scene_target_gate.zig");
+pub const sourceUsesTargetKeys = target_gate.sourceUsesTargetKeys;
+pub const MIN_ENGINE_FOR_TARGET_OVERRIDES = target_gate.MIN_ENGINE_FOR_TARGET_OVERRIDES;
+pub const engineSupportsTargetOverrides = target_gate.engineSupportsTargetOverrides;
+pub const findTargetKeyUsage = target_gate.findTargetKeyUsage;
+pub const findTargetKeyUsageInTree = target_gate.findTargetKeyUsageInTree;
 
 /// Read every `<scenes_dir>/<name>.jsonc` (where `name` is one of `scene_names`,
 /// possibly with subfolder slashes), parse it, and return the manifest list in

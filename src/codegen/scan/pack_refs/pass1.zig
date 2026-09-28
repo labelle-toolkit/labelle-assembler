@@ -26,6 +26,9 @@ const common = @import("common.zig");
 /// learns to accept `<pack>__Pascal` keys (they are the documented
 /// global-registry key format — a prerequisite for engine v2.0, which drops
 /// the wrapper entirely), this pass can flip to an in-place key rewrite.
+/// engine#806 now accepts flat `<pack>__Pascal` keys, so pass 1 also moves
+/// any flat namespaced pair into the wrapper (labelle-assembler#652); the
+/// wrap itself stays because it loads on engines older than #806 too.
 ///
 /// **What is transformed.** For each entity object (the file's entity
 /// content in any of the three accepted top-level shapes — see `emitRoot` —

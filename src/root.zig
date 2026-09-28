@@ -90,6 +90,7 @@ test {
     _ = @import("scene_name_lint.zig");
     _ = @import("scene_manifest.zig");
     _ = @import("scene_manifest_test.zig");
+    _ = @import("scene_keys_test.zig"); // #651/#652 key classification
     _ = @import("scene_override_check.zig");
     _ = @import("tilemap_scan_test.zig"); // covers tilemap_scan + tilemap_scene_scan
     _ = @import("asset_validator.zig");
