@@ -52,6 +52,7 @@ const backend_registry = @import("backend_registry.zig");
 const manifest_v2 = @import("codegen/manifest_v2.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
 const provider_contracts = @import("root/provider_contracts.zig");
+const generate_phases = @import("root/generate_phases.zig");
 
 const Capability = config.Capability;
 const ProjectConfig = config.ProjectConfig;
@@ -166,9 +167,22 @@ fn dirExists(path: []const u8) bool {
 /// `local:` paths exactly as generation does. Every returned string is
 /// owned by `arena`.
 pub fn describe(arena: std.mem.Allocator, cfg_in: ProjectConfig, project_dir: []const u8, target: []const u8) !Description {
+    return describeWith(arena, cfg_in, project_dir, target, .{ .editor_preview_env = generate_phases.editorPreviewEnv(arena) });
+}
+
+pub const Options = struct {
+    /// The `LABELLE_EDITOR_PREVIEW` value (null: unset). `describe` reads
+    /// the process environment; tests pass it explicitly.
+    editor_preview_env: ?[]const u8 = null,
+};
+
+/// `describe` with the environment supplied.
+pub fn describeWith(arena: std.mem.Allocator, cfg_in: ProjectConfig, project_dir: []const u8, target: []const u8, opts: Options) !Description {
     var cfg = cfg_in;
     const platform = parseTarget(target);
     if (platform) |p| cfg.platform = p;
+    // Editor-preview mode, normalized exactly as `generate` does it.
+    generate_phases.applyEditorPreview(&cfg, opts.editor_preview_env);
 
     const name = cfg.backendName();
     const bp = cfg.effectiveBackendPackage();
@@ -199,9 +213,18 @@ pub fn describe(arena: std.mem.Allocator, cfg_in: ProjectConfig, project_dir: []
     }
 
     if (platform == null) {
-        if (!installed and desc.backend.id == null) {
-            if (bp) |b| {
-                if (builtinSnapshot(b) != null) desc.backend.id = try std.fmt.allocPrint(arena, "labelle.{s}", .{name});
+        if (installed) {
+            // Still read the installed manifest, for the id and the source;
+            // only the verdict is moot (no platform to judge it against).
+            var probe = cfg;
+            probe.platform = .desktop;
+            const v = try provider_contracts.checkProvider(arena, probe, project_dir, .{ .emit_warnings = false });
+            if (v.manifest_loaded) desc.capabilities_source = .manifest;
+            desc.backend.id = v.id;
+        } else if (bp) |b| {
+            if (builtinSnapshot(b) != null) {
+                desc.capabilities_source = .builtin;
+                desc.backend.id = try std.fmt.allocPrint(arena, "labelle.{s}", .{name});
             }
         }
         desc.supported = false;
@@ -636,8 +659,11 @@ const Case = struct {
     raw: ?[]const u8 = null,
     /// The error generate fails with, or null when it passes every check.
     expect: ?[]const u8,
-    /// The `backend.id` describe reports when supported.
+    /// The `backend.id` describe reports (checked whenever set, supported
+    /// or not).
     expect_id: ?[]const u8 = null,
+    /// `LABELLE_EDITOR_PREVIEW`, as the environment would carry it.
+    env: ?[]const u8 = null,
 };
 
 const cases = [_]Case{
@@ -652,14 +678,20 @@ const cases = [_]Case{
     .{ .name = "reserved namespace", .cfg = acme_cfg, .pkg = acme_dir, .id = "labelle.bgfx", .expect = "ReservedProviderNamespace" },
     .{ .name = "shorthand id drift", .cfg = sokol_cfg, .pkg = sokol_dir, .id = "labelle.bgfx", .expect = "ProviderIdDrift" },
     .{ .name = "malformed id", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme", .expect = "MalformedProviderId" },
-    .{ .name = "privileged lifecycle from a third party", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .platforms = privileged_desktop, .expect = "PrivilegedLifecycleRequiresReservedNamespace" },
-    .{ .name = "undeclared callback lifecycle", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .platforms = callback_desktop, .expect = "ExternalCallbackBackendUnsupported" },
-    .{ .name = "missing capability", .cfg = acme_cfg, .target = "android", .pkg = acme_dir, .id = "acme.acme", .caps = ".screenshots", .platforms = loop_android, .expect = "UnsupportedCapability" },
-    .{ .name = "missing platform entry", .cfg = acme_cfg, .target = "android", .pkg = acme_dir, .id = "acme.acme", .caps = ".android, .surface_loss", .expect = "V2PlatformUnsupported" },
-    .{ .name = "entry template missing", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .platforms = ".desktop = .{ .entry = \"t/missing.txt\", .loop_style = .loop, .target = .native, .package = .binary },", .expect = "TemplateNotFound" },
-    .{ .name = "unknown builtin root build dep", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .platforms = ".desktop = .{ .entry = \"t/d.txt\", .loop_style = .loop, .target = .native, .package = .binary, .root_build_deps = .{ .{ .name = \"ndk\", .resolution = .builtin } } },", .expect = "UnknownBuiltinRootDep" },
-    .{ .name = "declared build hook missing", .cfg = acme_cfg, .pkg = acme_dir, .raw = "BUILD_HOOK", .expect = "FileNotFound" },
-    .{ .name = "version floor (bgfx 0.30.0 on core 1.32.0)", .cfg = ".{ .name = \"g\", .y_axis = .up, .backend = .bgfx, .core_version = \"1.32.0\", .engine_version = \"2.12.2\", .gfx_version = \"1.30.1\" }", .pkg = bgfx_dir, .id = "labelle.bgfx", .expect = "VersionFloorViolation" },
+    .{ .name = "privileged lifecycle from a third party", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .platforms = privileged_desktop, .expect = "PrivilegedLifecycleRequiresReservedNamespace", .expect_id = "acme.acme" },
+    .{ .name = "undeclared callback lifecycle", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .platforms = callback_desktop, .expect = "ExternalCallbackBackendUnsupported", .expect_id = "acme.acme" },
+    .{ .name = "missing capability", .cfg = acme_cfg, .target = "android", .pkg = acme_dir, .id = "acme.acme", .caps = ".screenshots", .platforms = loop_android, .expect = "UnsupportedCapability", .expect_id = "acme.acme" },
+    .{ .name = "missing platform entry", .cfg = acme_cfg, .target = "android", .pkg = acme_dir, .id = "acme.acme", .caps = ".android, .surface_loss", .expect = "V2PlatformUnsupported", .expect_id = "acme.acme" },
+    .{ .name = "entry template missing", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .platforms = ".desktop = .{ .entry = \"t/missing.txt\", .loop_style = .loop, .target = .native, .package = .binary },", .expect = "TemplateNotFound", .expect_id = "acme.acme" },
+    .{ .name = "unknown builtin root build dep", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .platforms = ".desktop = .{ .entry = \"t/d.txt\", .loop_style = .loop, .target = .native, .package = .binary, .root_build_deps = .{ .{ .name = \"ndk\", .resolution = .builtin } } },", .expect = "UnknownBuiltinRootDep", .expect_id = "acme.acme" },
+    .{ .name = "declared build hook missing", .cfg = acme_cfg, .pkg = acme_dir, .raw = "BUILD_HOOK", .expect = "FileNotFound", .expect_id = "acme.acme" },
+    .{ .name = "version floor (bgfx 0.30.0 on core 1.32.0)", .cfg = ".{ .name = \"g\", .y_axis = .up, .backend = .bgfx, .core_version = \"1.32.0\", .engine_version = \"2.12.2\", .gfx_version = \"1.30.1\" }", .pkg = bgfx_dir, .id = "labelle.bgfx", .expect = "VersionFloorViolation", .expect_id = "labelle.bgfx" },
+    .{ .name = "entry template is a directory", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .platforms = ".desktop = .{ .entry = \"t\", .loop_style = .loop, .target = .native, .package = .binary },", .expect = "TemplateNotFound", .expect_id = "acme.acme" },
+    .{ .name = "editor preview via env on wasm, no v2 wasm entry", .cfg = acme_cfg, .target = "wasm", .env = "1", .pkg = acme_dir, .id = "acme.acme", .caps = ".wasm", .expect = "EditorPreviewUnsupportedByBackend", .expect_id = "acme.acme" },
+    .{ .name = "editor preview via env is normalized off on desktop", .cfg = acme_cfg, .env = "1", .pkg = acme_dir, .id = "acme.acme", .expect = null, .expect_id = "acme.acme" },
+    .{ .name = "editor preview env '0' stays off on wasm (platform entry is the problem)", .cfg = acme_cfg, .target = "wasm", .env = "0", .pkg = acme_dir, .id = "acme.acme", .caps = ".wasm", .expect = "V2PlatformUnsupported", .expect_id = "acme.acme" },
+    .{ .name = "editor preview via project key on wasm, no v2 wasm entry", .cfg = ".{ .name = \"g\", .y_axis = .up, .editor_preview = true, .backend_package = .{ .name = \"acme\", .repo = \"github.com/acme/labelle-acme\", .version = \"1.0.0\" } }", .target = "wasm", .pkg = acme_dir, .id = "acme.acme", .caps = ".wasm", .expect = "EditorPreviewUnsupportedByBackend", .expect_id = "acme.acme" },
+    .{ .name = "editor preview via project key is normalized off on desktop", .cfg = ".{ .name = \"g\", .y_axis = .up, .editor_preview = true, .backend_package = .{ .name = \"acme\", .repo = \"github.com/acme/labelle-acme\", .version = \"1.0.0\" } }", .pkg = acme_dir, .id = "acme.acme", .expect = null, .expect_id = "acme.acme" },
 };
 
 test "describe: agrees with generate's provider check on every case (supported/reason = generate's outcome)" {
@@ -671,12 +703,15 @@ test "describe: agrees with generate's provider check on every case (supported/r
         try f.installFile(c.pkg, c.file, manifest);
         var cfg = try f.parse(c.cfg);
 
-        const d = try describe(a, cfg, f.dir, c.target);
-        // The check `generate` runs, on the same config.
+        const d = try describeWith(a, cfg, f.dir, c.target, .{ .editor_preview_env = c.env });
+        // The check `generate` runs, on the same config, normalized the way
+        // `generate` normalizes it.
         cfg.platform = parseTarget(c.target).?;
+        generate_phases.applyEditorPreview(&cfg, c.env);
         const v = try provider_contracts.checkProvider(a, cfg, f.dir, .{ .emit_warnings = false });
 
         errdefer std.debug.print("case '{s}': supported={} reason={?s}\n", .{ c.name, d.supported, d.reason });
+        if (c.expect_id) |want_id| try testing.expectEqualStrings(want_id, d.backend.id.?);
         if (c.expect) |want| {
             const p = v.problem orelse return error.TestExpectedProblem;
             try testing.expectEqualStrings(want, @errorName(p.err));
@@ -687,7 +722,7 @@ test "describe: agrees with generate's provider check on every case (supported/r
             try testing.expect(v.problem == null);
             try testing.expect(d.supported);
             try testing.expect(d.reason == null);
-            try testing.expectEqualStrings(c.expect_id.?, d.backend.id.?);
+            try testing.expect(d.backend.id != null);
             try testing.expectEqual(CapabilitySource.manifest, d.capabilities_source);
         }
         // A manifest that was not parsed never reads as the capability source.
@@ -699,6 +734,10 @@ test "describe: the failing cases fail the real generate with the same error" {
     const gen = @import("root.zig");
     for (cases) |c| {
         const want = c.expect orelse continue;
+        // `generate` reads LABELLE_EDITOR_PREVIEW from the process
+        // environment, which a test cannot set; those rows are covered by
+        // the shared-check agreement above.
+        if (c.env != null) continue;
         var f = try Fixture.init();
         defer f.deinit();
         const a = f.arena();
@@ -724,6 +763,18 @@ test "describe: an installed .sokol whose manifest has no .id reports the derive
     try testing.expect(d.supported);
     try testing.expectEqual(CapabilitySource.manifest, d.capabilities_source);
     try testing.expectEqualStrings("labelle.sokol", d.backend.id.?);
+}
+
+test "describe: an unknown target still reads the installed manifest for backend.id and capabilities_source" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.installFile(acme_dir, manifest_v2.V2_MANIFEST_NAME, try manifestV2(f.arena(), "acme.acme", ".screenshots", loop_desktop));
+    const d = try describe(f.arena(), try f.parse(acme_cfg), f.dir, "xbox");
+    try testing.expect(!d.supported);
+    try testing.expect(std.mem.indexOf(u8, d.reason.?, "backend 'acme' has no target 'xbox'") != null);
+    try testing.expectEqualStrings("acme.acme", d.backend.id.?);
+    try testing.expectEqual(CapabilitySource.manifest, d.capabilities_source);
+    try testing.expect(d.package_dir != null);
 }
 
 test "describe: an installed package dir with no manifest keeps capabilities_source unknown" {

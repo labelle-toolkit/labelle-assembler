@@ -29,10 +29,11 @@ pub const Verdict = struct {
     problem: ?Problem = null,
     /// A `backend.manifest.v2.zon` was found and parsed.
     manifest_loaded: bool = false,
-    /// The provider's canonical id, once it passed the identity check: the
-    /// manifest's `.id`, or `labelle.<name>` derived for an enum-shorthand
-    /// built-in whose manifest omits it (as `validateProviderIdentity` does).
-    /// Null when unknown or when the identity check failed.
+    /// The provider's canonical id whenever it passes the identity check,
+    /// even if a later check fails: the manifest's `.id`, or `labelle.<name>`
+    /// derived for an enum-shorthand built-in whose manifest omits it (as
+    /// `validateProviderIdentity` does). Null when unknown or when the
+    /// identity check itself failed.
     id: ?[]const u8 = null,
 };
 
@@ -91,6 +92,14 @@ pub fn checkProvider(
     // 2. Version floors: config-only, but after the manifest check (#746).
     if (try floorProblem(arena, cfg, opts.emit_warnings)) |p| {
         v.problem = p;
+        // The refusal stands, but a readable manifest still names the
+        // provider: report its id when it passes the identity check.
+        if (has_v2) {
+            if (manifest_v2.loadNamedManifest(arena, cfg, game_dir, manifest_v2.V2_MANIFEST_NAME)) |m| {
+                v.manifest_loaded = true;
+                v.id = try validatedId(arena, cfg, m.id);
+            } else |_| {}
+        }
         return v;
     }
 
@@ -104,6 +113,7 @@ pub fn checkProvider(
             v.problem = .{ .err = err, .message = try std.fmt.allocPrint(arena, "labelle-assembler: backend '{s}': {s} at '{s}' could not be read ({s}).", .{ name, manifest_splice.LEGACY_MANIFEST_NAME, pkg_dir, @errorName(err) }) };
             return v;
         };
+        v.id = try validatedId(arena, cfg, if (pm) |x| x.id else null);
         if (try contractProblem(arena, cfg, .{
             .manifest_id = if (pm) |x| x.id else null,
             .declared = if (pm) |x| x.capabilities else &.{},
@@ -129,6 +139,9 @@ pub fn checkProvider(
         return v;
     };
     v.manifest_loaded = true;
+    // The id is reported whenever the identity check passes, even if a
+    // later check (capabilities, platform entry, …) fails.
+    v.id = try validatedId(arena, cfg, m.id);
 
     // 4. Provider contracts.
     if (try contractProblem(arena, cfg, .{
@@ -140,11 +153,6 @@ pub fn checkProvider(
         v.problem = p;
         return v;
     }
-    v.id = m.id orelse if (cfg.backend_package == null)
-        try std.fmt.allocPrint(arena, "labelle.{s}", .{name})
-    else
-        null;
-
     // 5. Editor preview needs the v2 wasm link path.
     if (cfg.editor_preview and m.platforms.wasm == null) {
         v.problem = try editorPreviewProblem(arena, name);
@@ -155,10 +163,11 @@ pub fn checkProvider(
     // (`stageBackendBuildHook` reads it), the tests target included.
     if (m.build_hook) |hook_rel| {
         const hook_path = try std.fs.path.join(arena, &.{ pkg_dir, hook_rel });
-        if (!exists(hook_path)) {
-            v.problem = .{ .err = error.FileNotFound, .message = try std.fmt.allocPrint(arena, "labelle-assembler: backend '{s}' declares `.build_hook = \"{s}\"` but the package has no such file ('{s}').", .{ name, hook_rel, hook_path }) };
+        // The same bounded read `stageBackendBuildHook` does.
+        _ = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), hook_path, arena, .limited(256 * 1024)) catch |err| {
+            v.problem = .{ .err = err, .message = try std.fmt.allocPrint(arena, "labelle-assembler: backend '{s}' declares `.build_hook = \"{s}\"` but '{s}' cannot be read ({s}).", .{ name, hook_rel, hook_path, @errorName(err) }) };
             return v;
-        }
+        };
     }
 
     if (opts.is_tests_target) return v;
@@ -170,10 +179,12 @@ pub fn checkProvider(
     };
     // The entry template `templates.loadBackendTemplate` reads.
     const tmpl_path = try std.fs.path.join(arena, &.{ pkg_dir, entry.entry });
-    if (!exists(tmpl_path)) {
-        v.problem = .{ .err = error.TemplateNotFound, .message = try std.fmt.allocPrint(arena, "labelle: could not read v2 entry template '{s}': FileNotFound", .{tmpl_path}) };
+    // The same bounded read `loadBackendTemplate` does: a missing file, a
+    // directory or an unreadable path all fail it.
+    _ = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), tmpl_path, arena, .limited(64 * 1024)) catch |err| {
+        v.problem = .{ .err = error.TemplateNotFound, .message = try std.fmt.allocPrint(arena, "labelle: could not read v2 entry template '{s}': {s}", .{ tmpl_path, @errorName(err) }) };
         return v;
-    }
+    };
     // `emitRootBuildDepsV2`: `.builtin` resolves only `emsdk`.
     for (entry.root_build_deps) |dep| {
         if (dep.resolution == .builtin and !std.mem.eql(u8, dep.name, "emsdk")) {
@@ -237,6 +248,21 @@ pub fn floorProblem(arena: std.mem.Allocator, cfg: ProjectConfig, emit_warnings:
         try out.writer.print("{s}: {s}", .{ ctx, t.describe(&buf) });
     }
     return .{ .err = error.VersionFloorViolation, .message = out.written() };
+}
+
+/// The provider's canonical id when it passes the identity check: the
+/// manifest's `.id`, or `labelle.<name>` derived for an enum-shorthand
+/// built-in whose manifest omits it. Null when the check fails or no id is
+/// knowable (a third-party package without `.id`).
+fn validatedId(arena: std.mem.Allocator, cfg: ProjectConfig, manifest_id: ?[]const u8) !?[]const u8 {
+    if (cfg.effectiveBackendPackage() == null) return null;
+    const id = manifest_id orelse {
+        if (cfg.backend_package == null) return try std.fmt.allocPrint(arena, "labelle.{s}", .{cfg.backendName()});
+        return null;
+    };
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    backend_registry.checkProviderIdentity(cfg, id, &discard.writer) catch return null;
+    return id;
 }
 
 fn editorPreviewProblem(arena: std.mem.Allocator, name: []const u8) !Problem {
