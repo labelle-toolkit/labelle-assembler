@@ -110,6 +110,7 @@ test {
     // model/build/render, none of which is reached by a compiled function
     // path until `generate` runs.
     _ = @import("hook_routes.zig");
+    _ = @import("describe.zig");
     _ = @import("codegen/idents.zig");
     _ = @import("codegen/validate.zig");
     _ = @import("codegen/manifest_splice.zig");
@@ -188,6 +189,8 @@ pub const HookOrderEntry = config.HookOrderEntry;
 /// `generate` writes `<game>/.labelle/hook_routes.json`; the `routes`
 /// subcommand renders it.
 pub const hook_routes = @import("hook_routes.zig");
+/// `describe` (labelle-cli#471 D1): backend/target facts for the CLI.
+pub const describe = @import("describe.zig");
 pub const generation = @import("generation.zig");
 pub const HookRouteReport = hook_routes.Report;
 pub const generateBuildZig = build_files.generateBuildZig;
@@ -289,6 +292,18 @@ fn filterStepsByOs(
 
 // ── Provider-contract checks (root/provider_contracts.zig) ──────────
 pub const validateProviderContracts = provider_contracts.validateProviderContracts;
+pub const checkProvider = provider_contracts.checkProvider;
+
+/// Print a `checkProvider` problem. `std.debug.print` under test (the test
+/// runner fails any test that logs an error, even an asserted one), a
+/// `std.log.err` otherwise.
+fn reportProviderProblem(message: []const u8) void {
+    if (@import("builtin").is_test) {
+        std.debug.print("{s}\n", .{message});
+    } else {
+        std.log.err("{s}", .{message});
+    }
+}
 
 // ── Backend manifest-v2 detection + overrides (root/manifest_detect.zig) ─
 pub const resolveLoopStyleOverride = manifest_detect.resolveLoopStyleOverride;
@@ -373,7 +388,6 @@ pub fn generate(
     // v2-ONLY external backend (no legacy `backend.manifest.zon`) must not be
     // rejected as manifest-less (the requirement keys off THIS name).
     const backend_manifest_name = manifest_detect.detectV2ManifestName(allocator, cfg, game_dir);
-    try manifest_splice.requireManifestIfExternal(allocator, cfg, game_dir, backend_manifest_name);
 
     // ── cross-package version floors (labelle-assembler#739) ─────────────
     // `init` refuses a backend/core or core/engine/gfx pairing that cannot
@@ -396,9 +410,6 @@ pub fn generate(
     // discovered on the next run. The surrounding invariant is that
     // configuration errors that invalidate the provider outright precede
     // errors about how the provider is pinned.
-    try version_floors.enforce(cfg, "labelle-assembler generate");
-
-    try validateProviderContracts(allocator, cfg, game_dir, backend_manifest_name, is_tests_target);
 
     // ── Editor-preview link-path gate (#526 review, codex P2) ────────────
     // The `editor_*` exports reach the emcc link ONLY through the manifest-v2
@@ -413,7 +424,22 @@ pub fn generate(
     // template-hole check uses. (The tests target never trips this: it is
     // forced to `.desktop`, so the wasm-only normalization above already
     // cleared the flag.)
-    try generate_phases.checkEditorPreviewLinkPath(allocator, cfg, game_dir, backend_manifest_name);
+    //
+    // ── ONE provider/manifest check (labelle-cli#471 D1) ─────────────────
+    // Every check above — the manifest requirement, version floors, the
+    // provider contracts, the editor-preview link path — plus the platform
+    // entry and the callback rule the template load and `main.zig` render
+    // make later, run in that order in `provider_contracts.checkProvider`,
+    // the same function `describe` calls. Same errors as before.
+    {
+        var check_arena = std.heap.ArenaAllocator.init(allocator);
+        defer check_arena.deinit();
+        const verdict = try provider_contracts.checkProvider(check_arena.allocator(), cfg, game_dir, .{ .is_tests_target = is_tests_target });
+        if (verdict.problem) |p| {
+            reportProviderProblem(p.message);
+            return p.err;
+        }
+    }
 
     const cwd = std.Io.Dir.cwd();
 

@@ -45,15 +45,9 @@ const ResourceDef = config.ResourceDef;
 /// env goes through the process `Environ`, `std.process.hasEnvVarConstant` /
 /// `std.posix.getenv` are gone). Mutates `cfg.editor_preview` in place.
 pub fn normalizeEditorPreview(allocator: std.mem.Allocator, cfg: *ProjectConfig) void {
-    if (cfg.platform != .wasm) {
-        cfg.editor_preview = false;
-    } else if (!cfg.editor_preview) {
-        const environ = config.globalEnviron();
-        if (environ.getAlloc(allocator, "LABELLE_EDITOR_PREVIEW")) |v| {
-            defer allocator.free(v);
-            cfg.editor_preview = config.editorPreviewEnvEnabled(v);
-        } else |_| {}
-    }
+    const env = editorPreviewEnv(allocator);
+    defer if (env) |v| allocator.free(v);
+    applyEditorPreview(cfg, env);
     if (cfg.editor_preview) {
         // Generate-time breadcrumb: the splice compiles only against an
         // engine that ships `editor_api` (the generated main.zig carries a
@@ -63,6 +57,26 @@ pub fn normalizeEditorPreview(allocator: std.mem.Allocator, cfg: *ProjectConfig)
             "labelle-assembler: editor-preview wasm build (LABELLE_EDITOR_PREVIEW) — requires a labelle-engine that ships `editor_api`",
             .{},
         );
+    }
+}
+
+/// The `LABELLE_EDITOR_PREVIEW` value from the process environment, or
+/// null when unset. Caller frees.
+pub fn editorPreviewEnv(allocator: std.mem.Allocator) ?[]u8 {
+    return config.globalEnviron().getAlloc(allocator, "LABELLE_EDITOR_PREVIEW") catch null;
+}
+
+/// THE editor-preview normalization, shared by `generate` and `describe`
+/// (labelle-cli#471 D1): off on every non-wasm platform (even when
+/// project.labelle sets it); on wasm, the project's `editor_preview`, or
+/// else the env value (`env_value`, the `LABELLE_EDITOR_PREVIEW` value or
+/// null) read through `config.editorPreviewEnvEnabled`. Pure, so tests can
+/// supply the env value.
+pub fn applyEditorPreview(cfg: *ProjectConfig, env_value: ?[]const u8) void {
+    if (cfg.platform != .wasm) {
+        cfg.editor_preview = false;
+    } else if (!cfg.editor_preview) {
+        if (env_value) |v| cfg.editor_preview = config.editorPreviewEnvEnabled(v);
     }
 }
 

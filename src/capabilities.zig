@@ -152,13 +152,44 @@ pub fn validate(
     // `std.debug.print` (not `std.log.err`) matches the existing manifest-
     // validation diagnostics and keeps the test runner from flagging the
     // intentional error-path tests as failures.
-    for (missing) |cap| {
-        std.debug.print(
-            "labelle-assembler: backend provider '{s}' does not support capability '{s}' required by this project.\n  Choose a provider that advertises '{s}', or remove the requirement.\n",
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    writeMissing(&w, missing, provider_id) catch {};
+    std.debug.print("{s}\n", .{w.buffered()});
+    return error.UnsupportedCapability;
+}
+
+/// The diagnostic `validate` prints for the missing capabilities, one per
+/// line (no trailing newline).
+fn writeMissing(w: *std.Io.Writer, missing: []const Capability, provider_id: []const u8) std.Io.Writer.Error!void {
+    for (missing, 0..) |cap, i| {
+        if (i != 0) try w.writeAll("\n");
+        try w.print(
+            "labelle-assembler: backend provider '{s}' does not support capability '{s}' required by this project.\n  Choose a provider that advertises '{s}', or remove the requirement.",
             .{ provider_id, @tagName(cap), @tagName(cap) },
         );
     }
-    return error.UnsupportedCapability;
+}
+
+/// The pure core of `validate` (same back-compat gate): the diagnostic for a
+/// provider that opted in (`declared.len > 0`) and misses a required
+/// capability, or null when `validate` would pass. Shared with `describe`
+/// through `provider_contracts.checkProvider`. The message is `arena`-owned.
+pub fn missingMessage(
+    arena: std.mem.Allocator,
+    required: []const Capability,
+    declared: []const Capability,
+    provider_id: []const u8,
+) !?[]const u8 {
+    if (declared.len == 0) return null;
+    var missing: std.ArrayList(Capability) = .empty;
+    for (required) |cap| {
+        if (!declares(declared, cap)) try missing.append(arena, cap);
+    }
+    if (missing.items.len == 0) return null;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try writeMissing(&out.writer, missing.items, provider_id);
+    return out.written();
 }
 
 /// Assert a resolved provider's DECLARED `.surface_loss` capability agrees with

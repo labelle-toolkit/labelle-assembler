@@ -36,6 +36,7 @@ The binary is written to `zig-out/bin/labelle-assembler`.
 ./zig-out/bin/labelle-assembler --protocol-version
 ./zig-out/bin/labelle-assembler generate --project-root /path/to/game
 ./zig-out/bin/labelle-assembler routes --project-root /path/to/game
+./zig-out/bin/labelle-assembler describe --project-root /path/to/game --target desktop
 ```
 
 ### Generate options
@@ -45,6 +46,7 @@ The binary is written to `zig-out/bin/labelle-assembler`.
 | `--project-root <path>` | Path to game project (containing `project.labelle`) |
 | `--scene <name>` | Override the initial prefab |
 | `--platform <name>` | Override target platform (`desktop`, `wasm`, `ios`, `android`) |
+| `--target <name>` | Alias for `--platform`, spelled the way the CLI names targets. An unknown name exits 2 with a message naming the resolved backend and the target |
 | `--backend <name>` | Override graphics backend (`raylib`, `sokol`, `sdl`, `bgfx`, `wgpu`, `null`) |
 
 A `project.labelle` with no `.backend` (and no `.backend_package`) builds
@@ -62,8 +64,8 @@ generates. `.web` is the original spelling of `.wasm` and stays accepted
 as a warned alias; `.wasm` wins when both are set. The `.platform` key in
 `project.labelle` is deprecated: the target comes from the command line
 (the `labelle` CLI always passes it). `generate` warns about the key only
-when `--platform` is given, since that is when the key was overridden. A
-direct `generate` without `--platform` still takes its target from
+when `--platform` or `--target` is given, since that is when the key was
+overridden. A direct `generate` with neither still takes its target from
 `.platform`, with no warning.
 
 The `null` backend is a headless test/CI backend with no graphics, audio,
@@ -100,6 +102,87 @@ file: no package cache, no backend, no renderer. Run `generate` first.
 documented, and keyed on the same handler identity
 (`docs/design/hook-handler-ordering.md` §2.2) that runtime tracing uses.
 See `docs/design/hook-route-inspection.md`.
+
+### Describe a backend × target (the CLI's source of backend facts)
+
+```bash
+./zig-out/bin/labelle-assembler describe --project-root /path/to/game --target android
+./zig-out/bin/labelle-assembler describe --project-root /path/to/game --target ios --json
+```
+
+`describe` is the **single source of backend and target facts for the
+`labelle` CLI** (labelle-cli RFC #471). The CLI asks it, from protocol 7 on,
+instead of re-deriving them from its own copy of the assembler's enums —
+which is how the CLI came to name a third-party
+`.backend_package = .{ .name = "acme" }` project's target dir
+`.labelle/bgfx_desktop` while `generate` wrote `.labelle/acme_desktop`.
+
+It answers with the same code `generate` runs: the `.backend` shorthand
+(`builtinProvider`), an explicit `.backend_package`, third-party packages,
+the `bgfx` default, `backendName()` for the target dir, and `.asset_compression`
+for the asset format. For `supported`, when the package is installed, it
+calls **the same provider check `generate` runs before codegen**
+(`provider_contracts.checkProvider`). That check covers:
+- the manifest requirement and version floors;
+- the v2 manifest parse;
+- lifecycle privilege, provider identity and id collision;
+- capabilities;
+- the editor-preview link path and the declared build hook;
+- the `.platforms.<target>` entry, its entry template and builtin root deps;
+- the callback-lifecycle rule.
+
+A failure there is `supported: false`, with the exact diagnostic `generate`
+prints as the `reason`.
+
+It is **offline and config-only**: it reads `project.labelle` and, when the
+backend package is already installed, that package's manifest. It fetches
+nothing, writes nothing to the cache, and generates nothing. When the package
+is not installed, a first-party backend at its default version is answered
+from a snapshot of its manifest's capabilities; any other package reads as
+supported but unverified (`capabilities_source: "unknown"`), the same
+back-compat rule `generate` applies to a provider that declares no
+capabilities. Requirements that come from a resolved GUI plugin are not part
+of the answer.
+
+`--json` emits the `labelle.describe/v1` schema. Key order is fixed;
+`package_dir` appears only when the package is installed, and `reason` only
+when `supported` is false:
+
+```json
+{
+  "schema": "labelle.describe/v1",
+  "target": "ios",
+  "target_dir": ".labelle/raylib_ios",
+  "backend": {
+    "name": "raylib",
+    "id": "labelle.raylib",
+    "repo": "github.com/labelle-toolkit/labelle-raylib",
+    "version": "0.3.0",
+    "local_path": null
+  },
+  "asset_format": "png",
+  "supported": false,
+  "reason": "backend provider 'labelle.raylib' does not support capability 'ios' required by target 'ios'",
+  "capabilities_source": "builtin"
+}
+```
+
+| Key | Meaning |
+|-----|---------|
+| `target_dir` | `.labelle/<backend name>_<target>`, relative to the project root — the dir `generate` creates |
+| `backend.name` | `backendName()`: the package name (`bgfx`, `acme`) |
+| `backend.id` | Canonical provider id: from the installed manifest once it passes `generate`'s identity check (a reserved, drifted or malformed id is `supported: false` with that check's reason instead), derived as `labelle.<name>` for a first-party backend, else `null` |
+| `backend.repo`, `backend.version` | The resolved package's pin |
+| `backend.local_path` | The resolved directory of a `local:` / `@` package, else `null` |
+| `package_dir` | The package's directory, only when it is on disk |
+| `asset_format` | `png` or `astc`, from `.asset_compression` for this target |
+| `supported`, `reason` | Whether this backend can generate for this target, and why not |
+| `capabilities_source` | `manifest` (parsed from the installed v2 manifest), `builtin` (first-party snapshot), or `unknown` (nothing read: not installed, or installed without a readable v2 manifest) |
+
+Exit codes: 0 whenever an answer was produced, `supported: false` included
+(`describe` is a query, not a gate); 1 when `project.labelle` cannot be read
+or parsed; 2 on a usage error. An unknown target is `supported: false` with
+a reason naming the backend and the target.
 
 ### Run tests
 
