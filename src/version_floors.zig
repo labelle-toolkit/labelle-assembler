@@ -34,6 +34,24 @@ const config = @import("config.zig");
 /// materials contract gate shares it; the guards below keep the short name.
 const pinAtLeast = config.pinAtLeast;
 
+/// The pin a floor's SUBJECT is judged as (#783): a release pin as written;
+/// a semver pre-release/build pin (`0.31.0-rc.1`, `0.31.0+b.5`) — which the
+/// fetch path now fetches as its tag — as its `MAJOR.MINOR.PATCH`, written
+/// into `buf`; null for anything else (`local:…`, a branch).
+///
+/// Only the SUBJECT side is normalized, because only there is it
+/// conservative: a pre-release sorts below its release, so judging it as
+/// the release fires a floor at most one pre-release early. The
+/// REQUIREMENT side is not — whether `2.1.0-rc.1` already carries what a
+/// `>= 2.1.0` floor needs is unknowable — so a pre-release requirement
+/// stays undecidable, like a branch.
+pub fn subjectPin(buf: *[64]u8, pin: []const u8) ?[]const u8 {
+    if (config.isSemverVersion(pin)) return pin;
+    if (!config.isTagVersion(pin)) return null;
+    const sv = std.SemanticVersion.parse(pin) catch return null;
+    return std.fmt.bufPrint(buf, "{d}.{d}.{d}", .{ sv.major, sv.minor, sv.patch }) catch null;
+}
+
 // ── backend ⇄ core floor validation ──────────────────────────────────
 //
 // PRODUCTION check, not a test helper (#736 review): `checkTrioFloors`
@@ -177,10 +195,12 @@ fn providerCoreFloorViolation(backend: config.Backend, backend_version: []const 
         else => return null,
     };
     if (!config.isSemverVersion(core_version)) return null;
+    var buf: [64]u8 = undefined;
+    const judged = subjectPin(&buf, backend_version) orelse return null;
 
     var worst: ?FloorViolation = null;
     for (floors) |f| {
-        if (!try pinAtLeast(backend_version, f.backend_at_least)) continue;
+        if (!try pinAtLeast(judged, f.backend_at_least)) continue;
         if (try pinAtLeast(core_version, f.core_at_least)) continue;
         const v: FloorViolation = .{
             .backend = @tagName(backend),
@@ -377,9 +397,10 @@ pub fn trioFloorViolation(core_version: []const u8, engine_version: []const u8, 
         // This rule's own two pins. A rule is decidable iff BOTH are
         // release-shaped; the third pin is only ever quoted in the
         // diagnostic and never compared.
-        if (!config.isSemverVersion(v.pinOf(f.subject))) continue;
+        var buf: [64]u8 = undefined;
+        const subject = subjectPin(&buf, v.pinOf(f.subject)) orelse continue;
         if (!config.isSemverVersion(v.pinOf(f.requires))) continue;
-        if (!try pinAtLeast(v.pinOf(f.subject), f.subject_at_least)) continue;
+        if (!try pinAtLeast(subject, f.subject_at_least)) continue;
         if (try pinAtLeast(v.pinOf(f.requires), f.floor)) continue;
         if (worst == null or (f.severity == .compile_break and worst.?.floor.severity != .compile_break)) worst = v;
     }
@@ -515,14 +536,14 @@ pub fn isOfficialProvider(bp: config.PluginDep) bool {
 /// explicit `.backend_package` when there is one, else the builtin provider
 /// the `.backend` enum tag is shorthand for — and `init` has no
 /// `--backend-package` flag, so an explicit package is only ever seen here
-/// (#739). A non-official provider and a non-release pin are left alone.
+/// (#739). A non-official provider and a non-release pin are left alone;
+/// a pre-release pin is judged as its release (`subjectPin`, #783).
 ///
 /// The floor TABLE is chosen by the backend the PACKAGE identifies, never
 /// by `cfg.backend` — see `officialBackendOf`.
 pub fn configBackendCoreFloorViolation(cfg: config.ProjectConfig) error{UnparsableVersionPin}!?FloorViolation {
     const bp = cfg.effectiveBackendPackage() orelse return null;
     const backend = officialBackendOf(bp) orelse return null;
-    if (!config.isSemverVersion(bp.version)) return null;
     return providerCoreFloorViolation(backend, bp.version, cfg.core_version);
 }
 
