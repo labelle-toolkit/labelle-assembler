@@ -146,4 +146,29 @@ pub const SystemLocale = struct {
             \\}
         );
     }
+
+    test "with both regions shipped, each region finds its own locale (flying-platform's set)" {
+        try generateAndRun(&.{
+            .{ .tag = "en", .body = "{ \"menu\": { \"play\": \"Play\" } }" },
+            .{ .tag = "pt-BR", .body = "{ \"menu\": { \"play\": \"Jogar\" } }" },
+            .{ .tag = "pt-PT", .body = "{ \"menu\": { \"play\": \"Jogar!\" } }" },
+        },
+            \\const std = @import("std");
+            \\const i18n = @import("i18n.zig");
+            \\
+            \\test "exact region beats the first pt-* tag" {
+            \\    try std.testing.expect(i18n.applySystemLocale("pt-PT"));
+            \\    try std.testing.expectEqualStrings("pt-PT", i18n.activeLocale());
+            \\    try std.testing.expect(i18n.applySystemLocale("pt_BR.UTF-8"));
+            \\    try std.testing.expectEqualStrings("pt-BR", i18n.activeLocale());
+            \\    try std.testing.expect(i18n.applySystemLocale("pt_PT@euro"));
+            \\    try std.testing.expectEqualStrings("pt-PT", i18n.activeLocale());
+            \\    // Another region, or no region: the first shipped pt-* in tag order.
+            \\    try std.testing.expect(i18n.applySystemLocale("pt-AO"));
+            \\    try std.testing.expectEqualStrings("pt-BR", i18n.activeLocale());
+            \\    try std.testing.expect(i18n.applySystemLocale("pt"));
+            \\    try std.testing.expectEqualStrings("pt-BR", i18n.activeLocale());
+            \\}
+        );
+    }
 };
