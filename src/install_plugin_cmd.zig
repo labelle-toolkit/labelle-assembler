@@ -81,6 +81,10 @@ pub fn addOverride(
     // A `local:`/`@` pin already resolves straight to its path and never
     // consults a slot, so an override would be silently ignored.
     if (plugin.isLocal()) return error.PluginAlreadyLocal;
+    // An invalid `.subdir` makes `resolvePlugin` fail before it ever reaches
+    // the slot, so an override installed for it could never be used: refuse
+    // (and say why) before writing anything (Codex review).
+    if (cache.pluginSubdir.problem(plugin) != null) return error.InvalidPluginSubdir;
 
     const source = try cache.resolveLocalSource(allocator, spec, project_root);
     errdefer allocator.free(source);
@@ -215,6 +219,8 @@ pub fn run(
         .link => |spec| {
             const source = addOverride(allocator, plugin, spec, project_root) catch |err| {
                 switch (err) {
+                    // Logs the reason, naming the plugin.
+                    error.InvalidPluginSubdir => cache.pluginSubdir.validate(plugin) catch {},
                     error.PluginAlreadyLocal => std.log.err(
                         "labelle-assembler install plugin: '{s}' is already pinned to the local path '{s}' in project.labelle — an override would never be consulted",
                         .{ plugin.name, plugin.repo },
@@ -400,6 +406,13 @@ test "install plugin: rejects local pins, missing dirs and non-plugin dirs" {
     const alloc = std.testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit(alloc);
+
+    var bad_subdir = debug_pin;
+    bad_subdir.subdir = "../plugin";
+    const ok_spec = try std.fmt.allocPrint(alloc, "local:{s}", .{fx.checkout});
+    defer alloc.free(ok_spec);
+    try std.testing.expectError(error.InvalidPluginSubdir, addOverride(alloc, bad_subdir, ok_spec, null));
+    try std.testing.expect(try explicitSource(alloc, bad_subdir) == null);
 
     const local_pin: config.PluginDep = .{ .name = "caretaker", .repo = "@libs/caretaker" };
     try std.testing.expectError(error.PluginAlreadyLocal, addOverride(alloc, local_pin, "local:x", null));
