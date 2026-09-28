@@ -752,9 +752,9 @@ pub fn localVersionPath(version: []const u8) []const u8 {
 }
 
 /// Whether `version` looks like a semantic version number — i.e. it starts
-/// with a digit (`1.2.3`, `0.31.0`, `2`). Used to decide how a version maps
-/// to a git ref: semver-shaped versions are published as `v`-prefixed tags
-/// (`v1.2.3`), while anything else is treated as a branch / ref name.
+/// with a digit (`1.2.3`, `0.31.0`, `2`). This is the RELEASE predicate the
+/// version gates compare; the git-ref mapping (`isTagVersion`) also
+/// accepts pre-release/build-suffixed semver (#783).
 pub fn isSemverVersion(version: []const u8) bool {
     // A package release version is digits and dots only, with at least
     // one dot (`1.13.0`, `0.31.0`). "Starts with a digit" was too loose
@@ -784,12 +784,26 @@ pub fn isSemverVersion(version: []const u8) bool {
 /// appending `.0`, and this does the same rather than inventing a second
 /// convention.
 ///
+/// A pre-release or build-suffixed pin (`0.31.0-rc.1`, `2.0.0+ci.5` — a
+/// fetchable tag since #783, see `isTagVersion`) is judged as its
+/// `MAJOR.MINOR.PATCH`: the suffix is dropped. For build metadata that is
+/// the spec (it does not affect precedence). For a pre-release it is the
+/// gates' deliberate choice: as a floor's SUBJECT it can only fire a floor
+/// early (conservative); as a REQUIREMENT, `2.1.0-rc.1` passes a
+/// `>= 2.1.0` floor (permissive, like every other dev pin) while
+/// `2.0.0-rc.1` still fails it.
+///
 /// A dotted string that is still unparsable after padding (`1.2.3.4`, which
 /// `isSemverVersion` also admits) returns `error.UnparsableVersionPin` with
 /// the offending value named — a readable failure instead of the
 /// `catch unreachable` crash this used to take (#683 review).
 pub fn parsePin(version: []const u8) error{UnparsableVersionPin}!std.SemanticVersion {
-    if (std.SemanticVersion.parse(version)) |v| return v else |_| {}
+    if (std.SemanticVersion.parse(version)) |parsed| {
+        var v = parsed;
+        v.pre = null;
+        v.build = null;
+        return v;
+    } else |_| {}
     var buf: [64]u8 = undefined;
     const padded = std.fmt.bufPrint(&buf, "{s}.0", .{version}) catch {
         std.debug.print("version pin '{s}' is too long to normalize\n", .{version});
@@ -923,45 +937,14 @@ test "normalizeRemote/sameRemote fold every spelling of one remote, keep distinc
     try std.testing.expect(!sameRemote("local:github.com/labelle-toolkit/labelle-bgfx", canonical));
 }
 
-/// Map a package `version` string to the git ref to clone.
-///
-/// A semver-shaped version (`1.2.3`) maps to the published release tag
-/// `v1.2.3`. Anything else — `dev`, `main`, a feature-branch name — is a
-/// ref in its own right and is used verbatim. Blindly prepending `v` to a
-/// non-numeric version produced bogus refs like `vdev` that failed deep
-/// inside `git clone` (issue #159).
-///
-/// Returns an allocator-owned slice; the caller frees it.
-pub fn versionToGitRef(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
-    if (isSemverVersion(version)) {
-        return std.fmt.allocPrint(allocator, "v{s}", .{version});
-    }
-    return allocator.dupe(u8, version);
-}
+/// Package `version` → git ref, and the predicate behind it (#159, #783).
+/// See `version_ref.zig`.
+pub const versionToGitRef = version_ref.versionToGitRef;
+pub const isTagVersion = version_ref.isTagVersion;
+const version_ref = @import("version_ref.zig");
 
-test "versionToGitRef: semver versions get a `v` prefix" {
-    const alloc = std.testing.allocator;
-    inline for (.{
-        .{ "1.2.3", "v1.2.3" },
-        .{ "0.31.0", "v0.31.0" },
-        .{ "1.13.0", "v1.13.0" },
-    }) |case| {
-        const ref = try versionToGitRef(alloc, case[0]);
-        defer alloc.free(ref);
-        try std.testing.expectEqualStrings(case[1], ref);
-    }
-}
-
-test "versionToGitRef: non-numeric versions are used verbatim as a ref" {
-    const alloc = std.testing.allocator;
-    // The #159 regression: `dev` must not become `vdev`. Digit-leading
-    // branch refs (`159-fix`, `2026/dev`) must also pass through verbatim
-    // — they are not semver despite the leading digit.
-    inline for (.{ "dev", "main", "feature/foo", "159-fix", "2026/dev" }) |branch| {
-        const ref = try versionToGitRef(alloc, branch);
-        defer alloc.free(ref);
-        try std.testing.expectEqualStrings(branch, ref);
-    }
+test {
+    _ = version_ref;
 }
 
 // ── Per-feature engine-version gates ────────────────────────────────────
@@ -991,12 +974,12 @@ pub const FeatureSupport = enum {
 /// not to punish a deliberate dev setup — such pins come back
 /// `unverifiable`, never `no`.
 pub fn engineFeatureSupport(engine_version: []const u8, comptime min: []const u8) FeatureSupport {
-    // Classify with the repo's own release predicate FIRST: a
-    // digit-leading branch pin like `2.10.0-feature` is resolved verbatim
-    // as a git ref by `versionToGitRef`, yet `SemanticVersion.parse` would
-    // happily read it as a prerelease below the minimum and hard-reject a
-    // dev branch that may well carry the feature (codex round 3 on #650).
-    // Only true release pins are compared.
+    // Classify with the repo's own release predicate FIRST: a pre-release
+    // pin like `2.10.0-feature` (fetched as the tag `v2.10.0-feature`,
+    // #783) sorts below its release, yet a pre-release is how a feature is
+    // used before it ships — comparing it would hard-reject a pin that may
+    // well carry the feature (codex round 3 on #650). Only true release
+    // pins are compared.
     if (!isSemverVersion(engine_version)) return .unverifiable;
     const min_ver = std.SemanticVersion.parse(min) catch unreachable;
     // A release-shaped pin that SemanticVersion cannot parse is the

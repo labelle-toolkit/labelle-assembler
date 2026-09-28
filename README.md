@@ -215,11 +215,11 @@ message, and nothing is written; upgrade core first (`upgrade core <ver>` or
 `upgrade all`). A curated floor warns and proceeds. The command doesn't move
 core, engine or gfx: an incoherent trio is only warned about, and a no-op
 still warns when the current pairing is already below a floor. Versions must be
-strict `MAJOR.MINOR.PATCH`; anything else (`1.2`, `1.2.3.4`, `v1.2.3`) is
-refused (exit 2). A pre-release or build suffix (`1.2.3-rc.1`, `1.2.3+b.5`)
-is refused too, because the fetch path can't fetch such a pin yet
-(assembler#783). A pre-release pin already in the file is judged by the
-floors as its `MAJOR.MINOR.PATCH`.
+strict semver; anything else (`1.2`, `1.2.3.4`, `v1.2.3`) is refused (exit 2).
+A pre-release or build suffix (`1.2.3-rc.1`, `1.2.3+b.5`) is written as
+given. It is fetched as the tag of the same name (`v1.2.3-rc.1`, build
+metadata kept), and the floors judge it as its `MAJOR.MINOR.PATCH`
+(assembler#783).
 
 ### Plugin build options supplied by the assembler
 

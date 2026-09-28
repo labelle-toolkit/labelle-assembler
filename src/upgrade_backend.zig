@@ -27,9 +27,9 @@
 //! * A version that is not strict `MAJOR.MINOR.PATCH` — refused (exit 2):
 //!   `1.2`, `1.2.3.4`, `v1.2.3` and anything else `std.SemanticVersion`
 //!   rejects. A valid semver WITH a pre-release or build suffix
-//!   (`1.2.3-rc.1`, `1.2.3+b.5`) is refused too: the fetch path cannot fetch
-//!   such a pin yet (assembler#783). A pre-release pin ALREADY in the file
-//!   is judged by the floor tables as its `MAJOR.MINOR.PATCH`.
+//!   (`1.2.3-rc.1`, `1.2.3+b.5`) is written: the fetch path fetches it as the
+//!   tag `v1.2.3-rc.1` (assembler#783), and the floor tables judge it as its
+//!   `MAJOR.MINOR.PATCH` (`config.parsePin`).
 //! * A `local:` / `@` package — it builds from its checkout, so there is no
 //!   pin to bump: a no-op without a version, refused with one.
 //! * A third-party package with no version given — it has no builtin
@@ -82,7 +82,6 @@ pub fn plan(a: std.mem.Allocator, content: []const u8, requested: ?[]const u8) !
     if (requested) |v| {
         const example = ProjectConfig.builtinProvider(cfg.effectiveBackend()).?.version;
         if (!isStrictSemver(v)) return refuse(a, 2, "'{s}' is not a semantic version — pass MAJOR.MINOR.PATCH (e.g. {s})", .{ v, example });
-        if (!isRelease(v)) return refuse(a, 2, "'{s}' has a pre-release/build suffix: the fetch path doesn't support pre-release versions yet; see assembler#783 — pass MAJOR.MINOR.PATCH (e.g. {s})", .{ v, example });
     }
 
     var out = if (cfg.backend_package) |bp|
@@ -96,11 +95,9 @@ pub fn plan(a: std.mem.Allocator, content: []const u8, requested: ?[]const u8) !
     return out;
 }
 
-fn currentFloorWarnings(a: std.mem.Allocator, cfg_in: ProjectConfig) ![]const []const u8 {
-    // Same normalisation as the rewrite path: a pre-release pin already in
-    // the file is judged as its MAJOR.MINOR.PATCH, not skipped.
-    var cfg = cfg_in;
-    if (cfg.backend_package) |*bp| bp.version = try floorVersion(a, bp.version);
+fn currentFloorWarnings(a: std.mem.Allocator, cfg: ProjectConfig) ![]const []const u8 {
+    // A pre-release pin already in the file is judged as its
+    // MAJOR.MINOR.PATCH by the table itself (`config.parsePin`), not skipped.
     const v = version_floors.verdict(cfg) catch return &.{};
     var warnings: std.ArrayList([]const u8) = .empty;
     if (v.backend) |b| {
@@ -138,9 +135,9 @@ fn planExplicit(a: std.mem.Allocator, content: []const u8, cfg: ProjectConfig, b
     };
     if (std.mem.eql(u8, bp.version, target)) return noop(a, "backend package '{s}' is already at {s}", .{ bp.name, target });
 
-    if (!isRelease(target)) return refuse(a, 1, "refusing to write '{s}': not a MAJOR.MINOR.PATCH release (assembler#783)", .{target});
+    if (!isStrictSemver(target)) return refuse(a, 1, "refusing to write '{s}': not a semantic version", .{target});
     var prospective = cfg;
-    prospective.backend_package.?.version = try floorVersion(a, target);
+    prospective.backend_package.?.version = target;
     var warnings: std.ArrayList([]const u8) = .empty;
     if (try floorGate(a, prospective, &warnings)) |r| return r;
 
@@ -166,9 +163,9 @@ fn planShorthand(a: std.mem.Allocator, content: []const u8, cfg: ProjectConfig, 
         .{ how, official.name, official.version },
     );
 
-    if (!isRelease(target)) return refuse(a, 1, "refusing to write '{s}': not a MAJOR.MINOR.PATCH release (assembler#783)", .{target});
+    if (!isStrictSemver(target)) return refuse(a, 1, "refusing to write '{s}': not a semantic version", .{target});
     var prospective = cfg;
-    prospective.backend_package = .{ .name = official.name, .repo = official.repo, .version = try floorVersion(a, target) };
+    prospective.backend_package = .{ .name = official.name, .repo = official.repo, .version = target };
     var warnings: std.ArrayList([]const u8) = .empty;
     if (try floorGate(a, prospective, &warnings)) |r| return r;
 
@@ -214,33 +211,21 @@ fn floorGate(a: std.mem.Allocator, prospective: ProjectConfig, warnings: *std.Ar
     return null;
 }
 
-/// Strict semver 2.0.0 (`std.SemanticVersion.parse`): exactly
-/// MAJOR.MINOR.PATCH, optionally `-pre.release` and/or `+build`; no `v`
-/// prefix, no 4th numeric component, no `X.Y` abbreviation.
+/// Strict semver 2.0.0: exactly MAJOR.MINOR.PATCH, optionally
+/// `-pre.release` and/or `+build`; no `v` prefix, no 4th numeric component,
+/// no `X.Y` abbreviation. Also a version the fetch path fetches as its tag
+/// (`config.isTagVersion`, #783): `std.SemanticVersion.parse` alone takes a
+/// numeric core like `1_0.2.3`, which the fetch path would clone as a
+/// verbatim branch — so such a pin is never written.
 pub fn isStrictSemver(v: []const u8) bool {
     _ = std.SemanticVersion.parse(v) catch return false;
-    return true;
+    return config.isTagVersion(v);
 }
 
-/// Strict semver with NO pre-release/build suffix: the only pins the fetch
-/// path can fetch today (assembler#783) and so the only ones this command
-/// writes.
+/// Strict semver with NO pre-release/build suffix.
 pub fn isRelease(v: []const u8) bool {
     const sv = std.SemanticVersion.parse(v) catch return false;
     return sv.pre == null and sv.build == null;
-}
-
-/// The version the floor tables judge: MAJOR.MINOR.PATCH with any
-/// pre-release/build suffix dropped. This command never WRITES a suffixed
-/// pin (#783), but one may already be in the file (hand-edited). The tables
-/// only read release-shaped pins (`config.isSemverVersion`) and would
-/// otherwise SKIP a `-rc.1` pin entirely; judging `0.26.0-rc.1` as `0.26.0`
-/// is conservative (a pre-release sorts below its release, so at most it is
-/// floored early). A pin that is not semver at all is returned unchanged.
-fn floorVersion(a: std.mem.Allocator, v: []const u8) ![]const u8 {
-    const sv = std.SemanticVersion.parse(v) catch return v;
-    if (sv.pre == null and sv.build == null) return v;
-    return std.fmt.allocPrint(a, "{d}.{d}.{d}", .{ sv.major, sv.minor, sv.patch });
 }
 
 fn roundTrips(a: std.mem.Allocator, before: ProjectConfig, new_content: []const u8, target: []const u8) !bool {
@@ -865,27 +850,28 @@ test "upgrade backend: a non-semver version is refused" {
     try testing.expect(std.mem.indexOf(u8, r.message, "not a semantic version") != null);
 }
 
-test "upgrade backend: versions are strict MAJOR.MINOR.PATCH — 1.2.3.4, 1.2, v1.2.3 invalid; 1.2.3-rc.1 refused (#783)" {
+test "upgrade backend: versions are strict semver — 1.2.3.4, 1.2, v1.2.3 invalid; 1.2.3-rc.1 and +build written (#783)" {
     var ar = Arena.init();
     defer ar.deinit();
     const shorthand = ".{ .name = \"g\", .backend = .sokol }";
     const explicit = ".{ .name = \"g\", .backend_package = .{ .name = \"acme\", .repo = \"github.com/acme/labelle-acme\", .version = \"1.0.0\" } }";
     for ([_][]const u8{ shorthand, explicit }) |src| {
-        for ([_][]const u8{ "1.2.3.4", "1.2", "v1.2.3", "1.2.3-", "01.2.3" }) |bad| {
+        for ([_][]const u8{ "1.2.3.4", "1.2", "v1.2.3", "1.2.3-", "01.2.3", "1_0.2.3", "1_0.2.3-rc.1" }) |bad| {
             const r = try plan(ar.a(), src, bad);
             errdefer std.debug.print("version '{s}' was not refused\n", .{bad});
             try testing.expectEqual(Outcome.Kind.refuse, r.kind);
             try testing.expectEqual(@as(u8, 2), r.code);
             try testing.expect(std.mem.indexOf(u8, r.message, "not a semantic version") != null);
         }
-        // Valid semver with a suffix: refused because it cannot be fetched.
+        // Valid semver with a suffix: written verbatim — the fetch path
+        // fetches it as the `v`-prefixed tag of the same name.
         for ([_][]const u8{ "1.2.3-rc.1", "1.2.3+build.5", "1.2.3-rc.1+b" }) |pre| {
             const r = try plan(ar.a(), src, pre);
-            errdefer std.debug.print("version '{s}' was not refused\n", .{pre});
-            try testing.expectEqual(Outcome.Kind.refuse, r.kind);
-            try testing.expectEqual(@as(u8, 2), r.code);
-            try testing.expect(std.mem.indexOf(u8, r.message, "the fetch path doesn't support pre-release versions yet; see assembler#783") != null);
-            try testing.expectEqualStrings("", r.content);
+            errdefer std.debug.print("version '{s}' was not written\n", .{pre});
+            try testing.expectEqual(Outcome.Kind.rewrite, r.kind);
+            try testing.expectEqualStrings(pre, (try parse(ar.a(), r.content)).backend_package.?.version);
+            const ref = try config.versionToGitRef(ar.a(), pre);
+            try testing.expectEqualStrings(try std.fmt.allocPrint(ar.a(), "v{s}", .{pre}), ref);
         }
         // A plain release is still written.
         try testing.expectEqual(Outcome.Kind.rewrite, (try plan(ar.a(), src, "1.2.4")).kind);
@@ -904,8 +890,10 @@ test "upgrade backend: a no-op judges a pre-release pin already in the file by i
     try testing.expectEqual(@as(usize, 1), out.warnings.len);
     try testing.expect(std.mem.indexOf(u8, out.warnings[0], "already trips a floor") != null);
     try testing.expect(std.mem.indexOf(u8, out.warnings[0], "requires labelle-core >= 2.1.0") != null);
-    // Mechanism: the raw config alone is NOT judged by the table.
-    try testing.expect((try version_floors.configBackendCoreFloorViolation(try parse(ar.a(), src))) == null);
+    // Mechanism: the floor table itself judges the raw pin (the same verdict
+    // `generate` reaches), quoting it as written.
+    const fv = (try version_floors.configBackendCoreFloorViolation(try parse(ar.a(), src))).?;
+    try testing.expectEqualStrings("0.31.0-rc.1", fv.backend_version);
 }
 
 test "upgrade backend: .backend sharing a line with a later last field keeps valid separators" {
@@ -985,16 +973,6 @@ test "upgrade backend: a first-party .backend_package with no .version gets the 
     , out.content);
     // ...and a second bare run is a no-op.
     try testing.expectEqual(Outcome.Kind.noop, (try plan(ar.a(), out.content, null)).kind);
-}
-
-test "isStrictSemver / isRelease, and every builtinProvider default is a release" {
-    for ([_][]const u8{ "1.2.3", "0.30.0", "1.2.3-rc.1", "1.2.3+b.5", "1.2.3-alpha.1+sha.abc" }) |v| try testing.expect(isStrictSemver(v));
-    for ([_][]const u8{ "1.2.3.4", "1.2", "v1.2.3", "", "main", "1.2.3-", "1.2.3-01" }) |v| try testing.expect(!isStrictSemver(v));
-    try testing.expect(isRelease("1.2.3"));
-    for ([_][]const u8{ "1.2.3-rc.1", "1.2.3+b.5", "1.2", "1.2.3.4" }) |v| try testing.expect(!isRelease(v));
-    inline for (@typeInfo(config.Backend).@"enum".fields) |f| {
-        try testing.expect(isRelease(ProjectConfig.builtinProvider(@enumFromInt(f.value)).?.version));
-    }
 }
 
 test "upgrade backend: comments, strings and enum literals spelling the field are not matched" {
