@@ -908,10 +908,17 @@ test "describe: a git+https spelling of the official repo is not answered from t
 
     // Not installed: previously `builtin` + supported (sameRemote accepted
     // the spelling); now unverified, exactly like any non-official repo.
-    const d = try describe(a, cfg, f.dir, "desktop");
+    // The probe is injected: on Windows the cache path of a `git+https:`
+    // repo holds a `:`, which Zig 0.16's Debug std turns into a panic
+    // (OBJECT_NAME_INVALID) inside `Dir.access` instead of an error.
+    const d = try describeWith(a, cfg, f.dir, "desktop", .{ .access = accessFileNotFound });
     try testing.expect(d.package_dir == null);
     try testing.expectEqual(CapabilitySource.unknown, d.capabilities_source);
     try testing.expect(d.backend.id == null);
+
+    // The installed half needs that path on disk — POSIX only, for the
+    // reason above.
+    if (@import("builtin").os.tag == .windows) return;
 
     // Installed with its real `labelle.sokol` id: the identity check (the
     // classification the snapshot now shares) refuses it, and describe says so.
