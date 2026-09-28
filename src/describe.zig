@@ -62,13 +62,13 @@ pub const SCHEMA = "labelle.describe/v1";
 
 /// Where `supported` got the provider's declared capabilities from.
 pub const CapabilitySource = enum {
-    /// The installed package's `backend.manifest.v2.zon` (or a legacy
-    /// `backend.manifest.zon`).
+    /// The installed package's `backend.manifest.v2.zon`.
     manifest,
     /// Not installed; a first-party backend at its `builtinProvider`
     /// default version, answered from `builtin_snapshots`.
     builtin,
-    /// Not installed and not a known first-party version: unverifiable.
+    /// No declared set was read: not installed and not a known first-party
+    /// version, or installed without a readable v2 manifest.
     unknown,
 };
 
@@ -199,26 +199,45 @@ pub fn describe(arena: std.mem.Allocator, cfg_in: ProjectConfig, project_dir: []
     }
 
     // The declared capability set, and the v2 manifest when there is one.
+    // `capabilities_source` becomes `.manifest` only once a v2 manifest has
+    // actually been parsed.
     var declared: []const Capability = &.{};
     var manifest: ?manifest_v2.BackendManifestV2 = null;
     if (installed) {
-        desc.capabilities_source = .manifest;
         const v2_path = try std.fs.path.join(arena, &.{ pkg_dir, manifest_v2.V2_MANIFEST_NAME });
-        if (dirExists(v2_path)) {
-            manifest = manifest_v2.loadNamedManifest(arena, cfg, project_dir, manifest_v2.V2_MANIFEST_NAME) catch |err| {
+        if (!dirExists(v2_path)) {
+            // `generate` needs the v2 build-graph manifest: without it the
+            // run fails with `ExternalBackendNeedsManifest`, whether or not a
+            // legacy `backend.manifest.zon` is present (that file carries
+            // identity only; the v1 codegen path is gone).
+            const legacy_path = try std.fs.path.join(arena, &.{ pkg_dir, manifest_splice.LEGACY_MANIFEST_NAME });
+            desc.supported = false;
+            desc.reason = if (dirExists(legacy_path))
+                try std.fmt.allocPrint(arena, "backend '{s}': the package at '{s}' ships only the legacy {s}; generate needs {s} (ExternalBackendNeedsManifest)", .{ name, pkg_dir, manifest_splice.LEGACY_MANIFEST_NAME, manifest_v2.V2_MANIFEST_NAME })
+            else
+                try std.fmt.allocPrint(arena, "backend '{s}': the package at '{s}' ships no {s}; generate needs one (ExternalBackendNeedsManifest)", .{ name, pkg_dir, manifest_v2.V2_MANIFEST_NAME });
+            return desc;
+        }
+        const m = manifest_v2.loadNamedManifest(arena, cfg, project_dir, manifest_v2.V2_MANIFEST_NAME) catch |err| {
+            desc.supported = false;
+            desc.reason = try std.fmt.allocPrint(arena, "backend '{s}': {s} at '{s}' could not be read ({s})", .{ name, manifest_v2.V2_MANIFEST_NAME, pkg_dir, @errorName(err) });
+            return desc;
+        };
+        desc.capabilities_source = .manifest;
+        manifest = m;
+        declared = m.capabilities;
+
+        // The identity check `generate` runs (`validateProviderContracts`)
+        // before any codegen: a reserved, drifted or malformed id fails the
+        // run, so it is never reported as a supported identity.
+        if (m.id) |id| {
+            var w: std.Io.Writer.Allocating = .init(arena);
+            backend_registry.checkProviderIdentity(cfg, id, &w.writer) catch {
                 desc.supported = false;
-                desc.reason = try std.fmt.allocPrint(arena, "backend '{s}': {s} at '{s}' could not be read ({s})", .{ name, manifest_v2.V2_MANIFEST_NAME, pkg_dir, @errorName(err) });
+                desc.reason = w.written();
                 return desc;
             };
-            desc.backend.id = manifest.?.id;
-            declared = manifest.?.capabilities;
-        } else if (manifest_splice.loadProviderManifest(arena, cfg, project_dir) catch null) |pm| {
-            desc.backend.id = pm.id;
-            declared = pm.capabilities;
-        } else {
-            desc.supported = false;
-            desc.reason = try std.fmt.allocPrint(arena, "backend '{s}': the package at '{s}' ships no {s}, so it cannot generate for any target", .{ name, pkg_dir, manifest_v2.V2_MANIFEST_NAME });
-            return desc;
+            desc.backend.id = id;
         }
     } else if (bp) |b| {
         if (builtinSnapshot(b)) |s| {
@@ -378,10 +397,17 @@ const Fixture = struct {
 
     /// Install a fake package with `manifest` at `<home>/packages/<sub>`.
     fn installPackage(f: *Fixture, sub: []const u8, manifest: []const u8) !void {
+        try f.installFile(sub, manifest_v2.V2_MANIFEST_NAME, manifest);
+    }
+
+    /// Create `<home>/packages/<sub>` and, unless `file_name` is null, one
+    /// file in it.
+    fn installFile(f: *Fixture, sub: []const u8, file_name: ?[]const u8, data: []const u8) !void {
         const rel = try std.fs.path.join(f.arena(), &.{ "asm-471-home", "packages", sub });
         try f.tmp.dir.createDirPath(testing.io, rel);
-        const file = try std.fs.path.join(f.arena(), &.{ rel, manifest_v2.V2_MANIFEST_NAME });
-        try f.tmp.dir.writeFile(testing.io, .{ .sub_path = file, .data = manifest });
+        const name = file_name orelse return;
+        const file = try std.fs.path.join(f.arena(), &.{ rel, name });
+        try f.tmp.dir.writeFile(testing.io, .{ .sub_path = file, .data = data });
     }
 };
 
@@ -542,7 +568,7 @@ test "describe: JSON shape (golden)" {
     try testing.expectEqualStrings(golden, out.written());
 
     // And the installed, supported form carries `package_dir` and no `reason`.
-    try f.installPackage("plugins/github.com/labelle-toolkit/labelle-raylib/0.3.0", test_manifest_desktop_android);
+    try f.installPackage("plugins/github.com/labelle-toolkit/labelle-raylib/0.3.0", try manifestWithId(f.arena(), "labelle.raylib"));
     const i = try describe(f.arena(), cfg, f.dir, "desktop");
     var out2: std.Io.Writer.Allocating = .init(f.arena());
     try writeJson(&out2.writer, i);
@@ -582,6 +608,91 @@ test "describe: human output" {
     try testing.expect(std.mem.indexOf(u8, text, "backend       raylib (labelle.raylib)\n") != null);
     try testing.expect(std.mem.indexOf(u8, text, "supported     NO") != null);
     try testing.expect(std.mem.indexOf(u8, text, "reason      backend provider 'labelle.raylib'") != null);
+}
+
+test "describe: an installed package with only the legacy backend.manifest.zon is unsupported (generate needs v2)" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const cfg = try f.parse(
+        \\.{ .name = "g", .backend_package = .{ .name = "acme", .repo = "github.com/acme/labelle-acme", .version = "1.0.0" } }
+    );
+    try f.installFile("plugins/github.com/acme/labelle-acme/1.0.0", manifest_splice.LEGACY_MANIFEST_NAME,
+        \\.{ .dir_name = "acme", .dep_name = "labelle_acme", .id = "acme.acme", .capabilities = .{ .screenshots } }
+    );
+    const d = try describe(f.arena(), cfg, f.dir, "desktop");
+    try testing.expect(!d.supported);
+    try testing.expect(std.mem.indexOf(u8, d.reason.?, "ships only the legacy backend.manifest.zon") != null);
+    try testing.expect(std.mem.indexOf(u8, d.reason.?, "ExternalBackendNeedsManifest") != null);
+    // The legacy file's capabilities were not used for the answer.
+    try testing.expectEqual(CapabilitySource.unknown, d.capabilities_source);
+    try testing.expect(d.package_dir != null);
+}
+
+test "describe: an installed package dir with no manifest is unsupported and capabilities_source stays unknown" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const cfg = try f.parse(".{ .name = \"g\", .backend = .raylib }");
+    try f.installFile("plugins/github.com/labelle-toolkit/labelle-raylib/0.3.0", null, "");
+    const d = try describe(f.arena(), cfg, f.dir, "desktop");
+    try testing.expect(!d.supported);
+    try testing.expect(std.mem.indexOf(u8, d.reason.?, "ships no backend.manifest.v2.zon") != null);
+    try testing.expectEqual(CapabilitySource.unknown, d.capabilities_source);
+    try testing.expect(d.package_dir != null);
+}
+
+test "describe: a manifest id that generate's identity check rejects is unsupported, with that check's reason" {
+    var f = try Fixture.init();
+    defer f.deinit();
+
+    // Reserved namespace: a third-party repo claiming `labelle.*`.
+    const third = try f.parse(
+        \\.{ .name = "g", .backend_package = .{ .name = "acme", .repo = "github.com/acme/labelle-acme", .version = "1.0.0" } }
+    );
+    try f.installPackage("plugins/github.com/acme/labelle-acme/1.0.0", try manifestWithId(f.arena(), "labelle.bgfx"));
+    const r = try describe(f.arena(), third, f.dir, "desktop");
+    try testing.expect(!r.supported);
+    try testing.expect(r.backend.id == null);
+    try testing.expect(std.mem.indexOf(u8, r.reason.?, "claims the reserved 'labelle.*' namespace") != null);
+
+    // Drift: the `.sokol` shorthand resolving a manifest that says bgfx.
+    const shorthand = try f.parse(".{ .name = \"g\", .backend = .sokol }");
+    try f.installPackage("plugins/github.com/labelle-toolkit/labelle-sokol/" ++ comptime ProjectConfig.builtinProvider(.sokol).?.version, try manifestWithId(f.arena(), "labelle.bgfx"));
+    const drift = try describe(f.arena(), shorthand, f.dir, "desktop");
+    try testing.expect(!drift.supported);
+    try testing.expect(drift.backend.id == null);
+    try testing.expect(std.mem.indexOf(u8, drift.reason.?, "but the tag is a shorthand for 'labelle.sokol'") != null);
+
+    // Malformed: no namespace.
+    const local = try f.parse(
+        \\.{ .name = "g", .backend_package = .{ .name = "odd", .repo = "local:vendor/odd", .version = "0.1.0" } }
+    );
+    try f.tmp.dir.createDirPath(testing.io, "vendor/odd");
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "vendor/odd/" ++ manifest_v2.V2_MANIFEST_NAME, .data = try manifestWithId(f.arena(), "odd") });
+    const bad = try describe(f.arena(), local, f.dir, "desktop");
+    try testing.expect(!bad.supported);
+    try testing.expect(bad.backend.id == null);
+    try testing.expect(std.mem.indexOf(u8, bad.reason.?, "is not a canonical '<namespace>.<name>'") != null);
+
+    // The same checks, through generate's own entry point, agree.
+    try testing.expectError(error.ReservedProviderNamespace, backend_registry.validateProviderIdentity(third, "labelle.bgfx"));
+    try testing.expectError(error.ProviderIdDrift, backend_registry.validateProviderIdentity(shorthand, "labelle.bgfx"));
+    try testing.expectError(error.MalformedProviderId, backend_registry.validateProviderIdentity(local, "odd"));
+}
+
+fn manifestWithId(a: std.mem.Allocator, id: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a,
+        \\.{{
+        \\    .manifest_version = 2,
+        \\    .dir_name = "x",
+        \\    .dep_name = "labelle_x",
+        \\    .id = "{s}",
+        \\    .capabilities = .{{ .screenshots }},
+        \\    .modules = .{{}},
+        \\    .platforms = .{{
+        \\        .desktop = .{{ .entry = "templates/desktop.txt", .loop_style = .loop, .target = .native, .package = .binary }},
+        \\    }},
+        \\}}
+    , .{id});
 }
 
 const test_manifest_desktop_android =

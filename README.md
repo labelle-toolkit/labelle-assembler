@@ -108,7 +108,8 @@ which is how the CLI came to name a third-party
 It answers with the same code `generate` runs: the `.backend` shorthand
 (`builtinProvider`), an explicit `.backend_package`, third-party packages,
 the `bgfx` default, `backendName()` for the target dir, `.asset_compression`
-for the asset format, and the resolve-time capability check (the project's
+for the asset format, the provider identity check, the requirement that an
+installed package ship `backend.manifest.v2.zon`, and the resolve-time capability check (the project's
 required capabilities against the provider's declared `.capabilities`, plus
 the v2 manifest's `.platforms.<target>` entry) for `supported`.
 
@@ -149,13 +150,13 @@ when `supported` is false:
 |-----|---------|
 | `target_dir` | `.labelle/<backend name>_<target>`, relative to the project root — the dir `generate` creates |
 | `backend.name` | `backendName()`: the package name (`bgfx`, `acme`) |
-| `backend.id` | Canonical provider id: from the installed manifest, derived as `labelle.<name>` for a first-party backend, else `null` |
+| `backend.id` | Canonical provider id: from the installed manifest once it passes `generate`'s identity check (a reserved, drifted or malformed id is `supported: false` with that check's reason instead), derived as `labelle.<name>` for a first-party backend, else `null` |
 | `backend.repo`, `backend.version` | The resolved package's pin |
 | `backend.local_path` | The resolved directory of a `local:` / `@` package, else `null` |
 | `package_dir` | The package's directory, only when it is on disk |
 | `asset_format` | `png` or `astc`, from `.asset_compression` for this target |
 | `supported`, `reason` | Whether this backend can generate for this target, and why not |
-| `capabilities_source` | `manifest` (installed), `builtin` (first-party snapshot), or `unknown` (unverified) |
+| `capabilities_source` | `manifest` (parsed from the installed v2 manifest), `builtin` (first-party snapshot), or `unknown` (nothing read: not installed, or installed without a readable v2 manifest) |
 
 Exit codes: 0 whenever an answer was produced, `supported: false` included
 (`describe` is a query, not a gate); 1 when `project.labelle` cannot be read

@@ -192,6 +192,36 @@ fn repoIsOfficialOrLocal(repo: []const u8) bool {
 /// enforcement lands in a later release). No-op for a bundled backend (no
 /// provider package — none exist today).
 pub fn validateProviderIdentity(cfg: config.ProjectConfig, manifest_id: ?[]const u8) !void {
+    if (cfg.effectiveBackendPackage() == null) return; // bundled: no identity
+    const name = cfg.backendName();
+
+    const id = manifest_id orelse {
+        // `.backend = .<tag>` with no explicit `.backend_package` is the enum
+        // shorthand: a built-in with no id derives `labelle.<name>` silently.
+        if (cfg.backend_package != null) {
+            std.log.warn(
+                "labelle-assembler: external backend '{s}' (backend_package) ships no `.id` in its backend.manifest.zon; deriving '{s}' for now (a future release will require an explicit canonical `<namespace>.<name>` id).",
+                .{ name, name },
+            );
+        }
+        return;
+    };
+
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    checkProviderIdentity(cfg, id, &w) catch |err| {
+        std.debug.print("{s}\n", .{w.buffered()});
+        return err;
+    };
+}
+
+pub const IdentityError = error{ MalformedProviderId, ReservedProviderNamespace, ProviderIdDrift };
+
+/// The pure core of `validateProviderIdentity` for a present `id`: on a
+/// violation, writes the diagnostic to `w` (no trailing newline) and returns
+/// the error; writes nothing otherwise. Shared with `describe` (labelle-cli
+/// #471 D1), which reports the diagnostic as its `reason` instead of printing.
+pub fn checkProviderIdentity(cfg: config.ProjectConfig, id: []const u8, w: *std.Io.Writer) IdentityError!void {
     const bp = cfg.effectiveBackendPackage() orelse return; // bundled: no identity
     const name = cfg.backendName();
     // `.backend = .<tag>` with no explicit `.backend_package` is the enum
@@ -199,41 +229,30 @@ pub fn validateProviderIdentity(cfg: config.ProjectConfig, manifest_id: ?[]const
     // expected `labelle.<tag>` ID).
     const is_enum_shorthand = cfg.backend_package == null;
 
-    const id = manifest_id orelse {
-        if (!is_enum_shorthand) {
-            std.log.warn(
-                "labelle-assembler: external backend '{s}' (backend_package) ships no `.id` in its backend.manifest.zon; deriving '{s}' for now (a future release will require an explicit canonical `<namespace>.<name>` id).",
-                .{ name, name },
-            );
-        }
-        // Built-in with no id → derive `labelle.<name>`, no error.
-        return;
-    };
-
     const dot = std.mem.indexOfScalar(u8, id, '.') orelse {
-        std.debug.print(
-            "labelle-assembler: backend provider id '{s}' is not a canonical '<namespace>.<name>' (e.g. 'labelle.sokol', 'acme.vulkan').\n",
+        w.print(
+            "labelle-assembler: backend provider id '{s}' is not a canonical '<namespace>.<name>' (e.g. 'labelle.sokol', 'acme.vulkan').",
             .{id},
-        );
+        ) catch {};
         return error.MalformedProviderId;
     };
     // A dot alone isn't enough: `.sokol` (empty namespace, dot == 0) and
     // `labelle.` (empty name, dot is the last byte) are BOTH malformed —
     // `<namespace>.<name>` requires a non-empty half on each side.
     if (dot == 0 or dot + 1 == id.len) {
-        std.debug.print(
-            "labelle-assembler: backend provider id '{s}' is not a canonical '<namespace>.<name>' — both the namespace and the name must be non-empty (e.g. 'labelle.sokol').\n",
+        w.print(
+            "labelle-assembler: backend provider id '{s}' is not a canonical '<namespace>.<name>' — both the namespace and the name must be non-empty (e.g. 'labelle.sokol').",
             .{id},
-        );
+        ) catch {};
         return error.MalformedProviderId;
     }
     const namespace = id[0..dot];
 
     if (std.mem.eql(u8, namespace, "labelle") and !repoIsOfficialOrLocal(bp.repo)) {
-        std.debug.print(
-            "labelle-assembler: backend provider '{s}' claims the reserved 'labelle.*' namespace but resolves from '{s}',\n  which is not an official labelle-toolkit repo. The 'labelle.' namespace is reserved for official\n  providers; use a '<vendor>.<name>' id instead.\n",
+        w.print(
+            "labelle-assembler: backend provider '{s}' claims the reserved 'labelle.*' namespace but resolves from '{s}',\n  which is not an official labelle-toolkit repo. The 'labelle.' namespace is reserved for official\n  providers; use a '<vendor>.<name>' id instead.",
             .{ id, bp.repo },
-        );
+        ) catch {};
         return error.ReservedProviderNamespace;
     }
 
@@ -244,10 +263,10 @@ pub fn validateProviderIdentity(cfg: config.ProjectConfig, manifest_id: ?[]const
         const matches = std.mem.startsWith(u8, id, prefix) and
             std.mem.eql(u8, id[prefix.len..], name);
         if (!matches) {
-            std.debug.print(
-                "labelle-assembler: built-in backend '{s}' (selected by enum tag) declares id '{s}',\n  but the tag is a shorthand for 'labelle.{s}'. Fix the provider's backend.manifest.zon `.id`.\n",
+            w.print(
+                "labelle-assembler: built-in backend '{s}' (selected by enum tag) declares id '{s}',\n  but the tag is a shorthand for 'labelle.{s}'. Fix the provider's backend.manifest.zon `.id`.",
                 .{ name, id, name },
-            );
+            ) catch {};
             return error.ProviderIdDrift;
         }
     }
