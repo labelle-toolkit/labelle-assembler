@@ -260,7 +260,9 @@ pub fn build(b: *std.Build) void {
     // this job is the only place CI runs on Windows — the unfiltered `test`
     // step runs on ubuntu/macos, where those tests skip. Without the filter
     // the platform-specific code would have no automated execution anywhere.
-    const cache_filters = [_][]const u8{ "cache.local", "cache.disk", "cache_cmd", "junction" };
+    // `plugin_subdir` / `install plugin` join them for #771/#772: plugin
+    // overrides go through the same junction-or-copy slot machinery.
+    const cache_filters = [_][]const u8{ "cache.local", "cache.disk", "cache_cmd", "junction", "plugin_subdir", "install plugin" };
     const test_cache_step = b.step("test-cache", "Run only the cache/local-slot tests");
 
     const cache_src_tests = b.addTest(.{

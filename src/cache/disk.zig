@@ -165,11 +165,25 @@ fn purgeLegacyUnkeyedSlot(allocator: std.mem.Allocator, package: []const u8) voi
 /// Populate a plugin into the cache from a source directory.
 /// Creates a symlink from the cache location to the source directory.
 pub fn populatePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, source_dir: []const u8) !void {
+    return populatePluginMode(allocator, plugin, source_dir, plugin.version, .discovered);
+}
+
+/// `populatePlugin` with the provenance spelled out: `.explicit` is an
+/// `install plugin <name> local:<path>` override (#772), which activates
+/// wherever the assembler runs — see `local.Origin.Mode`. `pinned` is
+/// recorded in the marker for diagnostics only.
+pub fn populatePluginMode(
+    allocator: std.mem.Allocator,
+    plugin: config.PluginDep,
+    source_dir: []const u8,
+    pinned: []const u8,
+    mode: local.Origin.Mode,
+) !void {
     // #685: reserved local-namespace slot, same as the framework packages.
     const target = try local.pluginSlot(allocator, plugin);
     defer allocator.free(target);
     try symlinkToCache(allocator, source_dir, target);
-    try writeOriginOrDropSlot(allocator, target, source_dir, plugin.version, .discovered);
+    try writeOriginOrDropSlot(allocator, target, source_dir, pinned, mode);
 }
 
 /// Remove a cache entry that is a LINK, leaving whatever it points at alone.
@@ -567,7 +581,13 @@ fn purgeLegacyPluginSlot(allocator: std.mem.Allocator, packages_dir: []const u8,
     // #782: an unnameable repo has no slot to purge; the resolver reports it.
     const slot = path_key.pluginCachePath(allocator, packages_dir, plugin.repo, plugin.version) catch return;
     defer allocator.free(slot);
-    _ = try purgeLegacyLocalSlot(allocator, slot, plugin.version);
+    // A `.subdir` pin (#771) caches a MONOREPO archive, whose root
+    // `build.zig.zon` versions the monorepo (the assembler's said 0.107.0 at
+    // v0.118.0), not the plugin inside it — so the content rule would delete
+    // a genuine release on every install. Judge it by shape only: a
+    // non-semver version skips the content rule, the symlink rule still runs.
+    const judged_version = if (plugin.subdir.len > 0) "" else plugin.version;
+    _ = try purgeLegacyLocalSlot(allocator, slot, judged_version);
 }
 
 /// Whether `path` exists and is accessible. Public so the cache

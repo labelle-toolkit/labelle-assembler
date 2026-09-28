@@ -245,6 +245,46 @@ is true:
   name indirectly, or declares it in an imported file, must use the manifest
   key.
 
+### Plugins that live in a monorepo directory (`.subdir`)
+
+A plugin doesn't need a repo of its own. `.subdir` pins one directory of a
+tagged repo, so a game can use the assembler's debug overlay
+(`plugins/debug`) with no sibling `labelle-assembler` checkout (#771):
+
+```zig
+.plugins = .{
+    .{ .name = "debug", .repo = "github.com/labelle-toolkit/labelle-assembler",
+       .version = "0.118.0", .subdir = "plugins/debug" },
+},
+```
+
+The tag's source archive is cached whole under
+`~/.labelle/packages/plugins/<repo>/<version>/`, and the plugin is built from
+`<that>/<subdir>`. Two plugins from the same repo and version share one
+download. `.subdir` must be a relative path inside the repo (no `..`, no
+absolute path), and it only applies to a remote `.repo`. A `local:`/`@` repo
+already names the plugin directory.
+
+### Build one plugin from a local checkout (`install plugin`)
+
+To work on one plugin against a game that pins everything to releases,
+override it outside the committed files (#772):
+
+```bash
+labelle install plugin debug local:../labelle-assembler/plugins/debug
+labelle install plugin debug            # is it overridden, and by what?
+labelle install plugin debug --unlink   # back to the pinned release
+```
+
+(`labelle install …` forwards to `labelle-assembler install …`.) The checkout
+is linked into `~/.labelle/packages/local/plugins/`. Every build, by any
+assembler, then uses it instead of the pinned release and prints a warning.
+Nothing in `project.labelle` or `labelle.lock` changes, so the override can't
+be committed by accident. The path is the plugin directory (the one with its
+`build.zig.zon`), even for a `.subdir` pin. A relative path resolves against
+`--project-root` if you pass one, else the working directory.
+`labelle-assembler clean` drops every override.
+
 ### Run tests
 
 ```bash

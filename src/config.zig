@@ -253,6 +253,19 @@ pub const PluginDep = struct {
     name: []const u8,
     repo: []const u8 = "",
     version: []const u8 = "",
+    /// Directory INSIDE the fetched `.repo` archive that holds the plugin
+    /// (#771), for a plugin that lives in a monorepo rather than at the root
+    /// of a repo of its own — e.g. the assembler's imgui debug overlay:
+    ///
+    ///     .{ .name = "debug", .repo = "github.com/labelle-toolkit/labelle-assembler",
+    ///        .version = "0.118.0", .subdir = "plugins/debug" },
+    ///
+    /// The archive is still fetched and cached whole at
+    /// `packages/plugins/<repo>/<version>`; only the plugin ROOT moves to
+    /// `<that>/<subdir>`. Empty = the repo root (every entry before #771).
+    /// Remote pins only: a `local:`/`@` repo already names the plugin
+    /// directory itself. Validated by `cache/plugin_subdir.zig`.
+    subdir: []const u8 = "",
     /// Game states this plugin runs in. Empty = all states (plugin default).
     /// Overrides the plugin's own `Systems.game_states` if set.
     states: []const []const u8 = &.{},
