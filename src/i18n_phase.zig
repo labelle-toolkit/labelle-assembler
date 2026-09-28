@@ -1151,27 +1151,38 @@ fn emitModule(
         \\/// so pt-br finds pt-BR; a POSIX `_` separator and `.charset` /
         \\/// `@modifier` suffix are normalized away first.
         \\fn matchLocale(raw: []const u8) ?usize {
-        \\    var buf: [35]u8 = undefined;
-        \\    const cut = std.mem.indexOfAny(u8, raw, ".@") orelse raw.len;
-        \\    const n = @min(cut, buf.len);
-        \\    for (raw[0..n], 0..) |c, i| buf[i] = if (c == '_') '-' else c;
-        \\    const want = buf[0..n];
+        \\    // Compared in place, never copied: a fixed buffer would truncate a
+        \\    // long valid tag and miss its exact match.
+        \\    const want = raw[0 .. std.mem.indexOfAny(u8, raw, ".@") orelse raw.len];
         \\    if (want.len == 0) return null;
         \\    for (tags, 0..) |t_, i| {
-        \\        if (std.ascii.eqlIgnoreCase(t_, want)) return i;
+        \\        if (tagEql(t_, want)) return i;
         \\    }
         \\    const lang = languageOf(want);
         \\    for (tags, 0..) |t_, i| {
-        \\        if (std.ascii.eqlIgnoreCase(t_, lang)) return i;
+        \\        if (tagEql(t_, lang)) return i;
         \\    }
         \\    for (tags, 0..) |t_, i| {
-        \\        if (std.ascii.eqlIgnoreCase(languageOf(t_), lang)) return i;
+        \\        if (tagEql(languageOf(t_), lang)) return i;
         \\    }
         \\    return null;
         \\}
         \\
+        \\/// Case-insensitive tag equality that treats POSIX `_` as `-`.
+        \\fn tagEql(a: []const u8, b: []const u8) bool {
+        \\    if (a.len != b.len) return false;
+        \\    for (a, b) |x, y| {
+        \\        if (tagChar(x) != tagChar(y)) return false;
+        \\    }
+        \\    return true;
+        \\}
+        \\
+        \\fn tagChar(c: u8) u8 {
+        \\    return if (c == '_') '-' else std.ascii.toLower(c);
+        \\}
+        \\
         \\fn languageOf(tag: []const u8) []const u8 {
-        \\    return tag[0 .. std.mem.indexOfScalar(u8, tag, '-') orelse tag.len];
+        \\    return tag[0 .. std.mem.indexOfAny(u8, tag, "-_") orelse tag.len];
         \\}
         \\
         \\/// The translated string for a key, in the active locale. Zero-cost

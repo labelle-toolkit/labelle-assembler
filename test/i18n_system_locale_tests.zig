@@ -131,4 +131,19 @@ pub const SystemLocale = struct {
             \\}
         );
     }
+
+    test "a tag longer than 35 bytes still matches exactly, not just its language" {
+        try generateAndRun(&.{
+            .{ .tag = "en", .body = "{ \"menu\": { \"play\": \"Play\" } }" },
+            .{ .tag = "en-Latn-US-variant1-variant2-variant3", .body = "{ \"menu\": { \"play\": \"Go\" } }" },
+        },
+            \\const std = @import("std");
+            \\const i18n = @import("i18n.zig");
+            \\
+            \\test "long exact tag" {
+            \\    try std.testing.expect(i18n.applySystemLocale("en_Latn_US_variant1_variant2_variant3.UTF-8"));
+            \\    try std.testing.expectEqualStrings("en-Latn-US-variant1-variant2-variant3", i18n.activeLocale());
+            \\}
+        );
+    }
 };
