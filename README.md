@@ -204,7 +204,7 @@ backend at the requested version is refused, not written.
 | Project has | No version given | A version given |
 |---|---|---|
 | `.backend = .<tag>` only (or no `.backend`, i.e. the default `bgfx`) | No-op: the shorthand already resolves to this assembler's default (`builtinProvider`) and follows it on every assembler upgrade | The default version is a no-op. Any other version adds an explicit `.backend_package = .{ .name, .repo, .version }` for the same first-party package, next to `.backend`. With no `.backend`, it also adds `.backend = .bgfx`, so the resolved backend tag and the gamepad default don't change. Delete `.backend_package` to go back to following the default |
-| An explicit first-party `.backend_package` | `.version` set to this assembler's default for that backend. A pin already newer than the default is left alone (never downgraded) | `.version` set to it (inserted when the package omits it) |
+| An explicit first-party `.backend_package` | `.version` set to this assembler's default for that backend (inserted when the package has no `.version`). A pin already newer than the default is left alone (never downgraded) | `.version` set to it (inserted when the package omits it) |
 | A third-party `.backend_package` | No-op with a note: there is no builtin default for it | `.version` set to it |
 | A `local:` / `@` `.backend_package` | No-op: it builds from its checkout | Refused (exit 2) |
 
@@ -214,8 +214,10 @@ The prospective pins go through the same `version_floors` gate as
 message, and nothing is written; upgrade core first (`upgrade core <ver>` or
 `upgrade all`). A curated floor warns and proceeds. The command doesn't move
 core, engine or gfx: an incoherent trio is only warned about, and a no-op
-still warns when the current pairing is already below a floor. A version
-that isn't a release (`X.Y.Z`) is refused (exit 2).
+still warns when the current pairing is already below a floor. Versions are
+strict semver: `MAJOR.MINOR.PATCH`, optionally with a `-pre.release` and/or
+`+build` suffix. Anything else (`1.2`, `1.2.3.4`, `v1.2.3`) is refused
+(exit 2). A pre-release is judged by the floors as its `MAJOR.MINOR.PATCH`.
 
 ### Run tests
 

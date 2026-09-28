@@ -75,7 +75,7 @@ pub fn plan(a: std.mem.Allocator, content: []const u8, requested: ?[]const u8) !
     const cfg = try parse(a, content);
 
     if (requested) |v| {
-        if (!config.isSemverVersion(v)) return refuse(a, 2, "'{s}' is not a release version — pass X.Y.Z (e.g. {s})", .{ v, ProjectConfig.builtinProvider(cfg.effectiveBackend()).?.version });
+        if (!isStrictSemver(v)) return refuse(a, 2, "'{s}' is not a semantic version — pass MAJOR.MINOR.PATCH, optionally with a -pre-release/+build suffix (e.g. {s})", .{ v, ProjectConfig.builtinProvider(cfg.effectiveBackend()).?.version });
     }
 
     var out = if (cfg.backend_package) |bp|
@@ -116,15 +116,20 @@ fn planExplicit(a: std.mem.Allocator, content: []const u8, cfg: ProjectConfig, b
             .{ bp.name, bp.repo, bp.version },
         );
         const def = ProjectConfig.builtinProvider(b).?.version;
+        // No `.version` at all (parsed as ""): nothing to downgrade, so the
+        // default is inserted.
+        if (bp.version.len == 0) break :blk def;
         if (std.mem.eql(u8, bp.version, def)) return noop(a, "backend package '{s}' is already at {s}, this assembler's default", .{ bp.name, def });
-        if (!config.isSemverVersion(bp.version)) return noop(a, "backend package '{s}' is pinned to '{s}', not a release version — left unchanged. Pass a version to replace it: upgrade backend {s}", .{ bp.name, bp.version, def });
-        if (try config.pinAtLeast(bp.version, def)) return noop(a, "backend package '{s}' {s} is newer than this assembler's default {s} — left unchanged (never downgraded; pass a version to set one explicitly)", .{ bp.name, bp.version, def });
+        const cur = std.SemanticVersion.parse(bp.version) catch return noop(a, "backend package '{s}' is pinned to '{s}', not a semantic version — left unchanged. Pass a version to replace it: upgrade backend {s}", .{ bp.name, bp.version, def });
+        const def_v = std.SemanticVersion.parse(def) catch unreachable; // builtinProvider defaults are strict semver (tested)
+        if (cur.order(def_v) != .lt) return noop(a, "backend package '{s}' {s} is newer than this assembler's default {s} — left unchanged (never downgraded; pass a version to set one explicitly)", .{ bp.name, bp.version, def });
         break :blk def;
     };
     if (std.mem.eql(u8, bp.version, target)) return noop(a, "backend package '{s}' is already at {s}", .{ bp.name, target });
 
+    if (!isStrictSemver(target)) return refuse(a, 1, "refusing to write '{s}': not a semantic version", .{target});
     var prospective = cfg;
-    prospective.backend_package.?.version = target;
+    prospective.backend_package.?.version = try floorVersion(a, target);
     var warnings: std.ArrayList([]const u8) = .empty;
     if (try floorGate(a, prospective, &warnings)) |r| return r;
 
@@ -150,8 +155,9 @@ fn planShorthand(a: std.mem.Allocator, content: []const u8, cfg: ProjectConfig, 
         .{ how, official.name, official.version },
     );
 
+    if (!isStrictSemver(target)) return refuse(a, 1, "refusing to write '{s}': not a semantic version", .{target});
     var prospective = cfg;
-    prospective.backend_package = .{ .name = official.name, .repo = official.repo, .version = target };
+    prospective.backend_package = .{ .name = official.name, .repo = official.repo, .version = try floorVersion(a, target) };
     var warnings: std.ArrayList([]const u8) = .empty;
     if (try floorGate(a, prospective, &warnings)) |r| return r;
 
@@ -195,6 +201,25 @@ fn floorGate(a: std.mem.Allocator, prospective: ProjectConfig, warnings: *std.Ar
         try warnings.append(a, try std.fmt.allocPrint(a, "this project's core/engine/gfx pins already trip a floor (this upgrade changes none of them): {s}", .{t.describe(&buf)}));
     }
     return null;
+}
+
+/// Strict semver 2.0.0 (`std.SemanticVersion.parse`): exactly
+/// MAJOR.MINOR.PATCH, optionally `-pre.release` and/or `+build`; no `v`
+/// prefix, no 4th numeric component, no `X.Y` abbreviation.
+pub fn isStrictSemver(v: []const u8) bool {
+    _ = std.SemanticVersion.parse(v) catch return false;
+    return true;
+}
+
+/// The version the floor tables judge: MAJOR.MINOR.PATCH with any
+/// pre-release/build suffix dropped. The tables only read release-shaped
+/// pins (`config.isSemverVersion`) and would otherwise SKIP a `-rc.1` pin
+/// entirely; judging `0.26.0-rc.1` as `0.26.0` is conservative (a
+/// pre-release sorts below its release, so at most it is floored early).
+fn floorVersion(a: std.mem.Allocator, v: []const u8) ![]const u8 {
+    const sv = try std.SemanticVersion.parse(v);
+    if (sv.pre == null and sv.build == null) return v;
+    return std.fmt.allocPrint(a, "{d}.{d}.{d}", .{ sv.major, sv.minor, sv.patch });
 }
 
 fn roundTrips(a: std.mem.Allocator, before: ProjectConfig, new_content: []const u8, target: []const u8) !bool {
@@ -803,12 +828,86 @@ test "upgrade backend: single-line shorthand inserts the package after .backend 
     );
 }
 
-test "upgrade backend: a non-release version is refused" {
+test "upgrade backend: a non-semver version is refused" {
     var ar = Arena.init();
     defer ar.deinit();
     const r = try plan(ar.a(), ".{ .name = \"g\", .backend = .sokol }", "main");
     try testing.expectEqual(Outcome.Kind.refuse, r.kind);
-    try testing.expect(std.mem.indexOf(u8, r.message, "not a release version") != null);
+    try testing.expect(std.mem.indexOf(u8, r.message, "not a semantic version") != null);
+}
+
+test "upgrade backend: versions are strict semver — 1.2.3.4, 1.2 and v1.2.3 refused, 1.2.3-rc.1 written" {
+    var ar = Arena.init();
+    defer ar.deinit();
+    const shorthand = ".{ .name = \"g\", .backend = .sokol }";
+    const explicit = ".{ .name = \"g\", .backend_package = .{ .name = \"acme\", .repo = \"github.com/acme/labelle-acme\", .version = \"1.0.0\" } }";
+    for ([_][]const u8{ "1.2.3.4", "1.2", "v1.2.3", "1.2.3-", "01.2.3" }) |bad| {
+        for ([_][]const u8{ shorthand, explicit }) |src| {
+            const r = try plan(ar.a(), src, bad);
+            errdefer std.debug.print("version '{s}' was not refused\n", .{bad});
+            try testing.expectEqual(Outcome.Kind.refuse, r.kind);
+            try testing.expectEqual(@as(u8, 2), r.code);
+            try testing.expect(std.mem.indexOf(u8, r.message, "not a semantic version") != null);
+        }
+    }
+    // A pre-release (and a build suffix) is valid semver, and is written.
+    const rc = try plan(ar.a(), explicit, "1.2.3-rc.1");
+    try testing.expectEqual(Outcome.Kind.rewrite, rc.kind);
+    try testing.expectEqualStrings(try std.mem.replaceOwned(u8, ar.a(), explicit, "\"1.0.0\"", "\"1.2.3-rc.1\""), rc.content);
+    try testing.expectEqual(Outcome.Kind.rewrite, (try plan(ar.a(), shorthand, "1.2.3-rc.1+build.5")).kind);
+}
+
+test "upgrade backend: a pre-release is judged by the floors as its release triple" {
+    var ar = Arena.init();
+    defer ar.deinit();
+    // bgfx >= 0.26.0 needs core >= 2.1.0; 0.26.0-rc.1 must not slip past the
+    // floor table just because it is not digits-and-dots.
+    const src = ".{ .name = \"g\", .backend = .bgfx, .core_version = \"2.0.0\", .engine_version = \"3.0.0\", .gfx_version = \"2.0.0\" }";
+    const r = try plan(ar.a(), src, "0.26.0-rc.1");
+    try testing.expectEqual(Outcome.Kind.refuse, r.kind);
+    try testing.expect(std.mem.indexOf(u8, r.message, "requires labelle-core >= 2.1.0") != null);
+}
+
+test "upgrade backend: a first-party .backend_package with no .version gets the default inserted by a bare run" {
+    var ar = Arena.init();
+    defer ar.deinit();
+    const src =
+        \\.{
+        \\    .name = "g",
+        \\    .backend = .sokol,
+        \\    .backend_package = .{
+        \\        .name = "sokol",
+        \\        .repo = "github.com/labelle-toolkit/labelle-sokol",
+        \\    },
+        \\}
+    ;
+    // Mechanism: the parser really does hand us "" for the omitted field.
+    try testing.expectEqualStrings("", (try parse(ar.a(), src)).backend_package.?.version);
+    const out = try plan(ar.a(), src, null);
+    try testing.expectEqual(Outcome.Kind.rewrite, out.kind);
+    try testing.expectEqualStrings(
+        \\.{
+        \\    .name = "g",
+        \\    .backend = .sokol,
+        \\    .backend_package = .{
+        \\        .name = "sokol",
+        \\        .repo = "github.com/labelle-toolkit/labelle-sokol",
+        \\        .version = "
+    ++ sokol_default ++
+        \\",
+        \\    },
+        \\}
+    , out.content);
+    // ...and a second bare run is a no-op.
+    try testing.expectEqual(Outcome.Kind.noop, (try plan(ar.a(), out.content, null)).kind);
+}
+
+test "isStrictSemver, and every builtinProvider default satisfies it" {
+    for ([_][]const u8{ "1.2.3", "0.30.0", "1.2.3-rc.1", "1.2.3+b.5", "1.2.3-alpha.1+sha.abc" }) |v| try testing.expect(isStrictSemver(v));
+    for ([_][]const u8{ "1.2.3.4", "1.2", "v1.2.3", "", "main", "1.2.3-", "1.2.3-01" }) |v| try testing.expect(!isStrictSemver(v));
+    inline for (@typeInfo(config.Backend).@"enum".fields) |f| {
+        try testing.expect(isStrictSemver(ProjectConfig.builtinProvider(@enumFromInt(f.value)).?.version));
+    }
 }
 
 test "upgrade backend: comments, strings and enum literals spelling the field are not matched" {
