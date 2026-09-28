@@ -127,10 +127,13 @@ pub fn refreshExplicit(allocator: std.mem.Allocator, plugin: config.PluginDep) !
     return true;
 }
 
-/// Drop `plugin`'s local slot and its marker. Returns whether there was
-/// anything to drop. Never recurses into the checkout: a link entry is
-/// removed as a link (a junction via `deleteTree`, which drops the reparse
-/// point itself — #710), a copied slot as the copy it is.
+/// Drop `plugin`'s EXPLICIT override — slot and marker. Returns whether
+/// there was one. A `.discovered` slot (monorepo auto-discovery) shares the
+/// path but is not an override, so it is left alone: removing it would
+/// silently switch a monorepo build to the release, or be recreated on the
+/// next install (Codex review). Never recurses into the checkout: a link
+/// entry is removed as a link (a junction via `deleteTree`, which drops the
+/// reparse point itself — #710), a copied slot as the copy it is.
 pub fn removeOverride(allocator: std.mem.Allocator, plugin: config.PluginDep) !bool {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
@@ -139,6 +142,11 @@ pub fn removeOverride(allocator: std.mem.Allocator, plugin: config.PluginDep) !b
     defer allocator.free(slot);
     const marker = try local.originPath(allocator, slot);
     defer allocator.free(marker);
+
+    const origin = local.readOrigin(allocator, slot) orelse return false;
+    const explicit = origin.mode == .explicit;
+    origin.deinit(allocator);
+    if (!explicit) return false;
 
     var removed = false;
     if (local.pathExists(slot) or local.isSymlinkPath(slot)) {
@@ -354,6 +362,21 @@ test "install plugin: link makes resolvePlugin take the EXPLICIT slot, unlink go
     const kept = try std.fs.path.join(alloc, &.{ fx.checkout, "build.zig.zon" });
     defer alloc.free(kept);
     try std.testing.expect(local.pathExists(kept));
+}
+
+test "install plugin: --unlink leaves a DISCOVERED slot alone" {
+    const alloc = std.testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    try cache.populatePluginMode(alloc, debug_pin, fx.checkout, "0.118.0", .discovered);
+    try std.testing.expect(!try removeOverride(alloc, debug_pin));
+    const slot = try local.pluginSlot(alloc, debug_pin);
+    defer alloc.free(slot);
+    const origin = local.readOrigin(alloc, slot) orelse return error.TestUnexpectedResult;
+    defer origin.deinit(alloc);
+    try std.testing.expectEqual(local.Origin.Mode.discovered, origin.mode);
+    try std.testing.expect(local.pathExists(slot));
 }
 
 test "install plugin: an override for one plugin leaves every other pin on its release" {
