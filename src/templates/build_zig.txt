@@ -140,7 +140,7 @@ pub fn build(b: *std.Build) void {
 
 .ios_exe_start
     const exe = b.addExecutable(.{
-        .name = "game",
+        .name = "{{exe_name}}",
         .root_module = b.createModule(.{
             .root_source_file = b.path("main.zig"),
             .target = ios_target,

@@ -34,6 +34,7 @@ const context = @import("context.zig");
 const hooks_block = @import("blocks/hooks.zig");
 const resource_loader = @import("blocks/resource_loader.zig");
 const manifest_v2 = @import("manifest_v2.zig");
+const ios_selfinfo = @import("ios_selfinfo.zig");
 
 /// Manifest-driven run-loop splice (pluggable-backends RFC, assembler#378).
 /// When non-null, the run-loop style was resolved from the backend manifest's
@@ -311,6 +312,11 @@ pub fn generateMainZigWithAnimations(
         // does not). Only consulted on wasm.
         .wasm_template_provides_panic = cfg.platform == .wasm and
             std.mem.indexOf(u8, lifecycle_tmpl, "pub const panic") != null,
+        // ios-only (#774): skip the assembler's SelfInfo override when a
+        // template already declares a root `debug`.
+        .ios_template_provides_debug = cfg.platform == .ios and
+            (try ios_selfinfo.declaresRootDecl(allocator, lifecycle_tmpl, "debug") or
+                try ios_selfinfo.declaresRootDecl(allocator, engine_template, "debug")),
     };
 
     var data = tpl.TemplateData{

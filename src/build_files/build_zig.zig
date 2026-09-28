@@ -1338,8 +1338,12 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // core-diamond walk (labelle-assembler#492).
         try emsdk_preflight.emitHelperFn(w);
     } else if (cfg.platform == .ios) {
-        // iOS: build executable for simulator, link frameworks manually
-        try tpl.writeSection(build_zig_tmpl, "ios_exe_start", w);
+        // iOS: build executable for simulator, link frameworks manually.
+        // Named after the project like the desktop binary (#362, #774); the
+        // labelle-ios provider wraps whichever single exe `zig-out/bin` holds.
+        const exe_name = try sanitizeExeName(allocator, cfg.name);
+        defer allocator.free(exe_name);
+        try tpl.renderSection(build_zig_tmpl, "ios_exe_start", .{ .exe_name = exe_name }, w);
 
         for (cfg.plugins) |plugin| {
             try w.print("                .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });

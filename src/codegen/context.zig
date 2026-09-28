@@ -180,6 +180,14 @@ pub const Codegen = struct {
     // shim is emitted exactly as before.
     wasm_template_provides_panic: bool = false,
 
+    // ios-only (#774): true when the backend's entry template (or the engine
+    // template) already declares a root `debug` — e.g. labelle-sokol
+    // v0.8.1's `mobile.txt` ships `pub const debug = … SelfInfo = void …`.
+    // The assembler then skips its own `ios_selfinfo.OVERRIDE`, which would
+    // duplicate the root decl. Computed by a tokenizer scan of the loaded
+    // templates (`ios_selfinfo.declaresRootDecl`), not a per-backend switch.
+    ios_template_provides_debug: bool = false,
+
     // ── Mixin types ──────────────────────────────────────────────────
     const AssetWiringMixin = asset_wiring.Mixin(Self);
     const SceneManifestsMixin = scene_manifests_block.Mixin(Self);

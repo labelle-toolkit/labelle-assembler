@@ -367,6 +367,67 @@ pub const MAIN_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "enableImmersiveMode") == null);
     }
 
+    // ── iOS: Zig 0.16 SelfInfo override (#774) ──────────────────────────
+
+    fn genSokolMain(platform: generate.Platform, lifecycle: []const u8) ![]const u8 {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
+        return generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .sokol,
+            .platform = platform,
+            .ecs = .mock,
+        }, lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+    }
+
+    const selfinfo_decl = "pub const debug = if (@import(\"builtin\").target.os.tag == .ios) struct {\n    pub const SelfInfo = void;\n} else struct {};";
+
+    test "ios main.zig carries the root debug.SelfInfo = void override (#774)" {
+        const main_zig = try genSokolMain(.ios, sokol_mobile_lifecycle);
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, main_zig, selfinfo_decl));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, main_zig, "pub const debug ="));
+        // Golden: the whole iOS main.zig, so the override's placement (module
+        // root, next to the imports) is reviewed, not just its presence.
+        try std.testing.expectEqualStrings(@embedFile("goldens/sokol_ios_main.zig"), main_zig);
+    }
+
+    test "ios main.zig: a backend template that already declares root `debug` keeps the only copy (#774)" {
+        // labelle-sokol v0.8.1's mobile.txt ships its own override; emitting
+        // ours too would be a duplicate root decl (a compile error).
+        const with_own = sokol_mobile_lifecycle ++
+            \\// backend-owned override
+            \\pub const debug = if (@import("builtin").target.os.tag == .ios) struct {
+            \\    pub const SelfInfo = void;
+            \\} else struct {};
+            \\
+        ;
+        const main_zig = try genSokolMain(.ios, with_own);
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, main_zig, "pub const debug ="));
+        // ...and it is the backend's (the assembler's comment is absent).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "// backend-owned override") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "labelle-assembler#774") == null);
+    }
+
+    test "ios main.zig with labelle-sokol v0.8.1's real mobile.txt (own override) has exactly one root debug (#774)" {
+        // Verbatim copy of labelle-sokol v0.8.1 `templates/mobile.txt`: the
+        // released template that already carries the override. No duplicate.
+        const main_zig = try genSokolMain(.ios, @embedFile("fixtures/sokol_v0.8.1_mobile.txt"));
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, main_zig, "pub const debug ="));
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "labelle-assembler#774") == null);
+    }
+
+    test "non-iOS main.zig has no SelfInfo override (#774)" {
+        inline for (.{ generate.Platform.android, generate.Platform.desktop }) |p| {
+            const main_zig = try genSokolMain(p, sokol_mobile_lifecycle);
+            defer std.testing.allocator.free(main_zig);
+            try std.testing.expect(std.mem.indexOf(u8, main_zig, "SelfInfo") == null);
+        }
+    }
+
     // ── RFC-Y-AXIS-CONVENTION (#370) ────────────────────────────────────
 
     test "y_axis = .up overrides the project_y_axis const to .up" {
