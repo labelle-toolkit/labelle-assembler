@@ -79,7 +79,7 @@ pub fn judge(arena: std.mem.Allocator, source: []const u8) !Verdict {
     var found: std.ArrayList(Ast.full.VarDecl) = .empty;
     for (tree.rootDecls()) |node| {
         const vd = tree.fullVarDecl(node) orelse continue;
-        if (identIs(tree, vd.ast.mut_token + 1, "debug")) try found.append(arena, vd);
+        if (try identIs(arena, tree, vd.ast.mut_token + 1, "debug")) try found.append(arena, vd);
     }
     if (found.items.len == 0) return .absent;
     if (found.items.len > 1) {
@@ -92,7 +92,7 @@ pub fn judge(arena: std.mem.Allocator, source: []const u8) !Verdict {
     if (vd.visib_token == null) return .{ .incompatible = try std.fmt.allocPrint(arena, "the root `debug` (line {d}) is not `pub`, so std cannot read it", .{line}) };
     if (!std.mem.eql(u8, tree.tokenSlice(vd.ast.mut_token), "const")) return .{ .incompatible = try std.fmt.allocPrint(arena, "the root `debug` (line {d}) is a `var`, not a `pub const`", .{line}) };
     const init = vd.ast.init_node.unwrap() orelse return .{ .incompatible = try std.fmt.allocPrint(arena, "the root `debug` (line {d}) has no value", .{line}) };
-    if (!iosValueHasSelfInfo(tree, init)) return .{ .incompatible = try std.fmt.allocPrint(arena, "the root `debug` (line {d}) has no direct `pub const SelfInfo` in the value iOS selects", .{line}) };
+    if (!try iosValueHasSelfInfo(arena, tree, init)) return .{ .incompatible = try std.fmt.allocPrint(arena, "the root `debug` (line {d}) has no direct `pub const SelfInfo` in the value iOS selects", .{line}) };
     return .provided;
 }
 
@@ -103,8 +103,8 @@ fn lineOf(tree: Ast, tok: Ast.TokenIndex) usize {
 /// Whether `node`, evaluated on iOS, is a struct literal with a direct
 /// `pub const SelfInfo`. Conservative: anything it cannot see through
 /// (an `@import`, an identifier, a call) is `false`.
-fn iosValueHasSelfInfo(tree: Ast, node: Ast.Node.Index) bool {
-    if (tree.nodeTag(node) == .grouped_expression) return iosValueHasSelfInfo(tree, tree.nodeData(node).node_and_token[0]);
+fn iosValueHasSelfInfo(arena: std.mem.Allocator, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}!bool {
+    if (tree.nodeTag(node) == .grouped_expression) return iosValueHasSelfInfo(arena, tree, tree.nodeData(node).node_and_token[0]);
     var buf: [2]Ast.Node.Index = undefined;
     if (tree.fullContainerDecl(&buf, node)) |cd| {
         if (!std.mem.eql(u8, tree.tokenSlice(cd.ast.main_token), "struct")) return false;
@@ -112,18 +112,18 @@ fn iosValueHasSelfInfo(tree: Ast, node: Ast.Node.Index) bool {
             const vd = tree.fullVarDecl(m) orelse continue;
             if (vd.visib_token == null) continue;
             if (!std.mem.eql(u8, tree.tokenSlice(vd.ast.mut_token), "const")) continue;
-            if (identIs(tree, vd.ast.mut_token + 1, "SelfInfo")) return true;
+            if (try identIs(arena, tree, vd.ast.mut_token + 1, "SelfInfo")) return true;
         }
         return false;
     }
     if (tree.fullIf(node)) |f| {
         const else_expr = f.ast.else_expr.unwrap();
-        switch (iosCondition(tree, f.ast.cond_expr)) {
-            .is_ios => return iosValueHasSelfInfo(tree, f.ast.then_expr),
-            .not_ios => return if (else_expr) |e| iosValueHasSelfInfo(tree, e) else false,
+        switch (try iosCondition(arena, tree, f.ast.cond_expr)) {
+            .is_ios => return iosValueHasSelfInfo(arena, tree, f.ast.then_expr),
+            .not_ios => return if (else_expr) |e| iosValueHasSelfInfo(arena, tree, e) else false,
             .unknown => {
                 const e = else_expr orelse return false;
-                return iosValueHasSelfInfo(tree, f.ast.then_expr) and iosValueHasSelfInfo(tree, e);
+                return try iosValueHasSelfInfo(arena, tree, f.ast.then_expr) and try iosValueHasSelfInfo(arena, tree, e);
             },
         }
     }
@@ -134,12 +134,12 @@ const Cond = enum { is_ios, not_ios, unknown };
 
 /// Recognise `<target>.os.tag == .ios` / `.ios == <…>.os.tag` (and `!=`).
 /// Anything else (`and`/`or`, a helper call, a different tag) is `unknown`.
-fn iosCondition(tree: Ast, node: Ast.Node.Index) Cond {
+fn iosCondition(arena: std.mem.Allocator, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}!Cond {
     const tag = tree.nodeTag(node);
-    if (tag == .grouped_expression) return iosCondition(tree, tree.nodeData(node).node_and_token[0]);
+    if (tag == .grouped_expression) return iosCondition(arena, tree, tree.nodeData(node).node_and_token[0]);
     if (tag != .equal_equal and tag != .bang_equal) return .unknown;
     const lhs, const rhs = tree.nodeData(node).node_and_node;
-    const matches = (isOsTag(tree, lhs) and isIosLiteral(tree, rhs)) or (isOsTag(tree, rhs) and isIosLiteral(tree, lhs));
+    const matches = (try isOsTag(arena, tree, lhs) and try isIosLiteral(arena, tree, rhs)) or (try isOsTag(arena, tree, rhs) and try isIosLiteral(arena, tree, lhs));
     if (!matches) return .unknown;
     return if (tag == .equal_equal) .is_ios else .not_ios;
 }
@@ -148,20 +148,20 @@ fn iosCondition(tree: Ast, node: Ast.Node.Index) Cond {
 /// `B` is `@import("builtin")` or a root identifier bound to it. Any other
 /// receiver (`settings.os.tag`, …) is not the target, so the condition it
 /// appears in is `unknown`.
-fn isOsTag(tree: Ast, node: Ast.Node.Index) bool {
-    const os = fieldOf(tree, node, "tag") orelse return false;
-    const recv = fieldOf(tree, os, "os") orelse return false;
-    if (isBuiltinRef(tree, recv)) return true;
-    const b = fieldOf(tree, recv, "target") orelse return false;
-    return isBuiltinRef(tree, b);
+fn isOsTag(arena: std.mem.Allocator, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}!bool {
+    const os = try fieldOf(arena, tree, node, "tag") orelse return false;
+    const recv = try fieldOf(arena, tree, os, "os") orelse return false;
+    if (try isBuiltinRef(arena, tree, recv)) return true;
+    const b = try fieldOf(arena, tree, recv, "target") orelse return false;
+    return isBuiltinRef(arena, tree, b);
 }
 
 /// For `<obj>.<name>` (either spelling of `name`), `obj`; otherwise null.
-fn fieldOf(tree: Ast, node: Ast.Node.Index, name: []const u8) ?Ast.Node.Index {
+fn fieldOf(arena: std.mem.Allocator, tree: Ast, node: Ast.Node.Index, name: []const u8) error{OutOfMemory}!?Ast.Node.Index {
     const n = unparen(tree, node);
     if (tree.nodeTag(n) != .field_access) return null;
     const obj, const field = tree.nodeData(n).node_and_token;
-    return if (identIs(tree, field, name)) obj else null;
+    return if (try identIs(arena, tree, field, name)) obj else null;
 }
 
 fn unparen(tree: Ast, node: Ast.Node.Index) Ast.Node.Index {
@@ -172,59 +172,56 @@ fn unparen(tree: Ast, node: Ast.Node.Index) Ast.Node.Index {
 
 /// `@import("builtin")`, or an identifier that a root `const` binds to it.
 /// The `debug` value is evaluated at root, so root decls are its scope.
-fn isBuiltinRef(tree: Ast, node: Ast.Node.Index) bool {
+fn isBuiltinRef(arena: std.mem.Allocator, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}!bool {
     const n = unparen(tree, node);
-    if (isImportBuiltin(tree, n)) return true;
+    if (try isImportBuiltin(arena, tree, n)) return true;
     if (tree.nodeTag(n) != .identifier) return false;
-    const ident = tree.nodeMainToken(n);
+    const ident = try identName(arena, tree, tree.nodeMainToken(n));
     for (tree.rootDecls()) |d| {
         const vd = tree.fullVarDecl(d) orelse continue;
         if (!std.mem.eql(u8, tree.tokenSlice(vd.ast.mut_token), "const")) continue;
-        if (!sameIdent(tree, vd.ast.mut_token + 1, ident)) continue;
+        if (!try identIs(arena, tree, vd.ast.mut_token + 1, ident)) continue;
         const init = vd.ast.init_node.unwrap() orelse return false;
-        return isImportBuiltin(tree, unparen(tree, init));
+        return isImportBuiltin(arena, tree, unparen(tree, init));
     }
     return false;
 }
 
-fn isImportBuiltin(tree: Ast, node: Ast.Node.Index) bool {
+fn isImportBuiltin(arena: std.mem.Allocator, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}!bool {
     var buf: [2]Ast.Node.Index = undefined;
     const params = tree.builtinCallParams(&buf, node) orelse return false;
     if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@import")) return false;
     if (params.len != 1 or tree.nodeTag(params[0]) != .string_literal) return false;
-    return decodedIs(tree.tokenSlice(tree.nodeMainToken(params[0])), "builtin");
+    const path = try decode(arena, tree.tokenSlice(tree.nodeMainToken(params[0]))) orelse return false;
+    return std.mem.eql(u8, path, "builtin");
 }
 
 /// `.ios`.
-fn isIosLiteral(tree: Ast, node: Ast.Node.Index) bool {
-    return tree.nodeTag(node) == .enum_literal and identIs(tree, tree.nodeMainToken(node), "ios");
+fn isIosLiteral(arena: std.mem.Allocator, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}!bool {
+    return tree.nodeTag(node) == .enum_literal and try identIs(arena, tree, tree.nodeMainToken(node), "ios");
 }
 
 /// Whether identifier token `tok` names `name`, reading `@"…"` as the
 /// identifier it spells (#785): `@"debug"` IS `debug`.
-fn identIs(tree: Ast, tok: Ast.TokenIndex, name: []const u8) bool {
+fn identIs(arena: std.mem.Allocator, tree: Ast, tok: Ast.TokenIndex, name: []const u8) error{OutOfMemory}!bool {
+    return std.mem.eql(u8, try identName(arena, tree, tok), name);
+}
+
+/// The identifier token `tok` spells: `@"…"` decoded (no length limit), a
+/// bare identifier as-is. A quoted one that does not decode is returned raw
+/// (it will not compile anyway, and equals no real name).
+fn identName(arena: std.mem.Allocator, tree: Ast, tok: Ast.TokenIndex) error{OutOfMemory}![]const u8 {
     const s = tree.tokenSlice(tok);
-    if (std.mem.startsWith(u8, s, "@\"")) return decodedIs(s[1..], name);
-    return std.mem.eql(u8, s, name);
+    if (!std.mem.startsWith(u8, s, "@\"")) return s;
+    return try decode(arena, s[1..]) orelse s;
 }
 
-/// Whether two identifier tokens name the same identifier.
-fn sameIdent(tree: Ast, a: Ast.TokenIndex, b: Ast.TokenIndex) bool {
-    var buf: [256]u8 = undefined;
-    const s = tree.tokenSlice(b);
-    if (!std.mem.startsWith(u8, s, "@\"")) return identIs(tree, a, s);
-    var w: std.Io.Writer = .fixed(&buf);
-    const r = std.zig.string_literal.parseWrite(&w, s[1..]) catch return false;
-    if (r != .success) return false;
-    return identIs(tree, a, w.buffered());
-}
-
-/// Whether the string literal `quoted` (with its quotes) decodes to `name`.
-fn decodedIs(quoted: []const u8, name: []const u8) bool {
-    var buf: [256]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    const r = std.zig.string_literal.parseWrite(&w, quoted) catch return false;
-    return r == .success and std.mem.eql(u8, w.buffered(), name);
+/// Decode the string literal `quoted` (with its quotes), or null if invalid.
+fn decode(arena: std.mem.Allocator, quoted: []const u8) error{OutOfMemory}!?[]const u8 {
+    return std.zig.string_literal.parseAlloc(arena, quoted) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
 }
 
 pub const Error = error{ IosRootDebugWithoutSelfInfo, IosDuplicateRootDebug };
@@ -322,6 +319,19 @@ test "judge: only the build target's os.tag selects the iOS branch (#784)" {
     try testing.expectEqual(T.provided, try judgeTag("const builtin = @import(\"builtin\");\npub const debug = if (builtin.target.os.tag == .ios) struct { pub const SelfInfo = void; } else struct {};"));
     try testing.expectEqual(T.provided, try judgeTag("pub const debug = if (bi.os.tag == .ios) struct { pub const SelfInfo = void; } else struct {};\nconst bi = @import(\"builtin\");"));
     try testing.expectEqual(T.provided, try judgeTag("const @\"builtin\" = @import(\"builtin\");\npub const debug = if (builtin.os.tag == .ios) struct { pub const SelfInfo = void; } else struct {};"));
+}
+
+test "judge: a quoted builtin binding longer than 256 bytes still selects the iOS branch" {
+    const T = std.meta.Tag(Verdict);
+    const long = "b" ** 300;
+    // Bound quoted, referenced quoted; and bound bare, referenced quoted.
+    try testing.expectEqual(T.provided, try judgeTag("const @\"" ++ long ++ "\" = @import(\"builtin\");\npub const debug = if (@\"" ++ long ++ "\".target.os.tag == .ios) struct { pub const SelfInfo = void; } else struct {};"));
+    try testing.expectEqual(T.provided, try judgeTag("const " ++ long ++ " = @import(\"builtin\");\npub const debug = if (@\"" ++ long ++ "\".os.tag == .ios) struct { pub const SelfInfo = void; } else struct {};"));
+    // `SelfInfo` in ONE arm is only accepted when the condition is recognised
+    // (an unknown one needs it in both), so these pass only via selection.
+    try testing.expectEqual(T.provided, try judgeTag("const @\"" ++ long ++ "\" = @import(\"builtin\");\npub const debug = if (@\"" ++ long ++ "\".os.tag != .ios) struct {} else struct { pub const SelfInfo = void; };"));
+    // A long name differing only in its last byte is not the binding.
+    try testing.expectEqual(T.incompatible, try judgeTag("const @\"" ++ long ++ "\" = @import(\"builtin\");\npub const debug = if (@\"" ++ long[1..] ++ "c\".os.tag == .ios) struct { pub const SelfInfo = void; } else struct {};"));
 }
 
 test "judge: quoted @\"debug\" / @\"SelfInfo\" identifiers (#785)" {
