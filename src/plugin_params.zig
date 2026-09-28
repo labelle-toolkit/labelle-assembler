@@ -74,6 +74,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const provider_settings = @import("provider_settings.zig");
 const android_moved_keys = @import("android_moved_keys.zig");
+const target_keys = @import("target_keys.zig");
 
 // ============================================================================
 // Types
@@ -434,9 +435,17 @@ fn extractParamsBags(gpa: std.mem.Allocator, source: [:0]const u8) !?ExtractedBa
 /// parser's owned unexpected-field note is never freed (a std.zon quirk
 /// already noted in `config.zig`'s `PluginDep` tests).
 fn parseTyped(gpa: std.mem.Allocator, source: [:0]const u8) !config.ProjectConfig {
+    // `.asset_compression` accepts any identifier key (labelle-cli#471 P1):
+    // keys naming no target of this assembler are blanked before the strict
+    // parse, offsets and lines preserved, so every diagnostic still points at
+    // the user's file. `generate` warns about them once
+    // (`target_keys.logWarnings`); every other reader parses silently. The
+    // stripped copy outlives `diag`, whose AST points into it.
+    const stripped = try target_keys.stripUnknown(gpa, source);
+    defer if (stripped) |s| gpa.free(s);
     var diag: std.zon.parse.Diagnostics = .{};
     defer diag.deinit(gpa);
-    return parseTypedDiag(gpa, source, &diag) catch |err| switch (err) {
+    return parseTypedDiag(gpa, stripped orelse source, &diag) catch |err| switch (err) {
         error.ParseZon => {
             // `warn`, not `err`: this is the DETAIL of a failure the command
             // layer reports as an error (naming the file and the error). Logging

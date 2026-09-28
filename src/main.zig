@@ -333,6 +333,11 @@ fn readProjectConfig(allocator: std.mem.Allocator, io: std.Io, project_dir: []co
     defer allocator.free(source_raw);
 
     const source = try allocator.dupeZ(u8, source_raw);
+    // Deprecated / ignored target keys (labelle-cli#471 P1): `.platform`,
+    // the `.asset_compression.web` alias, and `.asset_compression` keys that
+    // name no target of this assembler. Warned here, once per `generate`;
+    // the parse itself strips the unknown keys silently.
+    gen.target_keys.logWarnings(allocator, source);
     // The params-tolerant parse (#591): identical to the plain typed parse
     // for every source without a `.params` bag; extracts plugin-declared
     // heterogeneous params into `PluginDep.params_bag` otherwise.
