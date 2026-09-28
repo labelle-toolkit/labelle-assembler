@@ -66,7 +66,9 @@ pub fn emitSystemLocale(w: anytype) !void {
     try w.writeAll("    // Device language (RFC-I18N section 8): boot in the OS/browser locale when\n");
     try w.writeAll("    // the build ships it. Folds away on backends without the decl.\n");
     try w.writeAll("    if (comptime @hasDecl(window, \"systemLocale\")) {\n");
-    try w.writeAll("        var locale_buf: [64]u8 = undefined;\n");
+    // One byte past the longest shipped tag: every shipped tag fits whole,
+    // and a longer device tag cut to fit can never equal one exactly.
+    try w.writeAll("        var locale_buf: [@max(64, @import(\"i18n\").max_tag_len + 1)]u8 = undefined;\n");
     try w.writeAll("        if (window.systemLocale(&locale_buf)) |tag| _ = @import(\"i18n\").applySystemLocale(tag);\n");
     try w.writeAll("    }\n\n");
 }

@@ -897,6 +897,13 @@ fn emitModule(
     }
     try w.writeAll("};\n\n");
 
+    // Sizes the generated main's `systemLocale` buffer, so the device tag
+    // handoff can never truncate a shipped tag.
+    var max_tag_len: usize = 0;
+    for (tags) |t| max_tag_len = @max(max_tag_len, t.len);
+    try w.writeAll("/// Length of the longest shipped tag.\n");
+    try w.print("pub const max_tag_len = {d};\n\n", .{max_tag_len});
+
     // The rectangular table: [locale][key], reference string where a locale
     // has no translation. Plain keys emit the DECODED text -- a string like
     // "Set {{name}}" carries escaped braces that t() would otherwise show
@@ -1123,12 +1130,11 @@ fn emitModule(
         \\    env_checked = true;
         \\    if (comptime builtin.os.tag == .wasi or !builtin.link_libc) return;
         \\    const raw = std.c.getenv("LABELLE_LOCALE") orelse return;
-        \\    // Unknown tags are ignored, never an error: a leaked dev var must
-        \\    // not be able to break a player's run.
-        \\    if (matchLocale(std.mem.span(raw))) |i| {
-        \\        active = i;
-        \\        pinned = true;
-        \\    }
+        \\    // Exact tags only, the same policy as initFromEnvValue on libc-less
+        \\    // hosts: the language fallback is for the device language, not a
+        \\    // dev override. Unknown tags are ignored, never an error: a leaked
+        \\    // dev var must not be able to break a player's run.
+        \\    _ = setLocale(std.mem.span(raw));
         \\}
         \\
         \\/// Applies the device's language at boot -- the generated main calls

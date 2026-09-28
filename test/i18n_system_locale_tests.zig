@@ -35,6 +35,11 @@ const Locale = struct { tag: []const u8, body: []const u8 };
 /// Generates `i18n.zig` from `locales` (default `en`), writes `harness` next
 /// to it and runs it with `zig test`.
 fn generateAndRun(locales: []const Locale, harness: []const u8) !void {
+    return generateAndRunWith(locales, harness, &.{});
+}
+
+/// `generateAndRun` with extra `zig test` flags (`-lc` for the env path).
+fn generateAndRunWith(locales: []const Locale, harness: []const u8, extra_args: []const []const u8) !void {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -64,8 +69,13 @@ fn generateAndRun(locales: []const Locale, harness: []const u8) !void {
 
     const target_abs = try tmp.dir.realPathFileAlloc(io, "target", allocator);
     defer allocator.free(target_abs);
+    const argv = try std.mem.concat(allocator, []const u8, &.{
+        &.{ test_options.zig_exe, "test", "system_locale_check.zig" },
+        extra_args,
+    });
+    defer allocator.free(argv);
     const result = try std.process.run(allocator, io, .{
-        .argv = &.{ test_options.zig_exe, "test", "system_locale_check.zig" },
+        .argv = argv,
         .cwd = .{ .path = target_abs },
     });
     defer allocator.free(result.stdout);
@@ -143,6 +153,8 @@ pub const SystemLocale = struct {
             \\test "long exact tag" {
             \\    try std.testing.expect(i18n.applySystemLocale("en_Latn_US_variant1_variant2_variant3.UTF-8"));
             \\    try std.testing.expectEqualStrings("en-Latn-US-variant1-variant2-variant3", i18n.activeLocale());
+            \\    // The generated main sizes its systemLocale buffer from this.
+            \\    try std.testing.expectEqual(37, i18n.max_tag_len);
             \\}
         );
     }
@@ -170,5 +182,28 @@ pub const SystemLocale = struct {
             \\    try std.testing.expectEqualStrings("pt-BR", i18n.activeLocale());
             \\}
         );
+    }
+
+    test "LABELLE_LOCALE matches exact tags only, like initFromEnvValue on libc-less hosts" {
+        try generateAndRunWith(&.{
+            .{ .tag = "en", .body = "{ \"menu\": { \"play\": \"Play\" } }" },
+            .{ .tag = "pt-BR", .body = "{ \"menu\": { \"play\": \"Jogar\" } }" },
+        },
+            \\const std = @import("std");
+            \\const i18n = @import("i18n.zig");
+            \\
+            \\extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+            \\
+            \\test "an unshipped region in the override is ignored, not a language fallback" {
+            \\    // Windows' C runtime has no setenv; comptime-skipped so it never links.
+            \\    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+            \\    try std.testing.expectEqual(@as(c_int, 0), setenv("LABELLE_LOCALE", "pt-PT", 1));
+            \\    // The override is read on the first lookup.
+            \\    try std.testing.expectEqualStrings("en", i18n.activeLocale());
+            \\    // It didn't pin, so the device language still applies.
+            \\    try std.testing.expect(i18n.applySystemLocale("pt-PT"));
+            \\    try std.testing.expectEqualStrings("pt-BR", i18n.activeLocale());
+            \\}
+        , &.{"-lc"});
     }
 };
