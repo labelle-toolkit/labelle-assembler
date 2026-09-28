@@ -108,6 +108,7 @@ test {
     // model/build/render, none of which is reached by a compiled function
     // path until `generate` runs.
     _ = @import("hook_routes.zig");
+    _ = @import("describe.zig");
     _ = @import("codegen/idents.zig");
     _ = @import("codegen/validate.zig");
     _ = @import("codegen/manifest_splice.zig");
@@ -186,6 +187,8 @@ pub const HookOrderEntry = config.HookOrderEntry;
 /// `generate` writes `<game>/.labelle/hook_routes.json`; the `routes`
 /// subcommand renders it.
 pub const hook_routes = @import("hook_routes.zig");
+/// `describe` (labelle-cli#471 D1): backend/target facts for the CLI.
+pub const describe = @import("describe.zig");
 pub const generation = @import("generation.zig");
 pub const HookRouteReport = hook_routes.Report;
 pub const generateBuildZig = build_files.generateBuildZig;

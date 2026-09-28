@@ -24,6 +24,7 @@ const init_cmd = @import("init_cmd.zig");
 const check_cmd = @import("check_cmd.zig");
 const add_cmd = @import("add_cmd.zig");
 const routes_cmd = @import("routes_cmd.zig");
+const describe_cmd = @import("describe_cmd.zig");
 
 /// Wire protocol version for CLI ↔ assembler subprocess communication.
 /// Bump when the command surface or output format changes in a way the
@@ -52,7 +53,14 @@ const routes_cmd = @import("routes_cmd.zig");
 /// the same bump makes `generate` write, so an older CLI driving a newer
 /// binary is unaffected and a newer CLI can probe for the subcommand by
 /// requiring protocol >= 6.
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// v7 (labelle-cli#471 D1): added the `describe` subcommand — the
+/// backend/target facts of a project (target dir, resolved backend package,
+/// asset format, support), human-readable and `labelle.describe/v1` JSON —
+/// and `generate --target <name>`, an alias for `--platform`. Additive: an
+/// older CLI never calls either, and a newer CLI probes for them by
+/// requiring protocol >= 7 and falls back to its own tables below that.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 const usage =
     \\labelle-assembler — code generator for the labelle game toolkit
@@ -69,6 +77,7 @@ const usage =
     \\  labelle-assembler add pack <name>
     \\  labelle-assembler add feature <kind> <name>
     \\  labelle-assembler routes --project-root <path> [--json] [--event <tag>] [--receiver <id>]
+    \\  labelle-assembler describe --project-root <path> --target <name> [--json]
     \\
     \\Subcommands:
     \\  generate    Materialize .labelle/<target>/ from project.labelle
@@ -80,11 +89,14 @@ const usage =
     \\  add         Scaffold a pack or a feature-unit (need/role/status)
     \\  routes      Inspect generated hook event routes (reads the sidecar
     \\              `generate` writes; run `generate` first)
+    \\  describe    Backend/target facts: target dir, backend package, asset
+    \\              format, support (offline; nothing fetched or generated)
     \\
     \\Generate options:
     \\  --project-root <path>   Path to game project (containing project.labelle)
     \\  --scene <name>          Override the initial prefab from project.labelle
     \\  --platform <name>       Override target platform (desktop, wasm, ios, android)
+    \\  --target <name>         Alias for --platform (the CLI's target name)
     \\  --backend <name>        Override graphics backend (raylib, sokol, sdl, bgfx, wgpu)
     \\  --editor-preview        Editor-preview wasm build (labelle-studio Play mode);
     \\                          equivalent to LABELLE_EDITOR_PREVIEW=1. Wasm-only —
@@ -168,6 +180,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, first, "describe")) {
+        try describe_cmd.cmdDescribe(allocator, io, &args);
+        return;
+    }
+
     std.log.err("labelle-assembler: unknown subcommand '{s}'", .{first});
     writeStderr(io, "\n" ++ usage);
     std.process.exit(2);
@@ -185,6 +202,10 @@ fn cmdGenerate(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args
     var scene_override: ?[]const u8 = null;
     var platform_override: ?gen.Platform = null;
     var backend_override: ?gen.Backend = null;
+    // `--target` (RFC labelle-cli#471 §3) is a string: it is mapped onto the
+    // internal Platform enum only after the project is read, so an unknown
+    // name can be reported against the backend it resolved to.
+    var target_override: ?[]const u8 = null;
     var editor_preview = false;
 
     while (args.next()) |arg| {
@@ -210,6 +231,13 @@ fn cmdGenerate(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args
             platform_override = parsePlatform(val) orelse std.process.exit(2);
         } else if (std.mem.startsWith(u8, arg, "--platform=")) {
             platform_override = parsePlatform(arg["--platform=".len..]) orelse std.process.exit(2);
+        } else if (std.mem.eql(u8, arg, "--target")) {
+            target_override = args.next() orelse {
+                std.log.err("labelle-assembler: --target requires a value", .{});
+                std.process.exit(2);
+            };
+        } else if (std.mem.startsWith(u8, arg, "--target=")) {
+            target_override = arg["--target=".len..];
         } else if (std.mem.eql(u8, arg, "--backend")) {
             const val = args.next() orelse {
                 std.log.err("labelle-assembler: --backend requires a value", .{});
@@ -249,6 +277,16 @@ fn cmdGenerate(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args
     if (scene_override) |s| cfg.initial_prefab = s;
     if (platform_override) |p| cfg.platform = p;
     if (backend_override) |b| cfg.backend = b;
+    if (target_override) |t| {
+        const p = targetToPlatform(cfg, t) orelse std.process.exit(2);
+        if (platform_override) |explicit| {
+            if (explicit != p) {
+                std.log.err("labelle-assembler: --target '{s}' contradicts --platform '{s}'", .{ t, @tagName(explicit) });
+                std.process.exit(2);
+            }
+        }
+        cfg.platform = p;
+    }
     if (editor_preview) cfg.editor_preview = true;
 
     // Resolve GUI plugin (reads gui.labelle manifest from plugin directory)
@@ -311,6 +349,16 @@ fn parsePlatform(val: []const u8) ?gen.Platform {
     return null;
 }
 
+/// Map a `--target` name onto the internal Platform enum (the only targets
+/// the codegen knows today; string-keyed targets are AS5). On an unknown
+/// name, log an error naming the resolved backend and the target, and
+/// return null. Caller is expected to exit with code 2 on null.
+fn targetToPlatform(cfg: gen.ProjectConfig, target: []const u8) ?gen.Platform {
+    if (gen.describe.parseTarget(target)) |p| return p;
+    std.log.err("labelle-assembler: backend '{s}' has no target '{s}'\n  this assembler generates for:{s}", .{ cfg.backendName(), target, gen.describe.target_list });
+    return null;
+}
+
 /// Parse a --backend value into the Backend enum, or log an error
 /// listing accepted values and return null. Caller is expected to exit
 /// with code 2 on null.
@@ -346,4 +394,5 @@ test {
     std.testing.refAllDecls(@import("check_cmd.zig"));
     std.testing.refAllDecls(@import("add_cmd.zig"));
     std.testing.refAllDecls(@import("routes_cmd.zig"));
+    std.testing.refAllDecls(@import("describe_cmd.zig"));
 }

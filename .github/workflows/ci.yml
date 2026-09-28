@@ -92,6 +92,19 @@ jobs:
           ./zig-out/bin/labelle-assembler --protocol-version
           ./zig-out/bin/labelle-assembler --help
 
+      # `describe` through the real binary (labelle-cli RFC #471 D1): a
+      # third-party package names the target dir after itself (finding 4),
+      # and nothing lands in the cache (offline, config-only).
+      - name: Verify describe (offline)
+        run: |
+          d=$(mktemp -d)
+          printf '.{ .name = "g", .backend_package = .{ .name = "acme", .repo = "github.com/acme/labelle-acme", .version = "1.0.0" } }\n' > "$d/project.labelle"
+          LABELLE_HOME="$d/home" ./zig-out/bin/labelle-assembler describe --project-root "$d" --target desktop --json > "$d/out.json"
+          cat "$d/out.json"
+          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['target_dir'] == '.labelle/acme_desktop', d" "$d/out.json"
+          test ! -e "$d/home"
+          test ! -e "$d/.labelle"
+
   # End-to-end usage test: check out every sibling repo the examples
   # need (labelle-cli for the binary, labelle-core/engine/gfx for the
   # runtime packages), then `labelle generate` and `zig build` the
