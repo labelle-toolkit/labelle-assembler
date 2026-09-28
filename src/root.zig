@@ -93,6 +93,7 @@ test {
     _ = @import("scene_override_check.zig");
     _ = @import("tilemap_scan_test.zig"); // covers tilemap_scan + tilemap_scene_scan
     _ = @import("asset_validator.zig");
+    _ = @import("catalog_key_check.zig");
     _ = @import("pack_resources.zig");
     _ = @import("language_policy.zig");
     _ = @import("plugin_params.zig");
@@ -908,6 +909,12 @@ pub fn generate(
     // rather than a confusing "atlas not found" panic at runtime.
     // Ticket #47.
     try asset_validator.validateSceneAssets(allocator, scene_manifests, cfg.resources);
+
+    // Reject static asset-catalog keys (`.catalog = "<key>"` literals and
+    // component fields listed in `catalog_keys`) that no resource
+    // registers; otherwise the typo only surfaces on the device as
+    // `AssetNotRegistered` (#738). Same merged game + pack resource list.
+    try @import("catalog_key_check.zig").validate(allocator, game_dir, cfg.resources);
 
     // Resolve the implicit `lazy` default on each resource entry.
     // Explicit `lazy = true/false` wins; null falls back to `true`
