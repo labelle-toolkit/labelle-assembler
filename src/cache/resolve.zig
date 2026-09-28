@@ -14,6 +14,7 @@ const env = @import("env.zig");
 const local = @import("local.zig");
 const local_hint = @import("local_hint.zig");
 const path_key = @import("path_key.zig");
+const plugin_subdir = @import("plugin_subdir.zig");
 
 /// Resolve a framework package (core, engine, gfx) to its cached path.
 /// Returns an absolute path like: ~/.labelle/packages/core/0.3.0
@@ -93,7 +94,13 @@ pub fn resolveBundledPackage(allocator: std.mem.Allocator, cli_version: []const 
 /// Resolve a plugin to its cached path.
 /// Returns an absolute path like: ~/.labelle/packages/plugins/github.com/labelle-toolkit/labelle-physics/0.3.0
 /// `project_dir` is used to resolve `local:` paths relative to the project (not CWD).
+///
+/// A `.subdir` pin (#771) resolves INSIDE the cached archive:
+/// `…/plugins/<repo>/<version>/<subdir>`. A local slot (an `install plugin
+/// <name> local:<path>` override, #772, or a monorepo-discovered sibling)
+/// is returned as-is: it names the plugin directory itself.
 pub fn resolvePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, project_dir: ?[]const u8) ![]const u8 {
+    if (plugin_subdir.problem(plugin) != null) return error.InvalidPluginSubdir;
     if (plugin.isLocal()) {
         return resolveLocalPath(allocator, plugin.localPath(), project_dir);
     }
@@ -101,7 +108,18 @@ pub fn resolvePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, pro
     // #685: same reserved-slot rule as the framework packages.
     if (try local.activePluginSlot(allocator, plugin)) |slot| return slot;
 
-    return pluginSlotPath(allocator, plugin.repo, plugin.version);
+    const archive = try pluginVersionPath(allocator, plugin);
+    defer allocator.free(archive);
+    return plugin_subdir.pluginRoot(allocator, archive, plugin);
+}
+
+/// Resolve a `local:<path>` SOURCE spec typed on the command line
+/// (`install <pkg> local:<path>`, `install plugin <name> local:<path>`)
+/// exactly as the same spec means in project.labelle: absolute as written,
+/// relative against `project_dir` (anchored at the main checkout when it
+/// escapes a worktree), else against the working directory.
+pub fn resolveLocalSource(allocator: std.mem.Allocator, spec: []const u8, project_dir: ?[]const u8) ![]const u8 {
+    return resolveLocalPath(allocator, config.localVersionPath(spec), project_dir);
 }
 
 /// Resolve a local path override relative to a project directory.
@@ -452,9 +470,18 @@ pub fn isPluginCached(allocator: std.mem.Allocator, plugin: config.PluginDep) !b
         return local.slotTracksSource(slot);
     }
 
-    const path = try pluginVersionPath(allocator, plugin);
+    // The plugin ROOT, not the archive root: an archive cached for a
+    // version that predates the `.subdir` (or a sibling plugin's pin of the
+    // same repo) must not count as this plugin being present (#771).
+    const archive = try pluginVersionPath(allocator, plugin);
+    defer allocator.free(archive);
+    const path = plugin_subdir.pluginRoot(allocator, archive, plugin) catch return false;
     defer allocator.free(path);
-    return @import("disk.zig").dirExists(path);
+    // A subdir naming a regular FILE of an already-cached archive must miss
+    // too, so the fetch path's directory check reports it (Codex review).
+    const disk = @import("disk.zig");
+    if (plugin.subdir.len > 0) return disk.isDirectory(path);
+    return disk.dirExists(path);
 }
 
 /// Validate that all dependencies in a project config are cached.

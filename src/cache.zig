@@ -42,6 +42,9 @@ pub const resolveFrameworkPackage = resolve.resolveFrameworkPackage;
 pub const resolveAssemblerPackage = resolve.resolveAssemblerPackage;
 pub const resolveBundledPackage = resolve.resolveBundledPackage;
 pub const resolvePlugin = resolve.resolvePlugin;
+pub const resolveLocalSource = resolve.resolveLocalSource;
+pub const pluginVersionPath = resolve.pluginVersionPath;
+pub const pluginSubdir = @import("cache/plugin_subdir.zig");
 pub const isInProjectLib = resolve.isInProjectLib;
 pub const resolveGuiPackage = resolve.resolveGuiPackage;
 pub const resolveGuiUrl = resolve.resolveGuiUrl;
@@ -56,6 +59,7 @@ pub const validateCache = resolve.validateCache;
 pub const populateAssemblerCache = disk.populateAssemblerCache;
 pub const populateFrameworkPackage = disk.populateFrameworkPackage;
 pub const populatePlugin = disk.populatePlugin;
+pub const populatePluginMode = disk.populatePluginMode;
 pub const patchCachedDeps = disk.patchCachedDeps;
 pub const dirExists = disk.dirExists;
 pub const isSymlink = disk.isSymlink;
@@ -95,6 +99,7 @@ test {
     _ = resolve;
     _ = @import("cache/path_key.zig");
     _ = @import("cache/local_hint.zig");
+    _ = @import("cache/plugin_subdir.zig");
     _ = disk;
     _ = fetch;
 }

@@ -23,6 +23,7 @@ const version_floors = @import("version_floors.zig");
 const cache = @import("cache.zig");
 const config = @import("config.zig");
 const upgrade_backend = @import("upgrade_backend.zig");
+const install_plugin = @import("install_plugin_cmd.zig");
 
 /// Write directly to stderr without a level prefix. Matches main.zig.
 fn writeStderr(io: std.Io, msg: []const u8) void {
@@ -39,6 +40,10 @@ const install_usage =
     \\  labelle-assembler install <pkg> <version>         Cache a specific package
     \\  labelle-assembler install <pkg> local:<path>      Build <pkg> from a local checkout
     \\  labelle-assembler install <version>               Cache core+engine+gfx at a version
+    \\  labelle-assembler install plugin <name> local:<path>
+    \\                                                    Build one plugin from a local checkout
+    \\  labelle-assembler install plugin <name>           Show whether <name> is overridden
+    \\  labelle-assembler install plugin <name> --unlink  Drop the override (back to the pin)
     \\
     \\Packages: core, engine, gfx
     \\
@@ -49,6 +54,11 @@ const install_usage =
     \\resolves against --project-root when given, else the working directory.
     \\Run `labelle-assembler clean` to drop the override.
     \\
+    \\`install plugin <name> local:<path>` does the same for ONE `.plugins`
+    \\entry of the project (#772); nothing in project.labelle or labelle.lock
+    \\changes. <path> is the plugin directory (the one holding its
+    \\build.zig.zon), also for a `.subdir` pin. `--unlink` (or `clean`) drops it.
+    \\
 ;
 
 /// `install` subcommand. Four forms:
@@ -58,6 +68,7 @@ const install_usage =
 ///   install <version>             → cache core/engine/gfx at one version
 pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     var project_root: ?[]const u8 = null;
+    var unlink = false;
     var positionals: std.ArrayList([]const u8) = .empty;
     defer positionals.deinit(allocator);
 
@@ -72,6 +83,8 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             writeStderr(io, install_usage);
             return;
+        } else if (std.mem.eql(u8, arg, "--unlink")) {
+            unlink = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             std.log.err("labelle-assembler install: unknown flag '{s}'", .{arg});
             std.process.exit(2);
@@ -125,6 +138,31 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
                 "(no absolute paths, no '.' or '..' components)",
             .{arg},
         );
+        std.process.exit(2);
+    }
+
+    // `install plugin <name> …` — a per-plugin local override (#772).
+    if (std.mem.eql(u8, positionals.items[0], "plugin")) {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const root = project_root orelse ".";
+        const cfg = readProjectConfig(arena.allocator(), io, root) catch |err| {
+            std.log.err(
+                "labelle-assembler install plugin: failed to read project.labelle in '{s}': {s}",
+                .{ root, @errorName(err) },
+            );
+            std.process.exit(1);
+        };
+        install_plugin.run(allocator, cfg, positionals.items[1..], unlink, project_root) catch |err| {
+            std.process.exit(switch (err) {
+                error.MissingPluginName, error.TooManyArguments, error.NotALocalSpec => 2,
+                else => 1,
+            });
+        };
+        return;
+    }
+    if (unlink) {
+        std.log.err("labelle-assembler install: --unlink only applies to 'install plugin <name> --unlink'", .{});
         std.process.exit(2);
     }
 
@@ -928,6 +966,11 @@ fn fetchAssemblerWithFallback(allocator: std.mem.Allocator, version: []const u8)
 
 /// Fetch a plugin: symlink from the monorepo when available, else clone.
 fn fetchPluginWithFallback(allocator: std.mem.Allocator, plugin: config.PluginDep) !void {
+    // An `install plugin <name> local:<path>` override owns the slot (#772):
+    // neither the release nor a discovered sibling may replace it. Only a
+    // copied (non-tracking) slot gets here, and it is re-copied.
+    if (try install_plugin.refreshExplicit(allocator, plugin)) return;
+    try cache.pluginSubdir.validate(plugin);
     if (findRepoRoot(allocator)) |repo_root| {
         defer allocator.free(repo_root);
         const plugin_dir = try std.fmt.allocPrint(allocator, "labelle-{s}", .{plugin.name});
@@ -1065,6 +1108,7 @@ fn readProjectConfigQuiet(allocator: std.mem.Allocator, io: std.Io, project_dir:
 test {
     std.testing.refAllDecls(@This());
     _ = upgrade_backend;
+    _ = install_plugin;
 }
 
 // ── tests: upgrade version-field rewriting ───────────────────────────
