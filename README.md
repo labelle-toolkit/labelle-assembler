@@ -184,6 +184,43 @@ Exit codes: 0 whenever an answer was produced, `supported: false` included
 or parsed; 2 on a usage error. An unknown target is `supported: false` with
 a reason naming the backend and the target.
 
+### Upgrade the backend
+
+```bash
+./zig-out/bin/labelle-assembler upgrade --project-root /path/to/game backend          # to this assembler's default
+./zig-out/bin/labelle-assembler upgrade --project-root /path/to/game backend 0.31.0   # to a given release
+```
+
+`upgrade backend [version]` bumps the backend provider pin in
+`project.labelle` (labelle-cli RFC #471, D2). The `labelle` CLI's
+`upgrade all` delegates the backend half of its work to it. The command is
+offline: it reads and rewrites `project.labelle` and fetches nothing.
+
+The edit is minimal. Only the version string changes, or the one field that
+is added; comments, ordering and spacing are kept. Each rewrite is parsed
+back before it is written, and one that does not resolve to the same
+backend at the requested version is refused, not written.
+
+| Project has | No version given | A version given |
+|---|---|---|
+| `.backend = .<tag>` only (or no `.backend`, i.e. the default `bgfx`) | No-op: the shorthand already resolves to this assembler's default (`builtinProvider`) and follows it on every assembler upgrade | The default version is a no-op. Any other version adds an explicit `.backend_package = .{ .name, .repo, .version }` for the same first-party package, next to `.backend`. With no `.backend`, it also adds `.backend = .bgfx`, so the resolved backend tag and the gamepad default don't change. Delete `.backend_package` to go back to following the default |
+| An explicit first-party `.backend_package` | `.version` set to this assembler's default for that backend (inserted when the package has no `.version`). A pin already newer than the default is left alone (never downgraded) | `.version` set to it (inserted when the package omits it) |
+| A third-party `.backend_package` | No-op with a note: there is no builtin default for it | `.version` set to it |
+| A `local:` / `@` `.backend_package` | No-op: it builds from its checkout | Refused (exit 2) |
+
+The prospective pins go through the same `version_floors` gate as
+`generate` and `upgrade core|engine|gfx`. A backend version whose floor on
+`.core_version` is a compile break is refused (exit 2) with the floor's own
+message, and nothing is written; upgrade core first (`upgrade core <ver>` or
+`upgrade all`). A curated floor warns and proceeds. The command doesn't move
+core, engine or gfx: an incoherent trio is only warned about, and a no-op
+still warns when the current pairing is already below a floor. Versions must be
+strict `MAJOR.MINOR.PATCH`; anything else (`1.2`, `1.2.3.4`, `v1.2.3`) is
+refused (exit 2). A pre-release or build suffix (`1.2.3-rc.1`, `1.2.3+b.5`)
+is refused too, because the fetch path can't fetch such a pin yet
+(assembler#783). A pre-release pin already in the file is judged by the
+floors as its `MAJOR.MINOR.PATCH`.
+
 ### Plugin build options supplied by the assembler
 
 Some `-D` options only the assembler knows the value of. Today that's
