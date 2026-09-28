@@ -30,6 +30,7 @@ const constants_phase = @import("constants_phase.zig");
 // the generated module's [:0] contract (flying-platform#786 friction #3).
 pub const i18n_phase = @import("i18n_phase.zig");
 const plugin_build_hook = @import("plugin_build_hook.zig");
+const plugin_build_options = @import("plugin_build_options.zig");
 pub const plugin_build_steps = @import("plugin_build_steps.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
 pub const manifest_v2 = @import("codegen/manifest_v2.zig");
@@ -72,6 +73,7 @@ test {
     _ = @import("junction.zig");
     _ = @import("plugin_manifest.zig");
     _ = @import("plugin_build_hook.zig");
+    _ = @import("plugin_build_options.zig");
     _ = @import("plugin_build_steps.zig");
     // Pulls in the build_files/ sub-modules' inline tests (its own `test`
     // block references build_zig.zig + build_zig_zon.zig). Was missing —
@@ -2091,6 +2093,15 @@ pub fn generate(
     // modules (`pack__<prefix>_mod`, #498 PR 2) ride `pack_modules`
     // instead — a third wiring category driven by `pack_scans`, never by
     // `cfg.plugins`.
+    // Plugins that take the assembler-provided `ios_sdk_path` option
+    // (#776): manifest `.build_options` opt-in, or a build.zig that declares
+    // it. Only an iOS generate passes the option at all.
+    const ios_sdk_path_plugins: []const []const u8 = if (cfg_modules.platform == .ios)
+        try plugin_build_options.pluginsTakingOption(allocator, cfg_modules, game_dir, plugin_build_options.ios_sdk_path)
+    else
+        &.{};
+    defer if (cfg_modules.platform == .ios) allocator.free(ios_sdk_path_plugins);
+
     const build_zig = try build_files.generateBuildZig(allocator, cfg_modules, .{
         .materials = material_names,
         .material_toolchain = material_toolchain,
@@ -2101,6 +2112,7 @@ pub fn generate(
         .promoted_scripts = promoted_scripts,
         .pack_modules = pack_modules.items,
         .plugin_hooks = plugin_hooks,
+        .ios_sdk_path_plugins = ios_sdk_path_plugins,
         // Declarative plugin build steps (#586): system-command + artifact
         // link wiring emitted after the game artifact is assembled. Empty
         // when no plugin declares `.build` — byte-identical build.zig.

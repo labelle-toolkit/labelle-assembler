@@ -14,6 +14,7 @@ const cache = @import("../cache.zig");
 const common = @import("common.zig");
 const language_policy = @import("../language_policy.zig");
 const plugin_params = @import("../plugin_params.zig");
+const plugin_build_options = @import("../plugin_build_options.zig");
 
 // v2 adds CLI-owned provider commands/hooks; runtime declarations keep their
 // existing meaning. Pack manifests retain their independent v1 version gate.
@@ -274,6 +275,18 @@ pub const PluginManifest = struct {
     /// module source (every plugin before #633) → byte-identical output.
     consumes_events: []const []const u8 = &.{},
 
+    /// Assembler-provided build options this plugin's `build.zig` declares
+    /// (assembler#776) — e.g. `.build_options = .{ "ios_sdk_path" }`. The
+    /// generated build.zig passes such an option to this plugin's
+    /// `b.dependency(...)` ONLY when it is listed here (or, for back-compat,
+    /// when the plugin's `build.zig` visibly declares it — see
+    /// `plugin_build_options.zig`): Zig rejects an undeclared `-D` option, so
+    /// passing it to every plugin broke any plugin that does not take it.
+    /// Validated at load against `plugin_build_options.provided` (a typo must
+    /// not silently drop the option). Empty/absent = the plugin takes none
+    /// → byte-identical output.
+    build_options: []const []const u8 = &.{},
+
     /// Allocator that owns the parsed strings and slice. Stored on
     /// the manifest so the caller doesn't have to remember to pass
     /// the right allocator to deinit.
@@ -304,6 +317,7 @@ pub const PluginManifest = struct {
         std.zon.parse.free(self.allocator, self.author);
         std.zon.parse.free(self.allocator, self.languages);
         std.zon.parse.free(self.allocator, self.consumes_events);
+        std.zon.parse.free(self.allocator, self.build_options);
         // Not parser-allocated (the strict schema walk owns its copies) but
         // shape-compatible; freed through its own helper for symmetry.
         plugin_params.freeSchema(self.allocator, self.params_schema);
@@ -324,6 +338,8 @@ pub const PluginManifest = struct {
 //   error.PluginManifestUnknownVersion     — manifest_version is < 1 or > what we support
 //   error.PluginManifestUnknownLanguage    — requires_language names a language outside
 //                                             language_policy.SUPPORTED_LANGUAGES (#584)
+//   error.PluginManifestUnknownBuildOption — a `.build_options` entry names an
+//                                             option the assembler does not supply (#776)
 //   error.PluginManifestInvalidParamsSchema — a `.params_schema` entry breaks the shape
 //                                             rules (unknown key, missing name/type,
 //                                             enum⇔values pairing, default/type mismatch,
@@ -552,6 +568,22 @@ pub fn loadFromDir(
         }
     }
 
+    // ── Validate `.build_options` (#776) ──
+    // Each entry names an option the ASSEMBLER supplies to the plugin's
+    // `b.dependency(...)`. The vocabulary is closed: an unknown name is a
+    // typo (or an option this assembler cannot supply), and ignoring it
+    // would silently leave the plugin without the option it asked for.
+    for (parsed.build_options) |opt| {
+        if (!plugin_build_options.isProvided(opt)) {
+            std.debug.print(
+                "labelle: plugin '{s}' declares `.build_options` entry \"{s}\"\n" ++
+                    "  but the assembler supplies only: {s}\n  at {s}\n",
+                .{ expected_name, opt, plugin_build_options.provided_list, manifest_path },
+            );
+            return error.PluginManifestUnknownBuildOption;
+        }
+    }
+
     // ── Parse + validate `.params_schema` (#591) ──
     // A dedicated STRICT walk over the raw source: the typed parse above
     // deliberately ignores the key (manifest-wide forward compat — an older
@@ -576,6 +608,7 @@ pub fn loadFromDir(
         .author = parsed.author,
         .languages = parsed.languages,
         .consumes_events = parsed.consumes_events,
+        .build_options = parsed.build_options,
         .allocator = allocator,
     };
 }
@@ -605,6 +638,9 @@ const ZonManifest = struct {
     // Declared plugin-to-plugin event consumption (#633). Optional/additive —
     // absent parses to the byte-identical empty default.
     consumes_events: []const []const u8 = &.{},
+    // Assembler-provided build options the plugin declares (#776).
+    // Optional/additive — absent parses to the byte-identical empty default.
+    build_options: []const []const u8 = &.{},
 };
 
 // ============================================================================
