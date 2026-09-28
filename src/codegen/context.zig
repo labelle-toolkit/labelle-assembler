@@ -181,11 +181,13 @@ pub const Codegen = struct {
     wasm_template_provides_panic: bool = false,
 
     // ios-only (#774): true when the backend's entry template (or the engine
-    // template) already declares a root `debug` — e.g. labelle-sokol
-    // v0.8.1's `mobile.txt` ships `pub const debug = … SelfInfo = void …`.
-    // The assembler then skips its own `ios_selfinfo.OVERRIDE`, which would
-    // duplicate the root decl. Computed by a tokenizer scan of the loaded
-    // templates (`ios_selfinfo.declaresRootDecl`), not a per-backend switch.
+    // template) already declares a root `debug` that carries `SelfInfo` —
+    // e.g. labelle-sokol v0.8.1's `mobile.txt` ships
+    // `pub const debug = … SelfInfo = void …`. The assembler then skips its
+    // own `ios_selfinfo.OVERRIDE`, which would duplicate the root decl. A
+    // root `debug` WITHOUT `SelfInfo` fails generate instead
+    // (`error.IosRootDebugWithoutSelfInfo`). Computed by a tokenizer scan of
+    // the loaded templates (`ios_selfinfo.rootDebugState`).
     ios_template_provides_debug: bool = false,
 
     // ── Mixin types ──────────────────────────────────────────────────

@@ -420,6 +420,22 @@ pub const MAIN_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "labelle-assembler#774") == null);
     }
 
+    test "ios main.zig: a template root `debug` WITHOUT SelfInfo fails generate with a clear error (#774)" {
+        // The assembler cannot add a second root `debug`, and skipping its
+        // override would leave the iOS link broken — so it refuses.
+        const without = sokol_mobile_lifecycle ++
+            \\pub const debug = struct {
+            \\    pub const log_level = 3;
+            \\};
+            \\
+        ;
+        try std.testing.expectError(error.IosRootDebugWithoutSelfInfo, genSokolMain(.ios, without));
+        // Off iOS the same template is not judged (the override is iOS-only).
+        const desktop = try genSokolMain(.desktop, without);
+        defer std.testing.allocator.free(desktop);
+        try std.testing.expect(std.mem.indexOf(u8, desktop, "SelfInfo") == null);
+    }
+
     test "non-iOS main.zig has no SelfInfo override (#774)" {
         inline for (.{ generate.Platform.android, generate.Platform.desktop }) |p| {
             const main_zig = try genSokolMain(p, sokol_mobile_lifecycle);

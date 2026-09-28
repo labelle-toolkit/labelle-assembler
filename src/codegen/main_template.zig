@@ -203,6 +203,33 @@ pub fn generateMainZigFromTemplate(
     return generateMainZigWithAnimations(allocator, engine_template, cfg, lifecycle_tmpl, script_entries, prefab_names, jsonc_scene_names, scene_manifests, component_names, hook_names, event_names, enum_names, view_names, gizmo_names, animation_names, &.{}, plugin_events, plugin_flow_nodes, plugin_pin_styles, plugin_coercions);
 }
 
+/// iOS (#774): whether a template's root `debug` already carries the
+/// `SelfInfo` override (then the assembler emits none). A root `debug`
+/// WITHOUT `SelfInfo` is an error: the assembler cannot add a second root
+/// `debug`, and silently skipping would leave the iOS link broken.
+fn iosTemplatesProvideSelfInfo(allocator: std.mem.Allocator, lifecycle_tmpl: []const u8, engine_template: []const u8) !bool {
+    var provided = false;
+    for ([_]struct { src: []const u8, what: []const u8 }{
+        .{ .src = lifecycle_tmpl, .what = "the backend's iOS entry template" },
+        .{ .src = engine_template, .what = "the engine's main.zig template" },
+    }) |t| {
+        switch (try ios_selfinfo.rootDebugState(allocator, t.src)) {
+            .absent => {},
+            .with_selfinfo => provided = true,
+            .without_selfinfo => {
+                var buf: [768]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "labelle-assembler: {s} declares a root `debug` without `SelfInfo`.\n" ++
+                    "  An iOS build needs `debug.SelfInfo = void` (Zig 0.16's Mach-O SelfInfo references a symbol the iOS SDK\n" ++
+                    "  does not export), and the assembler cannot add a second root `debug`. Declare\n" ++
+                    "  `pub const SelfInfo = void;` inside that `debug` for iOS, or remove it and let the assembler emit it (#774).\n", .{t.what}) catch "labelle-assembler: a template declares a root `debug` without `SelfInfo` (#774)\n";
+                std.Io.File.stderr().writeStreamingAll(config.globalIo(), msg) catch {};
+                return error.IosRootDebugWithoutSelfInfo;
+            },
+        }
+    }
+    return provided;
+}
+
 pub fn generateMainZigWithAnimations(
     allocator: std.mem.Allocator,
     engine_template: []const u8,
@@ -315,8 +342,7 @@ pub fn generateMainZigWithAnimations(
         // ios-only (#774): skip the assembler's SelfInfo override when a
         // template already declares a root `debug`.
         .ios_template_provides_debug = cfg.platform == .ios and
-            (try ios_selfinfo.declaresRootDecl(allocator, lifecycle_tmpl, "debug") or
-                try ios_selfinfo.declaresRootDecl(allocator, engine_template, "debug")),
+            try iosTemplatesProvideSelfInfo(allocator, lifecycle_tmpl, engine_template),
     };
 
     var data = tpl.TemplateData{
