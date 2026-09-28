@@ -243,23 +243,19 @@ pub fn build(b: *std.Build) void {
 
     // ── `test-cache`: the local-slot cache machinery, alone ─────────────
     //
-    // The Windows CI job runs THIS, not `test`. `zig build test` on Windows
-    // is red for ~33 pre-existing failures across the scripting-splice,
-    // panel-validate and pack-check suites (path-separator handling), which
-    // a Windows job added for #688 neither caused nor should be expected to
-    // fix — see the tracking issue linked from that PR. A job that is red
-    // for unrelated reasons guards nothing, so this step narrows to the
-    // modules the cache work touches: `cache.local`, `cache.disk` and
-    // `cache_cmd`.
+    // A narrow, fast subset: the modules the cache work touches
+    // (`cache.local`, `cache.disk`, `cache_cmd`). The Windows CI job used to
+    // run only this step while `zig build test` was red on Windows; since
+    // #699 it runs the full `test` (see the windows job in ci.yml), so this
+    // step is now a local convenience.
     //
     // `cache.resolve` is deliberately NOT in the filter: two of its
     // worktree-path tests are among the pre-existing Windows failures, and
     // they predate and are untouched by the local-slot work. Add it back
     // when those are fixed.
-    // `junction` joins them for #710: the junction code is Windows-ONLY, and
-    // this job is the only place CI runs on Windows — the unfiltered `test`
-    // step runs on ubuntu/macos, where those tests skip. Without the filter
-    // the platform-specific code would have no automated execution anywhere.
+    // `junction` joins them for #710: the junction code is Windows-ONLY. The
+    // full `test` step now runs on the Windows CI job too, so these tests have
+    // Windows coverage; the filter stays for a fast local run of them.
     // `plugin_subdir` / `install plugin` join them for #771/#772: plugin
     // overrides go through the same junction-or-copy slot machinery.
     const cache_filters = [_][]const u8{ "cache.local", "cache.disk", "cache_cmd", "junction", "plugin_subdir", "install plugin" };
@@ -293,12 +289,11 @@ pub fn build(b: *std.Build) void {
     test_cache_step.dependOn(&b.addRunArtifact(cache_bin_tests).step);
 
     // The link-placement suite joins the Windows job too (#699 review). It
-    // lives in `test/`, so it rides `zig build test` — which runs on
-    // ubuntu/macos only. Yet it is precisely where the platform differs:
+    // lives in `test/`, so it rides `zig build test` on every CI OS,
+    // Windows included. It is precisely where the platform differs:
     // Windows takes the junction fallback that POSIX never reaches, and the
     // idempotence pin there is the one that catches a junction being rebuilt
-    // on every generate. Left out, the Windows-only path would again have
-    // Windows-only tests that no Windows job runs.
+    // on every generate, so it stays in this narrow step as well.
     const scanner_link_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/scanner_symlink_tests.zig"),

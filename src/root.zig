@@ -69,6 +69,9 @@ const tilemap_phase = @import("root/tilemap_phase.zig");
 // any compiled function path during `addTest` runs.
 test {
     _ = @import("config.zig");
+    // Only aliased below (`resolveGuiPlugin`), and its one caller is in
+    // main.zig code a test build never analyzes, so its tests need this.
+    _ = @import("gui_resolve.zig");
     _ = @import("zon_escape.zig");
     _ = @import("junction.zig");
     _ = @import("plugin_manifest.zig");
