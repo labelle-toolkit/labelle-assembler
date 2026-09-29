@@ -43,6 +43,7 @@ WEB = ROOT / '.labelle/bgfx_wasm/zig-out/web'
 OUT = ROOT / '.test-output/webgl2'
 W, H = 1236, 330
 CAPTURE_FRAME = 120  # two seconds at the fixed 1/60 s step, like verify_runtime.py
+INSTANCES = 2  # two condenser units, one instance of each material per unit
 
 # A uniform that only that material's fragment shader declares.
 PROGRAM_MARKERS = {
@@ -59,6 +60,11 @@ MODES = {
     'water_off': {'CONDENSER_WATER_OFF': '1', 'CONDENSER_MIST_OFF': '1'},
     'fog_off': {'CONDENSER_FOG_OFF': '1'},
     'lamp_off': {'CONDENSER_LAMP_OFF': '1'},
+    # Fog and mist read the lamp state too (u_lamp); with both off, only the
+    # lamp program itself can tell these two runs apart.
+    'fog_mist_off': {'CONDENSER_FOG_OFF': '1', 'CONDENSER_MIST_OFF': '1'},
+    'fog_mist_lamp_off': {'CONDENSER_FOG_OFF': '1', 'CONDENSER_MIST_OFF': '1',
+                          'CONDENSER_LAMP_OFF': '1'},
     'mist_off': {'CONDENSER_MIST_OFF': '1'},
     'left_all': {'CONDENSER_TEST_LEFT': '1'},
     'default_again': {},
@@ -78,7 +84,9 @@ INIT_SCRIPT = r"""
   const markers = __MARKERS__;
   const t = window.__labelleTest = {
     webgl2: false, compileErrors: [], linkErrors: [], linked: {}, draws: {}, frames: 0,
+    perFrame: [],  // draws per material kind, one entry per rendered frame
   };
+  let frameDraws = {};
   window.Module = {
     preRun: [() => { for (const [k, v] of Object.entries(env)) ENV[k] = v; }],
   };
@@ -119,7 +127,10 @@ INIT_SCRIPT = r"""
   wrap('useProgram', function (orig, prog) { current = prog; return orig.call(this, prog); });
   const countDraw = function (orig, ...a) {
     const kind = current && kindOf.get(current);
-    if (kind) t.draws[kind] = (t.draws[kind] || 0) + 1;
+    if (kind) {
+      t.draws[kind] = (t.draws[kind] || 0) + 1;
+      frameDraws[kind] = (frameDraws[kind] || 0) + 1;
+    }
     return orig.apply(this, a);
   };
   for (const name of ['drawElements', 'drawArrays', 'drawElementsInstanced',
@@ -132,8 +143,12 @@ INIT_SCRIPT = r"""
     for (let i = 0; i < n; i++) {
       const run = queue; queue = [];
       now += 1000 / 60;
+      frameDraws = {};
       for (const cb of run) cb(now);
-      if (run.length) t.frames++;  // a step with no queued callback rendered nothing
+      if (run.length) {  // a step with no queued callback rendered nothing
+        t.frames++;
+        t.perFrame.push(frameDraws);
+      }
     }
     return queue.length;
   };
@@ -202,8 +217,13 @@ def check_mode(mode, state, logs, image, crash):
         assert f'{component}: 2/2 generic materials live' in text, (mode, component, text[-3000:])
     for kind in PROGRAM_MARKERS:
         assert state['linked'].get(kind, 0) >= 1, (mode, kind, 'program never linked', state['linked'])
-        # Effect-off controls zero uniforms; the program still draws both units.
-        assert state['draws'].get(kind, 0) >= CAPTURE_FRAME, (mode, kind, 'too few draws', state['draws'])
+        # Effect-off controls zero uniforms, so the program still draws BOTH
+        # units: from the first frame both instances draw (by frame 30, when
+        # the probe reports them live) to the capture, every frame has both.
+        per_frame = [f.get(kind, 0) for f in state['perFrame']]
+        first = next((i for i, n in enumerate(per_frame) if n >= INSTANCES), None)
+        assert first is not None and first < 30, (mode, kind, 'both instances never drew', per_frame[:40])
+        assert all(n >= INSTANCES for n in per_frame[first:]), (mode, kind, 'an instance stopped drawing', per_frame)
 
 
 def main():
@@ -234,7 +254,8 @@ def main():
     # Empty water also emits no mist, so water is judged against mist_off: the
     # only difference left between those two runs is the water itself.
     for mode, reference in [('water_off', 'mist_off'), ('fog_off', 'default'),
-                            ('lamp_off', 'default'), ('mist_off', 'default')]:
+                            ('lamp_off', 'default'), ('fog_mist_lamp_off', 'fog_mist_off'),
+                            ('mist_off', 'default')]:
         state, image, _ = results[mode]
         changed = np.any(results[reference][1] != image, axis=2)
         assert changed.any(), (mode, f'turning the effect off changed no pixel vs {reference}')
