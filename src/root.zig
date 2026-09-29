@@ -910,12 +910,6 @@ pub fn generate(
     // Ticket #47.
     try asset_validator.validateSceneAssets(allocator, scene_manifests, cfg.resources);
 
-    // Reject static asset-catalog keys (`.catalog = "<key>"` literals and
-    // component fields listed in `catalog_keys`) that no resource
-    // registers; otherwise the typo only surfaces on the device as
-    // `AssetNotRegistered` (#738). Same merged game + pack resource list.
-    try @import("catalog_key_check.zig").validate(allocator, game_dir, cfg.resources);
-
     // Resolve the implicit `lazy` default on each resource entry.
     // Explicit `lazy = true/false` wins; null falls back to `true`
     // (lazy) when the resource is referenced by any scene's `assets:`
@@ -952,6 +946,13 @@ pub fn generate(
     // source before the copy or it survives in the staged target (codex
     // #639 review).
     try flow_scanner.pruneStaleSidecars(allocator, game_dir);
+
+    // Reject static asset-catalog keys (`.catalog = "<key>"` literals and
+    // component fields listed in `catalog_keys`) that no resource
+    // registers; otherwise the typo only surfaces on the device as
+    // `AssetNotRegistered` (#738). Same merged game + pack resource list.
+    // After the sidecar prune, so a stale flow sidecar can't fail it.
+    try @import("catalog_key_check.zig").validate(allocator, game_dir, cfg.resources);
 
     try scanner.linkDir(allocator, game_dir, target_dir, "scripts");
 

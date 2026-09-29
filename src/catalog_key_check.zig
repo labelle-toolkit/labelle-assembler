@@ -15,6 +15,9 @@
 //!      `scripts/` and `components/` trees. Only string LITERALS are
 //!      checked; a key computed at runtime (`.catalog = w.mask`) is left
 //!      to the runtime `AssetNotRegistered` path, which still guards it.
+//!      A key the game's own code registers (the leading string literal
+//!      of any `register...("<key>", ...)` call in those trees) counts as
+//!      registered.
 //!   2. **Component fields that hold a catalog key.** A component opts
 //!      its string fields in with a declaration inside its struct:
 //!
@@ -37,6 +40,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const asset_validator = @import("asset_validator.zig");
+const scanner = @import("scanner.zig");
 
 pub const Error = error{ UnregisteredCatalogKey, OutOfMemory };
 
@@ -96,7 +100,7 @@ pub fn validate(
 pub fn check(
     arena: std.mem.Allocator,
     game_dir: []const u8,
-    resources: []const config.ResourceDef,
+    declared: []const config.ResourceDef,
 ) error{OutOfMemory}![]Finding {
     var findings: std.ArrayList(Finding) = .empty;
 
@@ -104,6 +108,14 @@ pub fn check(
     try collect(arena, game_dir, "components", ".zig", &zig_files);
     const component_file_count = zig_files.items.len;
     try collect(arena, game_dir, "scripts", ".zig", &zig_files);
+
+    // Registered = declared resources + keys the game's own code registers.
+    var registered: std.ArrayList(config.ResourceDef) = .empty;
+    try registered.appendSlice(arena, declared);
+    for (zig_files.items) |f| {
+        for (try scanRegisteredLiterals(arena, f.source)) |key| try registered.append(arena, .{ .name = key });
+    }
+    const resources = registered.items;
 
     // Component declarations come from `components/` only.
     var decls: std.ArrayList(KeyDecl) = .empty;
@@ -236,115 +248,195 @@ pub fn suggest(
 // ── Zig source scanning ────────────────────────────────────────────────
 
 /// Every `.catalog = "<key>"` string literal in `src`, with its 1-based
-/// line. Line comments and multiline-string lines are ignored; a literal
-/// containing an escape is skipped (not a plain catalog key).
+/// line. The assignment may span lines. Comments and multiline-string
+/// lines are ignored; a literal containing an escape is skipped (not a
+/// plain catalog key).
 pub fn scanCatalogLiterals(arena: std.mem.Allocator, src: []const u8) error{OutOfMemory}![]Literal {
+    const code = try stripZigComments(arena, src);
     var out: std.ArrayList(Literal) = .empty;
-    var lines = std.mem.splitScalar(u8, src, '\n');
-    var line_no: usize = 0;
-    while (lines.next()) |raw| {
-        line_no += 1;
-        const line = codePart(raw);
-        var i: usize = 0;
-        while (std.mem.indexOfPos(u8, line, i, ".catalog")) |at| {
-            i = at + ".catalog".len;
-            if (at > 0 and isIdentChar(line[at - 1])) continue;
-            var j = i;
-            if (j < line.len and isIdentChar(line[j])) continue;
-            j = skipSpaces(line, j);
-            if (j >= line.len or line[j] != '=') continue;
-            j += 1;
-            if (j < line.len and line[j] == '=') continue; // `==`
-            j = skipSpaces(line, j);
-            if (j >= line.len or line[j] != '"') continue;
-            const start = j + 1;
-            const end = std.mem.indexOfScalarPos(u8, line, start, '"') orelse continue;
-            const key = line[start..end];
-            i = end + 1;
-            if (std.mem.indexOfScalar(u8, key, '\\') != null) continue;
-            try out.append(arena, .{ .key = key, .line = line_no });
-        }
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, code, i, ".catalog")) |at| {
+        i = at + ".catalog".len;
+        if (at > 0 and isIdentChar(code[at - 1])) continue;
+        if (i < code.len and isIdentChar(code[i])) continue;
+        var j = skipWhitespace(code, i);
+        if (j >= code.len or code[j] != '=') continue;
+        j += 1;
+        if (j < code.len and code[j] == '=') continue; // `==`
+        j = skipWhitespace(code, j);
+        const key = stringAt(code, j) orelse continue;
+        i = j + key.len + 2;
+        try out.append(arena, .{ .key = key, .line = lineAt(code, j) });
     }
     return out.items;
 }
 
-/// Every `pub const catalog_keys = .{ "a", "b" };` in `src`, attributed
-/// to the nearest preceding `pub const <Name> = [extern|packed] struct`.
-/// A declaration with no enclosing struct header is ignored.
+/// Keys game code registers itself: the leading string-literal argument
+/// of any `register...("<key>", ...)` call (`assets.register("mask",
+/// .image, ...)`, `registerImageFromMemory("mask", ...)`). A `.catalog`
+/// literal naming one of these is bound at runtime by design, not a typo.
+pub fn scanRegisteredLiterals(arena: std.mem.Allocator, src: []const u8) error{OutOfMemory}![]const []const u8 {
+    const code = try stripZigComments(arena, src);
+    var out: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, code, i, "register")) |at| {
+        i = at + "register".len;
+        if (at > 0 and isIdentChar(code[at - 1])) continue;
+        var j = i;
+        while (j < code.len and isIdentChar(code[j])) j += 1;
+        if (j >= code.len or code[j] != '(') continue;
+        j = skipWhitespace(code, j + 1);
+        const key = stringAt(code, j) orelse continue;
+        try out.append(arena, key);
+    }
+    return out.items;
+}
+
+const Frame = struct {
+    /// Struct name when this `{` opened `const Name = struct {`.
+    name: ?[]const u8,
+    stmt_start: usize,
+    keys: ?[]const []const u8 = null,
+    lits: std.ArrayList(Default) = .empty,
+};
+
+/// Every component struct in `src` that declares
+/// `pub const catalog_keys = .{ "a", "b" };`, with the string-literal
+/// defaults of those fields. Brace-aware: a declaration belongs to the
+/// struct whose body directly contains it, never to a nested or
+/// preceding sibling struct.
 pub fn parseKeyDecls(arena: std.mem.Allocator, src: []const u8) error{OutOfMemory}![]KeyDecl {
     const code = try stripZigComments(arena, src);
+    var stack: std.ArrayList(Frame) = .empty;
+    try stack.append(arena, .{ .name = null, .stmt_start = 0 });
     var out: std.ArrayList(KeyDecl) = .empty;
-    const marker = "pub const catalog_keys";
+
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, code, i, marker)) |at| {
-        i = at + marker.len;
-        if (i < code.len and isIdentChar(code[i])) continue;
-        const open = std.mem.indexOfPos(u8, code, i, ".{") orelse break;
-        const close = std.mem.indexOfScalarPos(u8, code, open, '}') orelse break;
-        i = close + 1;
-        const header = enclosingStruct(code[0..at]) orelse continue;
-        var fields: std.ArrayList([]const u8) = .empty;
-        var defaults: std.ArrayList(Default) = .empty;
-        var body = code[open + 2 .. close];
-        while (std.mem.indexOfScalar(u8, body, '"')) |q| {
-            const end = std.mem.indexOfScalarPos(u8, body, q + 1, '"') orelse break;
-            const field = body[q + 1 .. end];
-            try fields.append(arena, field);
-            if (fieldDefault(code, header.pos, field)) |d| try defaults.append(arena, d);
-            body = body[end + 1 ..];
+    while (i < code.len) : (i += 1) {
+        switch (code[i]) {
+            '"' => i = skipString(code, i),
+            '\'' => i = skipChar(code, i),
+            '{' => {
+                const top = &stack.items[stack.items.len - 1];
+                const name = structHeaderName(code[top.stmt_start..i]);
+                try stack.append(arena, .{ .name = name, .stmt_start = i + 1 });
+            },
+            '}' => {
+                if (stack.items.len <= 1) continue;
+                var done = stack.pop().?;
+                try statement(arena, code, done.stmt_start, i, &done);
+                const name = done.name orelse continue;
+                const keys = done.keys orelse continue;
+                var defaults: std.ArrayList(Default) = .empty;
+                for (keys) |field| for (done.lits.items) |d| {
+                    if (std.mem.eql(u8, d.field, field)) try defaults.append(arena, d);
+                };
+                try out.append(arena, .{ .component = name, .fields = keys, .defaults = defaults.items });
+            },
+            ',', ';' => {
+                const top = &stack.items[stack.items.len - 1];
+                try statement(arena, code, top.stmt_start, i, top);
+                top.stmt_start = i + 1;
+            },
+            else => {},
         }
-        try out.append(arena, .{ .component = header.name, .fields = fields.items, .defaults = defaults.items });
     }
     return out.items;
 }
 
-/// The string-literal default of `field` (`<field>: []const u8 = "<key>",`),
-/// searched line by line from the struct header at `from`. Null when the
-/// field has no literal default.
-fn fieldDefault(code: []const u8, from: usize, field: []const u8) ?Default {
-    var line_no: usize = std.mem.count(u8, code[0..from], "\n") + 1;
-    var lines = std.mem.splitScalar(u8, code[from..], '\n');
-    while (lines.next()) |raw| : (line_no += 1) {
-        const line = std.mem.trimStart(u8, raw, " \t");
-        if (!std.mem.startsWith(u8, line, field)) continue;
-        var j = skipSpaces(line, field.len);
-        if (j >= line.len or line[j] != ':') continue;
-        const eq = std.mem.indexOfScalarPos(u8, line, j, '=') orelse return null;
-        j = skipSpaces(line, eq + 1);
-        if (j >= line.len or line[j] != '"') return null;
-        const end = std.mem.indexOfScalarPos(u8, line, j + 1, '"') orelse return null;
-        const key = line[j + 1 .. end];
-        if (std.mem.indexOfScalar(u8, key, '\\') != null) return null;
-        return .{ .field = field, .key = key, .line = line_no };
+/// Record one struct-level statement `code[start..end]` into `frame`:
+/// a `pub const catalog_keys = .{ ... }` declaration, or a field with a
+/// string-literal default (`mask: []const u8 = "reservoir_mask"`).
+fn statement(arena: std.mem.Allocator, code: []const u8, start: usize, end: usize, frame: *Frame) error{OutOfMemory}!void {
+    if (frame.name == null) return;
+    const raw = code[start..end];
+    const lead = start + (raw.len - std.mem.trimStart(u8, raw, " \t\r\n").len);
+    const text = std.mem.trimEnd(u8, code[lead..end], " \t\r\n");
+    const marker = "pub const catalog_keys";
+    if (std.mem.startsWith(u8, text, marker) and (text.len == marker.len or !isIdentChar(text[marker.len]))) {
+        var fields: std.ArrayList([]const u8) = .empty;
+        var j: usize = marker.len;
+        while (std.mem.indexOfScalarPos(u8, text, j, '"')) |q| {
+            const key = stringAt(text, q) orelse break;
+            try fields.append(arena, key);
+            j = q + key.len + 2;
+        }
+        frame.keys = fields.items;
+        return;
     }
+    // `<field> : <type> = "<key>"`, the statement ending at the literal.
+    var j: usize = 0;
+    while (j < text.len and isIdentChar(text[j])) j += 1;
+    if (j == 0) return;
+    const field = text[0..j];
+    j = skipWhitespace(text, j);
+    if (j >= text.len or text[j] != ':') return;
+    const eq = std.mem.indexOfScalarPos(u8, text, j, '=') orelse return;
+    const q = skipWhitespace(text, eq + 1);
+    const key = stringAt(text, q) orelse return;
+    if (q + key.len + 2 != text.len) return;
+    try frame.lits.append(arena, .{ .field = field, .key = key, .line = lineAt(code, lead + q) });
+}
+
+/// `Name` when `prefix` (the statement text before a `{`) is
+/// `[pub ]const Name = [extern |packed ]struct[(...)]`.
+fn structHeaderName(prefix: []const u8) ?[]const u8 {
+    const ws = " \t\r\n";
+    var s = std.mem.trim(u8, prefix, ws);
+    if (std.mem.startsWith(u8, s, "pub ")) s = std.mem.trimStart(u8, s[4..], ws);
+    if (!std.mem.startsWith(u8, s, "const ")) return null;
+    s = std.mem.trimStart(u8, s[6..], ws);
+    var j: usize = 0;
+    while (j < s.len and isIdentChar(s[j])) j += 1;
+    if (j == 0) return null;
+    const name = s[0..j];
+    s = std.mem.trimStart(u8, s[j..], ws);
+    if (s.len == 0 or s[0] != '=') return null;
+    s = std.mem.trimStart(u8, s[1..], ws);
+    for ([_][]const u8{ "extern", "packed" }) |q| {
+        if (std.mem.startsWith(u8, s, q) and s.len > q.len and !isIdentChar(s[q.len])) s = std.mem.trimStart(u8, s[q.len..], ws);
+    }
+    if (!std.mem.startsWith(u8, s, "struct")) return null;
+    s = std.mem.trimStart(u8, s["struct".len..], ws);
+    if (s.len == 0) return name;
+    if (s[0] == '(' and s[s.len - 1] == ')') return name;
     return null;
 }
 
-const StructHeader = struct { name: []const u8, pos: usize };
+/// The contents of the plain string literal opening at `code[at]`, or
+/// null if there is none there or it contains an escape.
+fn stringAt(code: []const u8, at: usize) ?[]const u8 {
+    if (at >= code.len or code[at] != '"') return null;
+    const end = std.mem.indexOfAnyPos(u8, code, at + 1, "\"\\\n") orelse return null;
+    if (code[end] != '"') return null;
+    return code[at + 1 .. end];
+}
 
-/// The last `pub const <Name> = [extern |packed ]struct` in `prefix`.
-fn enclosingStruct(prefix: []const u8) ?StructHeader {
-    var result: ?StructHeader = null;
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, prefix, i, "pub const ")) |at| {
-        i = at + "pub const ".len;
-        var j = i;
-        while (j < prefix.len and isIdentChar(prefix[j])) j += 1;
-        if (j == i) continue;
-        const name = prefix[i..j];
-        j = skipSpaces(prefix, j);
-        if (j >= prefix.len or prefix[j] != '=') continue;
-        var rest = std.mem.trimStart(u8, prefix[j + 1 ..], " \t\r\n");
-        for ([_][]const u8{ "extern ", "packed " }) |q| {
-            if (std.mem.startsWith(u8, rest, q)) rest = std.mem.trimStart(u8, rest[q.len..], " \t\r\n");
-        }
-        if (std.mem.startsWith(u8, rest, "struct") and
-            (rest.len == "struct".len or !isIdentChar(rest["struct".len])))
-        {
-            result = .{ .name = name, .pos = at };
-        }
+/// Index of the closing quote of the string literal opening at `at`.
+fn skipString(code: []const u8, at: usize) usize {
+    var i = at + 1;
+    while (i < code.len and code[i] != '"' and code[i] != '\n') : (i += 1) {
+        if (code[i] == '\\') i += 1;
     }
-    return result;
+    return @min(i, code.len - 1);
+}
+
+/// Index of the closing quote of the char literal opening at `at`.
+fn skipChar(code: []const u8, at: usize) usize {
+    var i = at + 1;
+    if (i < code.len and code[i] == '\\') i += 1;
+    while (i + 1 < code.len and code[i + 1] != '\'' and code[i + 1] != '\n') i += 1;
+    return @min(i + 1, code.len - 1);
+}
+
+fn lineAt(code: []const u8, pos: usize) usize {
+    return std.mem.count(u8, code[0..pos], "\n") + 1;
+}
+
+fn skipWhitespace(s: []const u8, from: usize) usize {
+    var j = from;
+    while (j < s.len and std.ascii.isWhitespace(s[j])) j += 1;
+    return j;
 }
 
 /// `raw` minus any `//` comment outside a string literal; empty for a
@@ -388,12 +480,6 @@ fn stripZigComments(arena: std.mem.Allocator, src: []const u8) error{OutOfMemory
 
 fn isIdentChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
-}
-
-fn skipSpaces(s: []const u8, from: usize) usize {
-    var j = from;
-    while (j < s.len and (s[j] == ' ' or s[j] == '\t')) j += 1;
-    return j;
 }
 
 // ── JSONC helpers ──────────────────────────────────────────────────────
@@ -479,6 +565,8 @@ fn collectDir(
     var it = dir.iterate();
     while (it.next(io) catch return) |entry| {
         if (entry.name.len > 0 and entry.name[0] == '.') continue;
+        // Caches, vendored trees and nested repositories are not game source.
+        if (entry.kind == .directory and scanner.isSkippableDir(dir, entry.name)) continue;
         const child_abs = try std.fs.path.join(arena, &.{ abs, entry.name });
         const child_rel = try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, entry.name });
         switch (entry.kind) {
@@ -573,6 +661,60 @@ test "parseKeyDecls: attributes catalog_keys to the enclosing component struct" 
     try testing.expectEqual(@as(usize, 5), decls[0].defaults[0].line);
 }
 
+test "parseKeyDecls: a preceding nested struct does not steal the declaration" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\pub const WaterShader = struct {
+        \\    pub const Tuning = struct { mask: []const u8 = "nested_default", brace: u8 = '}' };
+        \\    const s = "}{";
+        \\    pub const catalog_keys = .{"mask"};
+        \\    mask: []const u8 =
+        \\        "reservoir_mask",
+        \\    pub fn f(self: @This()) void { _ = self; }
+        \\};
+    ;
+    const decls = try parseKeyDecls(arena.allocator(), src);
+    try testing.expectEqual(@as(usize, 1), decls.len);
+    try testing.expectEqualStrings("WaterShader", decls[0].component);
+    // The outer field's default, not the nested struct's same-named field.
+    try testing.expectEqual(@as(usize, 1), decls[0].defaults.len);
+    try testing.expectEqualStrings("reservoir_mask", decls[0].defaults[0].key);
+    try testing.expectEqual(@as(usize, 6), decls[0].defaults[0].line);
+}
+
+test "scanCatalogLiterals: an assignment split across lines is still found" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\const t = .{
+        \\    .catalog =
+        \\        "fog_maks",
+        \\};
+    ;
+    const lits = try scanCatalogLiterals(arena.allocator(), src);
+    try testing.expectEqual(@as(usize, 1), lits.len);
+    try testing.expectEqualStrings("fog_maks", lits[0].key);
+    try testing.expectEqual(@as(usize, 3), lits[0].line);
+}
+
+test "scanRegisteredLiterals: leading string argument of register calls" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\try g.assets.register("runtime_mask", .image, bytes);
+        \\try g.registerImageFromMemory(
+        \\    "other_mask", bytes);
+        \\r.registerCatalogTexture(handle, tex);
+        \\// register("commented")
+        \\unregister("not_a_registration");
+    ;
+    const keys = try scanRegisteredLiterals(arena.allocator(), src);
+    try testing.expectEqual(@as(usize, 2), keys.len);
+    try testing.expectEqualStrings("runtime_mask", keys[0]);
+    try testing.expectEqualStrings("other_mask", keys[1]);
+}
+
 test "suggest: edit distance first, prefix fallback for long suffixes" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -644,6 +786,10 @@ test "check: a game with only registered keys produces no findings" {
     try writeTree(tmp.dir, &.{
         .{ "components/water_shader.zig", fixture_component },
         .{ "scripts/playing/fx.zig", "const t = .{ .catalog = \"fog_mask\" };\n" },
+        // A key the game registers from code is bound at runtime by design.
+        .{ "scripts/playing/runtime.zig", "try g.assets.register(\"runtime_mask\", .image, b);\nconst u = .{ .catalog = \"runtime_mask\" };\n" },
+        // Vendored trees are not game source.
+        .{ "scripts/node_modules/pkg/x.zig", "const v = .{ .catalog = \"vendored_MISSING\" };\n" },
         .{ "prefabs/reservoir.jsonc", "{ \"WaterShader\": { \"mask\": \"reservoir_mask\" } }\n" },
     });
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

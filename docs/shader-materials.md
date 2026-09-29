@@ -62,8 +62,11 @@ pub const WaterShader = struct {
 };
 ```
 
-A key computed at runtime (`.catalog = w.mask`, a key registered from code)
-is not checked here; it still reports `AssetNotRegistered` at runtime.
+A key the game registers from code (the leading string literal of a
+`register...("<key>", ...)` call in `scripts/` or `components/`) counts as
+registered. A key computed at runtime (`.catalog = w.mask`) is not checked
+here; it still reports `AssetNotRegistered` at runtime. Pack sources are not
+scanned yet.
 
 A binding that is registered but not yet resident returns `error.TextureNotReady`
 (streaming) or `error.AssetLoadFailed`; retry, do not treat either as fatal.
