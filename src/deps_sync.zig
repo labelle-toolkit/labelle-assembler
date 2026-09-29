@@ -219,7 +219,6 @@ fn fileUpToDate(src: []const u8, dest: []const u8) bool {
     if (ss.size != ds.size) return false;
     if (ss.inode == ds.inode and ss.mtime.nanoseconds == ds.mtime.nanoseconds) return true;
     if (ds.nlink != 1) return false;
-    if (!std.meta.eql(ss.permissions, ds.permissions)) return false;
     return write_if_changed.sameFiles(io, cwd, src, cwd, dest);
 }
 

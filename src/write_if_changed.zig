@@ -32,7 +32,9 @@ pub fn sameContent(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, content: [
 }
 
 /// True when `a_sub` (in `a_dir`) and `b_sub` (in `b_dir`) are both regular
-/// files with identical bytes. Streams both — no size cap, no allocation.
+/// files with identical bytes AND permissions (a mode-only change — e.g. a
+/// helper made executable — must still refresh a copy). Streams both — no
+/// size cap, no allocation.
 /// Any error reads as "different" (the caller then copies — the safe side).
 pub fn sameFiles(io: std.Io, a_dir: std.Io.Dir, a_sub: []const u8, b_dir: std.Io.Dir, b_sub: []const u8) bool {
     const a = a_dir.openFile(io, a_sub, .{}) catch return false;
@@ -42,6 +44,7 @@ pub fn sameFiles(io: std.Io, a_dir: std.Io.Dir, a_sub: []const u8, b_dir: std.Io
     const as = a.stat(io) catch return false;
     const bs = b.stat(io) catch return false;
     if (as.kind != .file or bs.kind != .file or as.size != bs.size) return false;
+    if (!std.meta.eql(as.permissions, bs.permissions)) return false;
     var abuf: [16 * 1024]u8 = undefined;
     var bbuf: [16 * 1024]u8 = undefined;
     var off: u64 = 0;
