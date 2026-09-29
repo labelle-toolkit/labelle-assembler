@@ -139,6 +139,13 @@ pub const Codegen = struct {
     // script-less projects) emits byte-identical output.
     scripting: ?scripting_splice.ScriptingSplice = null,
 
+    // i18n (RFC-I18N section 8): true when the project's generated `i18n`
+    // module exists, so the lifecycle setup hands it the device language
+    // (`lifecycle/loop.zig:emitSystemLocale`). Set by `root.zig` via the
+    // module-level var; false by default so every caller that never sets
+    // it (tests, preview, locale-less projects) emits byte-identical output.
+    i18n: bool = false,
+
     // Resolved hook dispatch order (labelle-assembler#723), built by
     // `blocks/hooks.zig:buildReceiverPlan`: the baseline sequence (root
     // hooks → pack hooks → priority-shaped flow tail) after any

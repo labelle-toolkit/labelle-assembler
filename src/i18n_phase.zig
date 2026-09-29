@@ -898,6 +898,13 @@ fn emitModule(
     }
     try w.writeAll("};\n\n");
 
+    // Sizes the generated main's `systemLocale` buffer, so the device tag
+    // handoff can never truncate a shipped tag.
+    var max_tag_len: usize = 0;
+    for (tags) |t| max_tag_len = @max(max_tag_len, t.len);
+    try w.writeAll("/// Length of the longest shipped tag.\n");
+    try w.print("pub const max_tag_len = {d};\n\n", .{max_tag_len});
+
     // The rectangular table: [locale][key], reference string where a locale
     // has no translation. Plain keys emit the DECODED text -- a string like
     // "Set {{name}}" carries escaped braces that t() would otherwise show
@@ -1104,29 +1111,85 @@ fn emitModule(
     }
 
     try w.writeAll(
-        \\// ---- LABELLE_LOCALE (RFC-I18N section 8, startup resolution) --------
-        \\// The dev/CI override is applied by the module itself, lazily, on the
-        \\// first lookup -- no generated-main wiring, and it works identically
-        \\// under every lifecycle style. An explicit setLocale() before the
-        \\// first lookup wins over the env var: a live choice outranks a dev
-        \\// knob. Same getenv pattern as labelle-engine's runtime_env.zig --
-        \\// comptime-guarded so libc-less targets (wasm/wasi) compile the
-        \\// return-early branch only.
+        \\// ---- Startup resolution (RFC-I18N section 8) -----------------------
+        \\// Boot order: LABELLE_LOCALE (dev/CI knob) > the device's language
+        \\// (applySystemLocale, fed by the generated main from the backend's
+        \\// window.systemLocale) > .i18n.default. The env override is applied by
+        \\// the module itself, lazily, on the first lookup -- no generated-main
+        \\// wiring, and it works identically under every lifecycle style. An
+        \\// explicit setLocale() before the first lookup wins over both: a live
+        \\// choice outranks a dev knob. Same getenv pattern as labelle-engine's
+        \\// runtime_env.zig -- comptime-guarded so libc-less targets (wasm/wasi)
+        \\// compile the return-early branch only.
         \\var env_checked = false;
+        \\/// Set once LABELLE_LOCALE or an explicit setLocale() picked the
+        \\/// locale, so the device language can no longer override it.
+        \\var pinned = false;
         \\
         \\fn ensureEnvLocale() void {
         \\    if (env_checked) return;
         \\    env_checked = true;
         \\    if (comptime builtin.os.tag == .wasi or !builtin.link_libc) return;
         \\    const raw = std.c.getenv("LABELLE_LOCALE") orelse return;
-        \\    const val = std.mem.span(raw);
-        \\    if (val.len == 0) return;
-        \\    // Unknown tags are ignored, never an error: a leaked dev var must
-        \\    // not be able to break a player's run. BCP-47 tags are
-        \\    // case-insensitive, so pt-br finds pt-BR.
+        \\    // Exact tags only, the same policy as initFromEnvValue on libc-less
+        \\    // hosts: the language fallback is for the device language, not a
+        \\    // dev override. Unknown tags are ignored, never an error: a leaked
+        \\    // dev var must not be able to break a player's run.
+        \\    _ = setLocale(std.mem.span(raw));
+        \\}
+        \\
+        \\/// Applies the device's language at boot -- the generated main calls
+        \\/// this with the backend's `window.systemLocale()` before the first
+        \\/// frame. Accepts OS spellings (`pt-BR`, `pt_BR.UTF-8`, `en-US`) and
+        \\/// falls back to the language subtag, so a `pt-BR` device gets `pt`.
+        \\/// A no-op, returning false, when LABELLE_LOCALE or setLocale()
+        \\/// already chose, or when the build ships no matching locale (the
+        \\/// .i18n.default stays active).
+        \\pub fn applySystemLocale(tag: []const u8) bool {
+        \\    ensureEnvLocale();
+        \\    if (pinned) return false;
+        \\    active = matchLocale(tag) orelse return false;
+        \\    return true;
+        \\}
+        \\
+        \\/// Index of the shipped locale that best serves `raw`: the exact tag
+        \\/// first, then the bare language (`pt-BR` -> `pt`), then any tag of the
+        \\/// same language (`pt-PT` -> `pt-BR`). BCP-47 tags are case-insensitive,
+        \\/// so pt-br finds pt-BR; a POSIX `_` separator and `.charset` /
+        \\/// `@modifier` suffix are normalized away first.
+        \\fn matchLocale(raw: []const u8) ?usize {
+        \\    // Compared in place, never copied: a fixed buffer would truncate a
+        \\    // long valid tag and miss its exact match.
+        \\    const want = raw[0 .. std.mem.indexOfAny(u8, raw, ".@") orelse raw.len];
+        \\    if (want.len == 0) return null;
         \\    for (tags, 0..) |t_, i| {
-        \\        if (std.ascii.eqlIgnoreCase(t_, val)) active = i;
+        \\        if (tagEql(t_, want)) return i;
         \\    }
+        \\    const lang = languageOf(want);
+        \\    for (tags, 0..) |t_, i| {
+        \\        if (tagEql(t_, lang)) return i;
+        \\    }
+        \\    for (tags, 0..) |t_, i| {
+        \\        if (tagEql(languageOf(t_), lang)) return i;
+        \\    }
+        \\    return null;
+        \\}
+        \\
+        \\/// Case-insensitive tag equality that treats POSIX `_` as `-`.
+        \\fn tagEql(a: []const u8, b: []const u8) bool {
+        \\    if (a.len != b.len) return false;
+        \\    for (a, b) |x, y| {
+        \\        if (tagChar(x) != tagChar(y)) return false;
+        \\    }
+        \\    return true;
+        \\}
+        \\
+        \\fn tagChar(c: u8) u8 {
+        \\    return if (c == '_') '-' else std.ascii.toLower(c);
+        \\}
+        \\
+        \\fn languageOf(tag: []const u8) []const u8 {
+        \\    return tag[0 .. std.mem.indexOfAny(u8, tag, "-_") orelse tag.len];
         \\}
         \\
         \\/// The translated string for a key, in the active locale. Zero-cost
@@ -1271,8 +1334,8 @@ fn emitModule(
         \\
         \\/// Switches the active locale. Returns false (and changes nothing)
         \\/// for a tag no locale file declared. An explicit call also settles
-        \\/// the LABELLE_LOCALE question: a live choice outranks the dev knob,
-        \\/// so the lazy env check will not overwrite this later.
+        \\/// the startup question: a live choice outranks the dev knob and the
+        \\/// device language, so neither overwrites this later.
         \\pub fn setLocale(tag: []const u8) bool {
         \\    // BCP-47 tags are case-insensitive: pt-br switches to pt-BR.
         \\    for (tags, 0..) |t_, i| {
@@ -1282,6 +1345,7 @@ fn emitModule(
         \\            // question -- a rejected tag "changes nothing", and that
         \\            // must include not eating the LABELLE_LOCALE fallback.
         \\            env_checked = true;
+        \\            pinned = true;
         \\            return true;
         \\        }
         \\    }
