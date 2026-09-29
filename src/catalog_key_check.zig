@@ -9,17 +9,18 @@
 //! registered set — project `.resources` plus the merged, namespaced
 //! `<pack>__<name>` pack entries — so a static typo is catchable here.
 //!
-//! Two sources of static keys are checked:
+//! Two sources of static keys are checked, both over the game's own
+//! `components/` and `scripts/` (packs: #803):
 //!
-//!   1. **Zig literals.** Every `.catalog = "<key>"` in the game's
-//!      `scripts/` and `components/` trees. Only string LITERALS are
-//!      checked; a key computed at runtime (`.catalog = w.mask`) is left
-//!      to the runtime `AssetNotRegistered` path, which still guards it.
-//!      A key the game's own code registers (the leading string literal
-//!      of any `register...("<key>", ...)` call in those trees) counts as
-//!      registered.
+//!   1. **Zig literals.** Every `.catalog = "<key>"` string literal,
+//!      found with the Zig tokenizer (so comments, line breaks and
+//!      multiline strings need no special casing). A key computed at
+//!      runtime (`.catalog = w.mask`) is left to the runtime
+//!      `AssetNotRegistered` path, which still guards it. A key the game
+//!      registers itself — the leading string literal of any
+//!      `register...("<key>", ...)` call — counts as registered.
 //!   2. **Component fields that hold a catalog key.** A component opts
-//!      its string fields in with a declaration inside its struct:
+//!      its string fields in with a declaration in its struct:
 //!
 //!          pub const WaterShader = struct {
 //!              pub const catalog_keys = .{ "mask", "reflection" };
@@ -27,12 +28,12 @@
 //!              ...
 //!          };
 //!
+//!      Read with the Zig parser from each root-level component struct.
 //!      Every string value those fields take in `prefabs/` and `scenes/`
-//!      (`.jsonc`, at any nesting depth, so prefab bodies, scene entity
-//!      `components` objects and overrides are all covered) is checked,
-//!      and so is each field's string-literal default in the component.
-//!      The declaration is an ordinary public decl, so the engine and
-//!      the Zig compiler ignore it.
+//!      is checked (component sites located by the scene walker
+//!      `scene_name_lint.collectComponentRefs`, so opaque payload that
+//!      happens to reuse a component name is not), and so is each
+//!      field's string-literal default in the component.
 //!
 //! Every unregistered key is reported — file, line, the component/field
 //! (or `.catalog` literal) that authored it, and the closest registered
@@ -41,6 +42,8 @@ const std = @import("std");
 const config = @import("config.zig");
 const asset_validator = @import("asset_validator.zig");
 const scanner = @import("scanner.zig");
+const scene_name_lint = @import("scene_name_lint.zig");
+const i18n_locales = @import("i18n_locales.zig");
 
 pub const Error = error{ UnregisteredCatalogKey, OutOfMemory };
 
@@ -48,8 +51,9 @@ pub const Error = error{ UnregisteredCatalogKey, OutOfMemory };
 pub const Site = union(enum) {
     /// A `.catalog = "<key>"` string literal in a Zig source.
     catalog_literal,
-    /// A `<component>.<field>` value in a prefab/scene, where the
-    /// component declares `field` in its `catalog_keys`.
+    /// A `<component>.<field>` value in a prefab/scene or the field's
+    /// default in the component, where the component lists `field` in
+    /// its `catalog_keys`.
     component_field: struct { component: []const u8, field: []const u8 },
 };
 
@@ -73,6 +77,14 @@ pub const KeyDecl = struct {
 };
 
 pub const Default = struct { field: []const u8, key: []const u8, line: usize };
+
+/// Static keys read from one Zig source.
+pub const ZigKeys = struct {
+    /// `.catalog = "<key>"` literals.
+    catalog: []const Literal,
+    /// Leading string argument of `register...(` calls.
+    registered: []const []const u8,
+};
 
 pub const Literal = struct { key: []const u8, line: usize };
 
@@ -112,10 +124,25 @@ pub fn check(
     // Registered = declared resources + keys the game's own code registers.
     var registered: std.ArrayList(config.ResourceDef) = .empty;
     try registered.appendSlice(arena, declared);
-    for (zig_files.items) |f| {
-        for (try scanRegisteredLiterals(arena, f.source)) |key| try registered.append(arena, .{ .name = key });
+    const zig_keys = try arena.alloc(ZigKeys, zig_files.items.len);
+    for (zig_files.items, zig_keys) |f, *k| {
+        k.* = try scanZigKeys(arena, f.source);
+        for (k.registered) |key| try registered.append(arena, .{ .name = key });
     }
     const resources = registered.items;
+
+    for (zig_files.items, zig_keys) |f, k| {
+        for (k.catalog) |lit| {
+            if (isRegistered(lit.key, resources)) continue;
+            try findings.append(arena, .{
+                .file = f.rel,
+                .line = lit.line,
+                .site = .catalog_literal,
+                .key = lit.key,
+                .suggestion = try suggest(arena, lit.key, resources),
+            });
+        }
+    }
 
     // Component declarations come from `components/` only.
     var decls: std.ArrayList(KeyDecl) = .empty;
@@ -134,19 +161,6 @@ pub fn check(
         };
     }
 
-    for (zig_files.items) |f| {
-        for (try scanCatalogLiterals(arena, f.source)) |lit| {
-            if (isRegistered(lit.key, resources)) continue;
-            try findings.append(arena, .{
-                .file = f.rel,
-                .line = lit.line,
-                .site = .catalog_literal,
-                .key = lit.key,
-                .suggestion = try suggest(arena, lit.key, resources),
-            });
-        }
-    }
-
     if (decls.items.len > 0) {
         var json_files: std.ArrayList(SourceFile) = .empty;
         try collect(arena, game_dir, "prefabs", ".jsonc", &json_files);
@@ -159,7 +173,9 @@ pub fn check(
 }
 
 /// Check one prefab/scene source against the component declarations.
-/// Unparseable JSON is skipped: the scene/prefab parsers own that error.
+/// Each component site the scene walker reports is parsed on its own; a
+/// site that is not a parseable object is skipped (the scene/prefab
+/// parsers own that error).
 pub fn checkJsonSource(
     arena: std.mem.Allocator,
     rel: []const u8,
@@ -168,52 +184,91 @@ pub fn checkJsonSource(
     resources: []const config.ResourceDef,
     findings: *std.ArrayList(Finding),
 ) error{OutOfMemory}!void {
-    const stripped = try stripJsonc(arena, source);
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, stripped, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return,
-    };
-    try walkJson(arena, rel, source, parsed, decls, resources, findings);
+    const refs = scene_name_lint.collectComponentRefs(arena, source) catch return error.OutOfMemory;
+    for (refs) |ref| {
+        const decl = findDecl(decls, ref.name) orelse continue;
+        const span = componentObject(source, ref.offset + ref.name.len) orelse continue;
+        const body = source[span[0]..span[1]];
+        const stripped = try i18n_locales.stripJsonc(arena, body);
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, stripped.text, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        if (parsed != .object) continue;
+        for (decl.fields) |field| {
+            const v = parsed.object.get(field) orelse continue;
+            if (v != .string) continue;
+            if (isRegistered(v.string, resources)) continue;
+            const at = quotedOffset(body, v.string);
+            try findings.append(arena, .{
+                .file = rel,
+                .line = if (at) |o| scene_name_lint.locOf(source, span[0] + o).line else 0,
+                .site = .{ .component_field = .{ .component = decl.component, .field = field } },
+                .key = v.string,
+                .suggestion = try suggest(arena, v.string, resources),
+            });
+        }
+    }
 }
 
-fn walkJson(
-    arena: std.mem.Allocator,
-    rel: []const u8,
-    source: []const u8,
-    value: std.json.Value,
-    decls: []const KeyDecl,
-    resources: []const config.ResourceDef,
-    findings: *std.ArrayList(Finding),
-) error{OutOfMemory}!void {
-    switch (value) {
-        .array => |arr| for (arr.items) |item| {
-            try walkJson(arena, rel, source, item, decls, resources, findings);
-        },
-        .object => |obj| {
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                const body = entry.value_ptr.*;
-                if (body == .object) {
-                    if (findDecl(decls, entry.key_ptr.*)) |decl| {
-                        for (decl.fields) |field| {
-                            const v = body.object.get(field) orelse continue;
-                            if (v != .string) continue;
-                            if (isRegistered(v.string, resources)) continue;
-                            try findings.append(arena, .{
-                                .file = rel,
-                                .line = lineOfQuoted(source, v.string),
-                                .site = .{ .component_field = .{ .component = decl.component, .field = field } },
-                                .key = v.string,
-                                .suggestion = try suggest(arena, v.string, resources),
-                            });
-                        }
-                    }
+/// `[start, end)` of the `{ ... }` object that is the value of the key
+/// whose content ends at `name_end` (the key's closing quote), or null
+/// when the value is not an object. String- and comment-aware.
+fn componentObject(src: []const u8, name_end: usize) ?[2]usize {
+    var i = skipJsonTrivia(src, name_end + 1);
+    if (i >= src.len or src[i] != ':') return null;
+    i = skipJsonTrivia(src, i + 1);
+    if (i >= src.len or src[i] != '{') return null;
+    const start = i;
+    var depth: usize = 0;
+    while (i < src.len) : (i += 1) {
+        switch (src[i]) {
+            '"' => {
+                i += 1;
+                while (i < src.len and src[i] != '"') : (i += 1) {
+                    if (src[i] == '\\') i += 1;
                 }
-                try walkJson(arena, rel, source, body, decls, resources, findings);
-            }
-        },
-        else => {},
+            },
+            '/' => if (i + 1 < src.len and (src[i + 1] == '/' or src[i + 1] == '*')) {
+                i = skipJsonTrivia(src, i) - 1;
+            },
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if (depth == 0) return .{ start, i + 1 };
+            },
+            else => {},
+        }
     }
+    return null;
+}
+
+/// Index of the first non-whitespace, non-comment byte at or after `from`.
+fn skipJsonTrivia(src: []const u8, from: usize) usize {
+    var i = from;
+    while (i < src.len) {
+        if (std.ascii.isWhitespace(src[i])) {
+            i += 1;
+        } else if (std.mem.startsWith(u8, src[i..], "//")) {
+            i = std.mem.indexOfScalarPos(u8, src, i, '\n') orelse src.len;
+        } else if (std.mem.startsWith(u8, src[i..], "/*")) {
+            i = if (std.mem.indexOfPos(u8, src, i + 2, "*/")) |p| p + 2 else src.len;
+        } else break;
+    }
+    return i;
+}
+
+/// Offset of the first `"<key>"` in `src`, or null.
+fn quotedOffset(src: []const u8, key: []const u8) ?usize {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, key)) |at| {
+        i = at + 1;
+        if (at == 0 or src[at - 1] != '"') continue;
+        const end = at + key.len;
+        if (end >= src.len or src[end] != '"') continue;
+        return at;
+    }
+    return null;
 }
 
 fn findDecl(decls: []const KeyDecl, component: []const u8) ?KeyDecl {
@@ -245,288 +300,122 @@ pub fn suggest(
     return best;
 }
 
-// ── Zig source scanning ────────────────────────────────────────────────
+// ── Zig sources ────────────────────────────────────────────────────────
 
-/// Every `.catalog = "<key>"` string literal in `src`, with its 1-based
-/// line. The assignment may span lines. Comments and multiline-string
-/// lines are ignored; a literal containing an escape is skipped (not a
-/// plain catalog key).
-pub fn scanCatalogLiterals(arena: std.mem.Allocator, src: []const u8) error{OutOfMemory}![]Literal {
-    const code = try stripZigComments(arena, src);
-    var out: std.ArrayList(Literal) = .empty;
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, code, i, ".catalog")) |at| {
-        i = at + ".catalog".len;
-        if (at > 0 and isIdentChar(code[at - 1])) continue;
-        if (i < code.len and isIdentChar(code[i])) continue;
-        var j = skipWhitespace(code, i);
-        if (j >= code.len or code[j] != '=') continue;
-        j += 1;
-        if (j < code.len and code[j] == '=') continue; // `==`
-        j = skipWhitespace(code, j);
-        const key = stringAt(code, j) orelse continue;
-        i = j + key.len + 2;
-        try out.append(arena, .{ .key = key, .line = lineAt(code, j) });
+/// Token-level scan of one Zig source for `.catalog = "<key>"` literals
+/// and `register...("<key>"` calls. Comments, whitespace and line breaks
+/// are the tokenizer's business; a literal with an escape is skipped
+/// (not a plain catalog key).
+pub fn scanZigKeys(arena: std.mem.Allocator, src: []const u8) error{OutOfMemory}!ZigKeys {
+    const src_z = try arena.dupeZ(u8, src);
+    var catalog: std.ArrayList(Literal) = .empty;
+    var registered: std.ArrayList([]const u8) = .empty;
+
+    // A 4-token window: the three before `cur`.
+    var w: [3]std.zig.Token = undefined;
+    var seen: usize = 0;
+    var tok = std.zig.Tokenizer.init(src_z);
+    while (true) {
+        const cur = tok.next();
+        if (cur.tag == .eof) break;
+        if (cur.tag == .string_literal and seen >= 3) {
+            const key = plainString(src, cur);
+            // `.catalog = "<key>"`
+            if (key != null and w[0].tag == .period and w[1].tag == .identifier and
+                std.mem.eql(u8, src[w[1].loc.start..w[1].loc.end], "catalog") and w[2].tag == .equal)
+            {
+                try catalog.append(arena, .{ .key = key.?, .line = lineAt(src, cur.loc.start) });
+            }
+            // `register...("<key>"`
+            if (key != null and w[1].tag == .identifier and
+                std.mem.startsWith(u8, src[w[1].loc.start..w[1].loc.end], "register") and w[2].tag == .l_paren)
+            {
+                try registered.append(arena, key.?);
+            }
+        }
+        w[0] = w[1];
+        w[1] = w[2];
+        w[2] = cur;
+        seen += 1;
     }
-    return out.items;
+    return .{ .catalog = catalog.items, .registered = registered.items };
 }
 
-/// Keys game code registers itself: the leading string-literal argument
-/// of any `register...("<key>", ...)` call (`assets.register("mask",
-/// .image, ...)`, `registerImageFromMemory("mask", ...)`). A `.catalog`
-/// literal naming one of these is bound at runtime by design, not a typo.
-pub fn scanRegisteredLiterals(arena: std.mem.Allocator, src: []const u8) error{OutOfMemory}![]const []const u8 {
-    const code = try stripZigComments(arena, src);
-    var out: std.ArrayList([]const u8) = .empty;
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, code, i, "register")) |at| {
-        i = at + "register".len;
-        if (at > 0 and isIdentChar(code[at - 1])) continue;
-        var j = i;
-        while (j < code.len and isIdentChar(code[j])) j += 1;
-        if (j >= code.len or code[j] != '(') continue;
-        j = skipWhitespace(code, j + 1);
-        const key = stringAt(code, j) orelse continue;
-        try out.append(arena, key);
-    }
-    return out.items;
-}
-
-const Frame = struct {
-    /// Struct name when this `{` opened `const Name = struct {`.
-    name: ?[]const u8,
-    stmt_start: usize,
-    keys: ?[]const []const u8 = null,
-    lits: std.ArrayList(Default) = .empty,
-};
-
-/// Every component struct in `src` that declares
-/// `pub const catalog_keys = .{ "a", "b" };`, with the string-literal
-/// defaults of those fields. Brace-aware: a declaration belongs to the
-/// struct whose body directly contains it, never to a nested or
-/// preceding sibling struct.
+/// Every root-level `const Name = struct { ... }` in `src` that declares
+/// `pub const catalog_keys = .{ "a", "b" };` as a DIRECT member, with the
+/// string-literal defaults of those fields. A source that does not parse
+/// yields nothing (the Zig build reports it).
 pub fn parseKeyDecls(arena: std.mem.Allocator, src: []const u8) error{OutOfMemory}![]KeyDecl {
-    const code = try stripZigComments(arena, src);
-    var stack: std.ArrayList(Frame) = .empty;
-    try stack.append(arena, .{ .name = null, .stmt_start = 0 });
+    const src_z = try arena.dupeZ(u8, src);
+    var ast = try std.zig.Ast.parse(arena, src_z, .zig);
+    if (ast.errors.len > 0) return &.{};
+
     var out: std.ArrayList(KeyDecl) = .empty;
+    for (ast.rootDecls()) |decl| {
+        const vd = ast.fullVarDecl(decl) orelse continue;
+        const name = ast.tokenSlice(vd.ast.mut_token + 1);
+        const init_node = vd.ast.init_node.unwrap() orelse continue;
+        var buf: [2]std.zig.Ast.Node.Index = undefined;
+        const container = ast.fullContainerDecl(&buf, init_node) orelse continue;
+        if (ast.tokenTag(container.ast.main_token) != .keyword_struct) continue;
 
-    var i: usize = 0;
-    while (i < code.len) : (i += 1) {
-        switch (code[i]) {
-            '"' => i = skipString(code, i),
-            '\'' => i = skipChar(code, i),
-            '{' => {
-                const top = &stack.items[stack.items.len - 1];
-                const name = structHeaderName(code[top.stmt_start..i]);
-                try stack.append(arena, .{ .name = name, .stmt_start = i + 1 });
-            },
-            '}' => {
-                if (stack.items.len <= 1) continue;
-                var done = stack.pop().?;
-                try statement(arena, code, done.stmt_start, i, &done);
-                const name = done.name orelse continue;
-                const keys = done.keys orelse continue;
-                var defaults: std.ArrayList(Default) = .empty;
-                for (keys) |field| for (done.lits.items) |d| {
-                    if (std.mem.eql(u8, d.field, field)) try defaults.append(arena, d);
-                };
-                try out.append(arena, .{ .component = name, .fields = keys, .defaults = defaults.items });
-            },
-            ',', ';' => {
-                const top = &stack.items[stack.items.len - 1];
-                try statement(arena, code, top.stmt_start, i, top);
-                top.stmt_start = i + 1;
-            },
-            else => {},
+        var keys: ?[]const []const u8 = null;
+        var lits: std.ArrayList(Default) = .empty;
+        for (container.ast.members) |m| {
+            if (ast.fullVarDecl(m)) |mvd| {
+                if (!std.mem.eql(u8, ast.tokenSlice(mvd.ast.mut_token + 1), "catalog_keys")) continue;
+                const list = mvd.ast.init_node.unwrap() orelse continue;
+                keys = try stringElements(arena, &ast, list);
+            } else if (ast.fullContainerField(m)) |field| {
+                if (field.ast.tuple_like) continue;
+                const value = field.ast.value_expr.unwrap() orelse continue;
+                if (ast.nodeTag(value) != .string_literal) continue;
+                const tok_i = ast.nodeMainToken(value);
+                const key = plainTokenString(ast.tokenSlice(tok_i)) orelse continue;
+                try lits.append(arena, .{
+                    .field = ast.tokenSlice(field.ast.main_token),
+                    .key = key,
+                    .line = lineAt(src, ast.tokenStart(tok_i)),
+                });
+            }
         }
+        const fields = keys orelse continue;
+        var defaults: std.ArrayList(Default) = .empty;
+        for (fields) |f| for (lits.items) |d| {
+            if (std.mem.eql(u8, d.field, f)) try defaults.append(arena, d);
+        };
+        try out.append(arena, .{ .component = name, .fields = fields, .defaults = defaults.items });
     }
     return out.items;
 }
 
-/// Record one struct-level statement `code[start..end]` into `frame`:
-/// a `pub const catalog_keys = .{ ... }` declaration, or a field with a
-/// string-literal default (`mask: []const u8 = "reservoir_mask"`).
-fn statement(arena: std.mem.Allocator, code: []const u8, start: usize, end: usize, frame: *Frame) error{OutOfMemory}!void {
-    if (frame.name == null) return;
-    const raw = code[start..end];
-    const lead = start + (raw.len - std.mem.trimStart(u8, raw, " \t\r\n").len);
-    const text = std.mem.trimEnd(u8, code[lead..end], " \t\r\n");
-    const marker = "pub const catalog_keys";
-    if (std.mem.startsWith(u8, text, marker) and (text.len == marker.len or !isIdentChar(text[marker.len]))) {
-        var fields: std.ArrayList([]const u8) = .empty;
-        var j: usize = marker.len;
-        while (std.mem.indexOfScalarPos(u8, text, j, '"')) |q| {
-            const key = stringAt(text, q) orelse break;
-            try fields.append(arena, key);
-            j = q + key.len + 2;
-        }
-        frame.keys = fields.items;
-        return;
-    }
-    // `<field> : <type> = "<key>"`, the statement ending at the literal.
-    var j: usize = 0;
-    while (j < text.len and isIdentChar(text[j])) j += 1;
-    if (j == 0) return;
-    const field = text[0..j];
-    j = skipWhitespace(text, j);
-    if (j >= text.len or text[j] != ':') return;
-    const eq = std.mem.indexOfScalarPos(u8, text, j, '=') orelse return;
-    const q = skipWhitespace(text, eq + 1);
-    const key = stringAt(text, q) orelse return;
-    if (q + key.len + 2 != text.len) return;
-    try frame.lits.append(arena, .{ .field = field, .key = key, .line = lineAt(code, lead + q) });
-}
-
-/// `Name` when `prefix` (the statement text before a `{`) is
-/// `[pub ]const Name = [extern |packed ]struct[(...)]`.
-fn structHeaderName(prefix: []const u8) ?[]const u8 {
-    const ws = " \t\r\n";
-    var s = std.mem.trim(u8, prefix, ws);
-    if (std.mem.startsWith(u8, s, "pub ")) s = std.mem.trimStart(u8, s[4..], ws);
-    if (!std.mem.startsWith(u8, s, "const ")) return null;
-    s = std.mem.trimStart(u8, s[6..], ws);
-    var j: usize = 0;
-    while (j < s.len and isIdentChar(s[j])) j += 1;
-    if (j == 0) return null;
-    const name = s[0..j];
-    s = std.mem.trimStart(u8, s[j..], ws);
-    if (s.len == 0 or s[0] != '=') return null;
-    s = std.mem.trimStart(u8, s[1..], ws);
-    for ([_][]const u8{ "extern", "packed" }) |q| {
-        if (std.mem.startsWith(u8, s, q) and s.len > q.len and !isIdentChar(s[q.len])) s = std.mem.trimStart(u8, s[q.len..], ws);
-    }
-    if (!std.mem.startsWith(u8, s, "struct")) return null;
-    s = std.mem.trimStart(u8, s["struct".len..], ws);
-    if (s.len == 0) return name;
-    if (s[0] == '(' and s[s.len - 1] == ')') return name;
-    return null;
-}
-
-/// The contents of the plain string literal opening at `code[at]`, or
-/// null if there is none there or it contains an escape.
-fn stringAt(code: []const u8, at: usize) ?[]const u8 {
-    if (at >= code.len or code[at] != '"') return null;
-    const end = std.mem.indexOfAnyPos(u8, code, at + 1, "\"\\\n") orelse return null;
-    if (code[end] != '"') return null;
-    return code[at + 1 .. end];
-}
-
-/// Index of the closing quote of the string literal opening at `at`.
-fn skipString(code: []const u8, at: usize) usize {
-    var i = at + 1;
-    while (i < code.len and code[i] != '"' and code[i] != '\n') : (i += 1) {
-        if (code[i] == '\\') i += 1;
-    }
-    return @min(i, code.len - 1);
-}
-
-/// Index of the closing quote of the char literal opening at `at`.
-fn skipChar(code: []const u8, at: usize) usize {
-    var i = at + 1;
-    if (i < code.len and code[i] == '\\') i += 1;
-    while (i + 1 < code.len and code[i + 1] != '\'' and code[i + 1] != '\n') i += 1;
-    return @min(i + 1, code.len - 1);
-}
-
-fn lineAt(code: []const u8, pos: usize) usize {
-    return std.mem.count(u8, code[0..pos], "\n") + 1;
-}
-
-fn skipWhitespace(s: []const u8, from: usize) usize {
-    var j = from;
-    while (j < s.len and std.ascii.isWhitespace(s[j])) j += 1;
-    return j;
-}
-
-/// `raw` minus any `//` comment outside a string literal; empty for a
-/// `\\` multiline-string line.
-fn codePart(raw: []const u8) []const u8 {
-    const trimmed = std.mem.trimStart(u8, raw, " \t");
-    if (std.mem.startsWith(u8, trimmed, "\\\\")) return "";
-    var in_str = false;
-    var i: usize = 0;
-    while (i < raw.len) : (i += 1) {
-        const c = raw[i];
-        if (in_str) {
-            if (c == '\\') {
-                i += 1;
-            } else if (c == '"') in_str = false;
-        } else if (c == '"') {
-            in_str = true;
-        } else if (c == '\'') {
-            // Char literal (`'"'`, `'\''`): skip it so its quote can't
-            // open a phantom string.
-            i += 1;
-            if (i < raw.len and raw[i] == '\\') i += 1;
-            while (i + 1 < raw.len and raw[i + 1] != '\'') i += 1;
-            i += 1;
-        } else if (c == '/' and i + 1 < raw.len and raw[i + 1] == '/') {
-            return raw[0..i];
-        }
-    }
-    return raw;
-}
-
-fn stripZigComments(arena: std.mem.Allocator, src: []const u8) error{OutOfMemory}![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    var lines = std.mem.splitScalar(u8, src, '\n');
-    while (lines.next()) |raw| {
-        try out.appendSlice(arena, codePart(raw));
-        try out.append(arena, '\n');
+/// The string-literal elements of an anonymous list `.{ "a", "b" }`.
+fn stringElements(arena: std.mem.Allocator, ast: *const std.zig.Ast, node: std.zig.Ast.Node.Index) error{OutOfMemory}![]const []const u8 {
+    var buf: [2]std.zig.Ast.Node.Index = undefined;
+    const list = ast.fullArrayInit(&buf, node) orelse return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    for (list.ast.elements) |el| {
+        if (ast.nodeTag(el) != .string_literal) continue;
+        const s = plainTokenString(ast.tokenSlice(ast.nodeMainToken(el))) orelse continue;
+        try out.append(arena, s);
     }
     return out.items;
 }
 
-fn isIdentChar(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '_';
+fn plainString(src: []const u8, tok: std.zig.Token) ?[]const u8 {
+    return plainTokenString(src[tok.loc.start..tok.loc.end]);
 }
 
-// ── JSONC helpers ──────────────────────────────────────────────────────
-
-/// Blank `//` and `/* */` comments outside strings, preserving length and
-/// newlines, so `std.json` can parse a `.jsonc` file.
-fn stripJsonc(arena: std.mem.Allocator, source: []const u8) error{OutOfMemory}![]u8 {
-    const out = try arena.dupe(u8, source);
-    var i: usize = 0;
-    var in_str = false;
-    while (i < out.len) : (i += 1) {
-        const c = out[i];
-        if (in_str) {
-            if (c == '\\') {
-                i += 1;
-            } else if (c == '"') in_str = false;
-            continue;
-        }
-        if (c == '"') {
-            in_str = true;
-        } else if (c == '/' and i + 1 < out.len and out[i + 1] == '/') {
-            while (i < out.len and out[i] != '\n') : (i += 1) out[i] = ' ';
-        } else if (c == '/' and i + 1 < out.len and out[i + 1] == '*') {
-            while (i < out.len and !(out[i] == '*' and i + 1 < out.len and out[i + 1] == '/')) : (i += 1) {
-                if (out[i] != '\n') out[i] = ' ';
-            }
-            if (i + 1 < out.len) {
-                out[i] = ' ';
-                out[i + 1] = ' ';
-                i += 1;
-            }
-        }
-    }
-    return out;
+/// Contents of a `"..."` token without escapes, else null.
+fn plainTokenString(text: []const u8) ?[]const u8 {
+    if (text.len < 2 or text[0] != '"' or text[text.len - 1] != '"') return null;
+    const inner = text[1 .. text.len - 1];
+    if (std.mem.indexOfScalar(u8, inner, '\\') != null) return null;
+    return inner;
 }
 
-/// 1-based line of the first `"<key>"` in `source`; 0 if absent.
-fn lineOfQuoted(source: []const u8, key: []const u8) usize {
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, source, i, key)) |at| {
-        i = at + 1;
-        if (at == 0 or source[at - 1] != '"') continue;
-        const end = at + key.len;
-        if (end >= source.len or source[end] != '"') continue;
-        return std.mem.count(u8, source[0..at], "\n") + 1;
-    }
-    return 0;
+fn lineAt(src: []const u8, pos: usize) usize {
+    return std.mem.count(u8, src[0..pos], "\n") + 1;
 }
 
 // ── File collection & output ───────────────────────────────────────────
@@ -602,252 +491,6 @@ fn printFinding(arena: std.mem.Allocator, f: Finding) void {
     std.Io.File.stderr().writeStreamingAll(config.globalIo(), msg) catch {};
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────
-
-const testing = std.testing;
-
-const test_resources = [_]config.ResourceDef{
-    .{ .name = "fog_mask" },
-    .{ .name = "reservoir_mask" },
-    .{ .name = "reservoir_reflection" },
-    .{ .name = "sky__clouds" },
-};
-
-test "scanCatalogLiterals: finds literals with their lines, skips comments and runtime keys" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\const a = .{ .name = "s", .texture = .{ .catalog = "fog_mask" } };
-        \\// .texture = .{ .catalog = "commented_out" },
-        \\const b = .{ .catalog = w.mask };
-        \\const c = .{ .catalog="fog_maks" }; // .catalog = "trailing_comment"
-        \\if (x.catalog == "cmp") {}
-        \\const d = .{ .catalogue = "other_field" };
-        \\const q = '"'; const e = .{ .catalog = "reservoir_mask" };
-        \\    \\ .catalog = "inside_multiline_string"
-    ;
-    const lits = try scanCatalogLiterals(arena.allocator(), src);
-    try testing.expectEqual(@as(usize, 3), lits.len);
-    try testing.expectEqualStrings("fog_mask", lits[0].key);
-    try testing.expectEqual(@as(usize, 1), lits[0].line);
-    try testing.expectEqualStrings("fog_maks", lits[1].key);
-    try testing.expectEqual(@as(usize, 4), lits[1].line);
-    try testing.expectEqualStrings("reservoir_mask", lits[2].key);
-    try testing.expectEqual(@as(usize, 7), lits[2].line);
-}
-
-test "parseKeyDecls: attributes catalog_keys to the enclosing component struct" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\const std = @import("std");
-        \\pub const WaterShader = struct {
-        \\    // pub const catalog_keys = .{ "commented" };
-        \\    pub const catalog_keys = .{ "mask", "reflection" };
-        \\    mask: []const u8 = "reservoir_mask",
-        \\};
-        \\pub const Plain = struct { x: f32 = 0 };
-    ;
-    const decls = try parseKeyDecls(arena.allocator(), src);
-    try testing.expectEqual(@as(usize, 1), decls.len);
-    try testing.expectEqualStrings("WaterShader", decls[0].component);
-    try testing.expectEqual(@as(usize, 2), decls[0].fields.len);
-    try testing.expectEqualStrings("mask", decls[0].fields[0]);
-    try testing.expectEqualStrings("reflection", decls[0].fields[1]);
-    // Only `mask` has a literal default.
-    try testing.expectEqual(@as(usize, 1), decls[0].defaults.len);
-    try testing.expectEqualStrings("mask", decls[0].defaults[0].field);
-    try testing.expectEqualStrings("reservoir_mask", decls[0].defaults[0].key);
-    try testing.expectEqual(@as(usize, 5), decls[0].defaults[0].line);
-}
-
-test "parseKeyDecls: a preceding nested struct does not steal the declaration" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\pub const WaterShader = struct {
-        \\    pub const Tuning = struct { mask: []const u8 = "nested_default", brace: u8 = '}' };
-        \\    const s = "}{";
-        \\    pub const catalog_keys = .{"mask"};
-        \\    mask: []const u8 =
-        \\        "reservoir_mask",
-        \\    pub fn f(self: @This()) void { _ = self; }
-        \\};
-    ;
-    const decls = try parseKeyDecls(arena.allocator(), src);
-    try testing.expectEqual(@as(usize, 1), decls.len);
-    try testing.expectEqualStrings("WaterShader", decls[0].component);
-    // The outer field's default, not the nested struct's same-named field.
-    try testing.expectEqual(@as(usize, 1), decls[0].defaults.len);
-    try testing.expectEqualStrings("reservoir_mask", decls[0].defaults[0].key);
-    try testing.expectEqual(@as(usize, 6), decls[0].defaults[0].line);
-}
-
-test "scanCatalogLiterals: an assignment split across lines is still found" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\const t = .{
-        \\    .catalog =
-        \\        "fog_maks",
-        \\};
-    ;
-    const lits = try scanCatalogLiterals(arena.allocator(), src);
-    try testing.expectEqual(@as(usize, 1), lits.len);
-    try testing.expectEqualStrings("fog_maks", lits[0].key);
-    try testing.expectEqual(@as(usize, 3), lits[0].line);
-}
-
-test "scanRegisteredLiterals: leading string argument of register calls" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\try g.assets.register("runtime_mask", .image, bytes);
-        \\try g.registerImageFromMemory(
-        \\    "other_mask", bytes);
-        \\r.registerCatalogTexture(handle, tex);
-        \\// register("commented")
-        \\unregister("not_a_registration");
-    ;
-    const keys = try scanRegisteredLiterals(arena.allocator(), src);
-    try testing.expectEqual(@as(usize, 2), keys.len);
-    try testing.expectEqualStrings("runtime_mask", keys[0]);
-    try testing.expectEqualStrings("other_mask", keys[1]);
-}
-
-test "suggest: edit distance first, prefix fallback for long suffixes" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try testing.expectEqualStrings("fog_mask", (try suggest(a, "fog_maks", &test_resources)).?);
-    try testing.expectEqualStrings("reservoir_mask", (try suggest(a, "reservoir_mask_MISSING", &test_resources)).?);
-    try testing.expect((try suggest(a, "zzzzzzzzzz", &test_resources)) == null);
-}
-
-test "checkJsonSource: typo'd prefab binding is reported with component, field, line and hint" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const decls = [_]KeyDecl{.{ .component = "WaterShader", .fields = &.{ "mask", "reflection" } }};
-    const src =
-        \\// reservoir
-        \\{
-        \\  "Position": { "x": 1 },
-        \\  "WaterShader": {
-        \\    "mask": "reservoir_mask_MISSING",
-        \\    "reflection": "reservoir_reflection",
-        \\    "water_level": 0.5
-        \\  }
-        \\}
-    ;
-    var findings: std.ArrayList(Finding) = .empty;
-    try checkJsonSource(a, "prefabs/reservoir.jsonc", src, &decls, &test_resources, &findings);
-    try testing.expectEqual(@as(usize, 1), findings.items.len);
-    const f = findings.items[0];
-    try testing.expectEqualStrings("prefabs/reservoir.jsonc", f.file);
-    try testing.expectEqual(@as(usize, 5), f.line);
-    try testing.expectEqualStrings("reservoir_mask_MISSING", f.key);
-    try testing.expectEqualStrings("WaterShader", f.site.component_field.component);
-    try testing.expectEqualStrings("mask", f.site.component_field.field);
-    try testing.expectEqualStrings("reservoir_mask", f.suggestion.?);
-}
-
-test "checkJsonSource: nested scene components with valid keys pass" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const decls = [_]KeyDecl{.{ .component = "WaterShader", .fields = &.{"mask"} }};
-    const src =
-        \\{ "entities": [ { "prefab": "reservoir", "components": { "WaterShader": { "mask": "sky__clouds" } } } ] }
-    ;
-    var findings: std.ArrayList(Finding) = .empty;
-    try checkJsonSource(a, "scenes/main.jsonc", src, &decls, &test_resources, &findings);
-    try testing.expectEqual(@as(usize, 0), findings.items.len);
-}
-
-fn writeTree(dir: std.Io.Dir, files: []const [2][]const u8) !void {
-    const io = config.globalIo();
-    for (files) |f| {
-        if (std.fs.path.dirname(f[0])) |parent| try dir.createDirPath(io, parent);
-        try dir.writeFile(io, .{ .sub_path = f[0], .data = f[1] });
-    }
-}
-
-const fixture_component =
-    \\pub const WaterShader = struct {
-    \\    pub const catalog_keys = .{ "mask" };
-    \\    mask: []const u8 = "reservoir_mask",
-    \\};
-;
-
-test "check: a game with only registered keys produces no findings" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeTree(tmp.dir, &.{
-        .{ "components/water_shader.zig", fixture_component },
-        .{ "scripts/playing/fx.zig", "const t = .{ .catalog = \"fog_mask\" };\n" },
-        // A key the game registers from code is bound at runtime by design.
-        .{ "scripts/playing/runtime.zig", "try g.assets.register(\"runtime_mask\", .image, b);\nconst u = .{ .catalog = \"runtime_mask\" };\n" },
-        // Vendored trees are not game source.
-        .{ "scripts/node_modules/pkg/x.zig", "const v = .{ .catalog = \"vendored_MISSING\" };\n" },
-        .{ "prefabs/reservoir.jsonc", "{ \"WaterShader\": { \"mask\": \"reservoir_mask\" } }\n" },
-    });
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const game_dir = try tmp.dir.realPathFileAlloc(config.globalIo(), ".", arena.allocator());
-    const findings = try check(arena.allocator(), game_dir, &test_resources);
-    try testing.expectEqual(@as(usize, 0), findings.len);
-    try validate(testing.allocator, game_dir, &test_resources);
-}
-
-test "check: typo'd keys in a script literal and a prefab field are both reported" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeTree(tmp.dir, &.{
-        .{ "components/water_shader.zig", fixture_component },
-        .{ "scripts/playing/fx.zig", "const ok = 1;\nconst t = .{ .catalog = \"fog_mask_MISSING\" };\n" },
-        .{ "prefabs/reservoir.jsonc", "{ \"WaterShader\": { \"mask\": \"reservoir_mask_MISSING\" } }\n" },
-    });
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const game_dir = try tmp.dir.realPathFileAlloc(config.globalIo(), ".", arena.allocator());
-    const findings = try check(arena.allocator(), game_dir, &test_resources);
-    try testing.expectEqual(@as(usize, 2), findings.len);
-
-    try testing.expectEqualStrings("scripts/playing/fx.zig", findings[0].file);
-    try testing.expectEqual(@as(usize, 2), findings[0].line);
-    try testing.expect(findings[0].site == .catalog_literal);
-    try testing.expectEqualStrings("fog_mask_MISSING", findings[0].key);
-    try testing.expectEqualStrings("fog_mask", findings[0].suggestion.?);
-
-    try testing.expectEqualStrings("prefabs/reservoir.jsonc", findings[1].file);
-    try testing.expect(findings[1].site == .component_field);
-    try testing.expectEqualStrings("reservoir_mask_MISSING", findings[1].key);
-
-    try testing.expectError(error.UnregisteredCatalogKey, validate(testing.allocator, game_dir, &test_resources));
-}
-
-test "check: a typo'd component default is reported against the component file" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeTree(tmp.dir, &.{
-        .{
-            "components/water_shader.zig",
-            \\pub const WaterShader = struct {
-            \\    pub const catalog_keys = .{ "mask" };
-            \\    mask: []const u8 = "reservoir_mask_MISSING",
-            \\};
-        },
-        // The prefab omits `mask`, so the default is what ships.
-        .{ "prefabs/reservoir.jsonc", "{ \"WaterShader\": {} }\n" },
-    });
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const game_dir = try tmp.dir.realPathFileAlloc(config.globalIo(), ".", arena.allocator());
-    const findings = try check(arena.allocator(), game_dir, &test_resources);
-    try testing.expectEqual(@as(usize, 1), findings.len);
-    try testing.expectEqualStrings("components/water_shader.zig", findings[0].file);
-    try testing.expectEqual(@as(usize, 3), findings[0].line);
-    try testing.expectEqualStrings("mask", findings[0].site.component_field.field);
-    try testing.expectEqualStrings("reservoir_mask_MISSING", findings[0].key);
+test {
+    _ = @import("catalog_key_check_test.zig");
 }
