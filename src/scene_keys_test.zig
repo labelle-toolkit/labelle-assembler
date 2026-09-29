@@ -375,3 +375,24 @@ test "scanTilemapAssets: an escaped key the engine cannot load fabricates no til
     defer scene_manifest.freeTilemapAssets(std.testing.allocator, escaped);
     try std.testing.expectEqual(@as(usize, 0), escaped.len);
 }
+
+test "version gate: pack prefabs are gated AFTER the rewrite wraps them (codex on #798)" {
+    const gate = @import("scene_target_gate.zig");
+    // Source prefab: flat `rooms__Room` beside a pack-local `Worker`.
+    const src =
+        \\{ "prefab": "base", "Worker": {}, "rooms__Room": { "w": 2 } }
+    ;
+    try std.testing.expect(gate.sourceUsesFlatNamespacedKeys(src));
+    // Staged copy: pass 1 wrapped both, which loads on every engine.
+    const staged = try rewrite(src);
+    defer std.testing.allocator.free(staged);
+    try std.testing.expect(!gate.sourceUsesFlatNamespacedKeys(staged));
+    // No pack-local key to trigger the wrap: still flat, still gated.
+    const unwrapped = try rewrite(
+        \\{ "prefab": "base", "rooms__Room": { "w": 2 } }
+    );
+    defer std.testing.allocator.free(unwrapped);
+    try std.testing.expect(gate.sourceUsesFlatNamespacedKeys(unwrapped));
+    // The pre-staging pack SOURCE scan is `@`-only, so it lets `src` through.
+    try std.testing.expect(!gate.sourceUsesTargetKeys(src));
+}

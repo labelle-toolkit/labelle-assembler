@@ -86,13 +86,33 @@ pub fn findTargetKeyUsage(
 }
 
 /// `findTargetKeyUsage` over every `.jsonc` in a directory TREE — used for
-/// pack source dirs, whose file lists are not staged yet when the gate
-/// runs (codex P1 / CodeRabbit on #650). A missing directory is fine
-/// (packs need not ship prefabs or scenes). Returns the first offending
-/// path (allocator-owned), or null.
-pub fn findTargetKeyUsageInTree(
+/// pack SOURCE dirs, whose file lists are not staged yet when the gate
+/// runs (codex P1 / CodeRabbit on #650). `@` keys only: a source prefab's
+/// flat namespaced keys may still be wrapped by the pack rewrite (pass 1),
+/// so those are checked on the staged copies instead
+/// (`findFlatNamespacedKeyUsageInTree`, codex on #798). A missing
+/// directory is fine (packs need not ship prefabs or scenes). Returns the
+/// first offending path (allocator-owned), or null.
+pub fn findTargetKeyUsageInTree(allocator: std.mem.Allocator, dir_path: []const u8) !?[]const u8 {
+    return findKeyUsageInTree(allocator, dir_path, sourceUsesTargetKeys);
+}
+
+/// Flat pack-namespaced component keys (engine#806) in an already-STAGED,
+/// rewritten pack tree (`<target>/packs`). Run after `loadPackScans`, so
+/// entities pass 1 wrapped (which load on old engines) no longer count.
+pub fn findFlatNamespacedKeyUsageInTree(allocator: std.mem.Allocator, dir_path: []const u8) !?[]const u8 {
+    return findKeyUsageInTree(allocator, dir_path, sourceUsesFlatNamespacedKeys);
+}
+
+/// True iff `src` has a flat `<prefix>__<Pascal>` key at entity scope.
+pub fn sourceUsesFlatNamespacedKeys(src: []const u8) bool {
+    return @import("scene_name_lint.zig").sourceUsesKeyFeature(src, .flat_namespaced);
+}
+
+fn findKeyUsageInTree(
     allocator: std.mem.Allocator,
     dir_path: []const u8,
+    comptime uses: fn ([]const u8) bool,
 ) !?[]const u8 {
     const io = config.globalIo();
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return null;
@@ -104,7 +124,7 @@ pub fn findTargetKeyUsageInTree(
             .directory => {
                 const sub = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
                 defer allocator.free(sub);
-                if (try findTargetKeyUsageInTree(allocator, sub)) |hit| return hit;
+                if (try findKeyUsageInTree(allocator, sub, uses)) |hit| return hit;
             },
             .file => {
                 if (!std.mem.endsWith(u8, entry.name, ".jsonc")) continue;
@@ -123,7 +143,7 @@ pub fn findTargetKeyUsageInTree(
                         continue;
                     },
                 };
-                const used = sourceNeedsV211Keys(source);
+                const used = uses(source);
                 allocator.free(source);
                 if (used) return rel;
                 allocator.free(rel);

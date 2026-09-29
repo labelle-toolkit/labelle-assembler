@@ -1252,6 +1252,33 @@ pub fn generate(
         pack_scans.deinit(allocator);
     }
 
+    // Flat namespaced keys in pack prefabs (engine#806) are gated on the
+    // STAGED, rewritten copies: pack rewrite pass 1 wraps any entity that
+    // declares a pack-local component, and a wrapped key loads on every
+    // engine. Only keys still flat after that would be dropped by an
+    // engine older than v2.11.0 (codex on #798).
+    if (!scene_manifest.engineSupportsTargetOverrides(cfg.engine_version)) {
+        // Prefabs only: a pack's other staged `.jsonc` (locales, …) is not
+        // entity data.
+        var flat_hit: ?[]const u8 = null;
+        for (pack_scans.items) |ps| {
+            const staged_prefabs = try std.fs.path.join(allocator, &.{ target_dir, "packs", ps.name, "prefabs" });
+            defer allocator.free(staged_prefabs);
+            flat_hit = try scene_manifest.findFlatNamespacedKeyUsageInTree(allocator, staged_prefabs);
+            if (flat_hit != null) break;
+        }
+        if (flat_hit) |offender| {
+            defer allocator.free(offender);
+            std.debug.print(
+                "labelle-assembler: '{s}' uses flat \"<pack>__Pascal\" component keys (labelle-engine#806), but the pinned engine v{s} predates them (needs >= v{s}).\n" ++
+                    "  An older engine silently DROPS those keys.\n" ++
+                    "  Bump `engine_version` in project.labelle, or move the namespaced keys into a \"components\"/\"overrides\" wrapper.\n",
+                .{ offender, cfg.engine_version, scene_manifest.MIN_ENGINE_FOR_TARGET_OVERRIDES },
+            );
+            return error.EngineTooOldForTargetOverrides;
+        }
+    }
+
     // ── Asset-Plugins Phase 1: copy + namespace + validate pack assets ──
     // Runs AFTER `loadPackScans` copied each pack's convention dirs (its
     // prefabs are now under `<target>/packs/<pack>/prefabs/`). For every pack

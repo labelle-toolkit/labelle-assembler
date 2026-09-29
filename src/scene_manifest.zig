@@ -956,6 +956,7 @@ pub const MIN_ENGINE_FOR_TARGET_OVERRIDES = target_gate.MIN_ENGINE_FOR_TARGET_OV
 pub const engineSupportsTargetOverrides = target_gate.engineSupportsTargetOverrides;
 pub const findTargetKeyUsage = target_gate.findTargetKeyUsage;
 pub const findTargetKeyUsageInTree = target_gate.findTargetKeyUsageInTree;
+pub const findFlatNamespacedKeyUsageInTree = target_gate.findFlatNamespacedKeyUsageInTree;
 
 /// Read every `<scenes_dir>/<name>.jsonc` (where `name` is one of `scene_names`,
 /// possibly with subfolder slashes), parse it, and return the manifest list in
