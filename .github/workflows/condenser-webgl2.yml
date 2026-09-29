@@ -1,0 +1,91 @@
+# WebGL2 runtime check of the condenser's game-owned shader materials
+# (labelle-bgfx#100). Builds examples/condenser for wasm through the released
+# labelle CLI and the pinned `web` provider, then runs it in headless Chromium
+# (SwiftShader WebGL2) with tools/verify_webgl2.py: all four game-owned
+# programs must compile, link and draw, every effect control must change the
+# frame, captures must be frame-exact, and a sabotaged shader must be caught.
+#
+# Runs on PRs that touch the example or the material pipeline, after merges
+# to main, and on demand.
+name: Condenser WebGL2
+
+on:
+  pull_request:
+    paths:
+      - 'examples/condenser/**'
+      - 'src/material_*.zig'
+      - '.github/workflows/condenser-webgl2.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'examples/condenser/**'
+      - 'src/material_*.zig'
+      - '.github/workflows/condenser-webgl2.yml'
+  workflow_dispatch:
+
+jobs:
+  webgl2:
+    name: Condenser under WebGL2 (headless Chromium)
+    runs-on: ubuntu-latest
+    # Cold emsdk install + shaderc + wasm build dominate (~15 min cold).
+    timeout-minutes: 45
+    env:
+      LABELLE_CLI_VERSION: 3.0.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # zbgfx's build touches its glfw/bgfx targets alongside shaderc, so the
+      # X11/GL headers must exist even for a wasm game build.
+      - name: Install zbgfx build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev libvulkan-dev
+
+      - name: Install the labelle CLI
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/labelle-bin"
+          curl -sSfL -o "$RUNNER_TEMP/labelle-bin/labelle" \
+            "https://releases.labelle.games/cli/v${LABELLE_CLI_VERSION}/labelle-linux-x86_64"
+          chmod +x "$RUNNER_TEMP/labelle-bin/labelle"
+          echo "$RUNNER_TEMP/labelle-bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/labelle-bin/labelle" --version
+
+      - name: Cache the provider emsdk
+        uses: actions/cache@v4
+        with:
+          path: ~/.labelle/providers
+          key: labelle-providers-${{ runner.os }}-${{ hashFiles('examples/condenser/labelle.providers.lock') }}
+
+      - name: Build the condenser for wasm
+        working-directory: examples/condenser
+        run: |
+          set -euo pipefail
+          labelle providers fetch
+          labelle build --platform=wasm
+          test -f .labelle/bgfx_wasm/zig-out/web/index.html
+
+      - name: Install Playwright Chromium
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet playwright==1.58.0 numpy pillow
+          python3 -m playwright install --with-deps chromium
+
+      - name: Verify the game-owned materials under WebGL2
+        working-directory: examples/condenser
+        run: python3 tools/verify_webgl2.py
+
+      - name: Upload captures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: condenser-webgl2
+          path: examples/condenser/.test-output/webgl2/
+          if-no-files-found: ignore
