@@ -117,13 +117,11 @@ fn syncDir(allocator: std.mem.Allocator, src_path: []const u8, dest_path: []cons
                     stats.kept += 1;
                     continue;
                 }
-                if (fileUpToDate(src_sub, dest_sub)) {
+                if (isSameFile(src_sub, dest_sub)) {
                     stats.kept += 1;
                     continue;
                 }
-                if (destKind(dest_sub) != null) try removeEntry(dest_sub);
-                try hardlinkOrCopy(allocator, src_sub, dest_sub);
-                stats.linked += 1;
+                if (try stageFile(allocator, src_sub, dest_sub)) stats.linked += 1 else stats.kept += 1;
             },
             .sym_link => {
                 var src_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -201,41 +199,49 @@ fn destKind(path: []const u8) ?std.Io.File.Kind {
     return st.kind;
 }
 
-/// True when `dest` needs no work:
-///   * it IS the source file (hardlink: same inode, size and mtime — the
-///     size/mtime check guards a coincidental inode match across two
-///     filesystems); or
-///   * it is a standalone copy (`nlink == 1`: the copy fallback) with the
-///     same bytes and permissions.
-/// A dest hardlinked to some OTHER file (`nlink > 1`, different inode — e.g.
-/// the pin moved to another checkout with identical bytes) is relinked, so
-/// the stage tracks the currently resolved source, not the old tree.
-fn fileUpToDate(src: []const u8, dest: []const u8) bool {
+/// True when `dest` IS the source file — a hardlink to it: same inode, size
+/// and mtime (size/mtime guard a coincidental inode match across two
+/// filesystems; see #806). Byte equality is deliberately NOT enough: a stage
+/// hardlinked to another tree, or detached from a source that was replaced,
+/// would stop tracking the current source.
+fn isSameFile(src: []const u8, dest: []const u8) bool {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
     const ds = cwd.statFile(io, dest, .{ .follow_symlinks = false }) catch return false;
     if (ds.kind != .file) return false;
     const ss = cwd.statFile(io, src, .{}) catch return false;
-    if (ss.size != ds.size) return false;
-    if (ss.inode == ds.inode and ss.mtime.nanoseconds == ds.mtime.nanoseconds) return true;
-    if (ds.nlink != 1) return false;
-    return write_if_changed.sameFiles(io, cwd, src, cwd, dest);
+    return ss.inode == ds.inode and ss.size == ds.size and ss.mtime.nanoseconds == ds.mtime.nanoseconds;
 }
 
-/// Create a hardlink, falling back to copy (cross-device, no hardlink
-/// support). Hardlinks share disk space and need no admin rights on Windows.
-fn hardlinkOrCopy(allocator: std.mem.Allocator, src: []const u8, dest: []const u8) !void {
+/// Make `dest` the source file. Returns true when it changed `dest`.
+///
+/// Hardlink first, to a temp name renamed over `dest` (the old file is never
+/// written through). Only when hardlinking is impossible (cross-device, no
+/// hardlink support) does it fall back to a copy — and then an existing
+/// `dest` with the same bytes and permissions is kept (returns false), so the
+/// copy fallback is byte-stable too.
+fn stageFile(allocator: std.mem.Allocator, src: []const u8, dest: []const u8) !bool {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
-    if (comptime builtin.os.tag == .windows) {
-        windowsHardLink(allocator, src, dest) catch {
-            try cwd.copyFile(src, cwd, dest, io, .{});
-        };
-    } else {
-        cwd.hardLink(src, cwd, dest, io, .{}) catch {
-            try cwd.copyFile(src, cwd, dest, io, .{});
-        };
-    }
+    const tmp = try std.fmt.allocPrint(allocator, "{s}.labelle-link", .{dest});
+    defer allocator.free(tmp);
+    cwd.deleteFile(io, tmp) catch {};
+
+    if (hardLink(allocator, src, tmp)) {
+        if (destKind(dest)) |k| if (k != .file) try removeEntry(dest);
+        try cwd.rename(tmp, cwd, dest, io);
+        return true;
+    } else |_| {}
+
+    if (write_if_changed.sameFiles(io, cwd, src, cwd, dest)) return false;
+    if (destKind(dest) != null) try removeEntry(dest);
+    try cwd.copyFile(src, cwd, dest, io, .{});
+    return true;
+}
+
+fn hardLink(allocator: std.mem.Allocator, src: []const u8, dest: []const u8) !void {
+    if (comptime builtin.os.tag == .windows) return windowsHardLink(allocator, src, dest);
+    return std.Io.Dir.cwd().hardLink(src, std.Io.Dir.cwd(), dest, config.globalIo(), .{});
 }
 
 /// Windows hardlink via kernel32.CreateHardLinkW (NTFS, no admin needed).
@@ -391,6 +397,25 @@ test "syncTree: a stage hardlinked to ANOTHER tree with identical bytes is relin
         try testing.expectEqual(@as(usize, 3), stats.linked);
         try testing.expectEqual(fork_file.inode, staged.inode);
     }
+}
+
+test "syncTree: a stage detached from an atomically replaced source (same bytes) is relinked" {
+    // Replace-by-rename leaves the old stage hardlink with nlink == 1 and the
+    // same bytes — it must still be relinked, or later in-place edits to the
+    // new source never reach the stage.
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    _ = try fx.sync(.{});
+    const before = try fx.stat("src/root.zig");
+    if (before.nlink < 2) return error.SkipZigTest; // no hardlinks here
+
+    try fx.tmp.dir.writeFile(testing.io, .{ .sub_path = "pkg/src/root.zig.new", .data = "pub const x = 1;" });
+    try fx.tmp.dir.rename("pkg/src/root.zig.new", fx.tmp.dir, "pkg/src/root.zig", testing.io);
+
+    const s = try fx.sync(.{});
+    try testing.expectEqual(@as(usize, 1), s.linked);
+    const src_now = try fx.tmp.dir.statFile(testing.io, "pkg/src/root.zig", .{});
+    try testing.expectEqual(src_now.inode, (try fx.stat("src/root.zig")).inode);
 }
 
 test "syncTree: a link overlay over a source dir is unlinked (never followed) and the dir restored" {
