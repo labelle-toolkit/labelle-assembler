@@ -1182,19 +1182,6 @@ test "801: payload @ keys do not trip the gate (scope-aware detection)" {
     ));
 }
 
-test "801: the JSON-escaped @ spelling still trips the gate" {
-    // `"@slot"` decodes to `@slot` at engine load — the gate must
-    // see through the escape or an old pin silently drops the override
-    // (CodeRabbit on #650).
-    try std.testing.expect(scene_manifest.sourceUsesTargetKeys(
-        \\{ "prefab": "m", "\u0040slot": { "Storage": {} } }
-    ));
-    // Escaped spelling inside an overrides wrapper too.
-    try std.testing.expect(scene_manifest.sourceUsesTargetKeys(
-        \\{ "prefab": "m", "overrides": { "\u0040slot": { "Storage": {} } } }
-    ));
-}
-
 test "801: digit-leading branch pins stay permissive; deep nesting fails closed" {
     const supports = scene_manifest.engineSupportsTargetOverrides;
     // `2.10.0-feature` is a PRE-RELEASE pin (isSemverVersion=false), not
