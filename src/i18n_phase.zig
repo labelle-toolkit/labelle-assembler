@@ -28,6 +28,7 @@
 //! A project with no `locales/` emits nothing and keeps a byte-identical
 //! build.zig; a stale generated file is deleted, mirroring constants_phase.
 const std = @import("std");
+const write_if_changed = @import("write_if_changed.zig");
 const Allocator = std.mem.Allocator;
 const locales_mod = @import("i18n_locales.zig");
 const usage = @import("usage_scan.zig");
@@ -430,7 +431,7 @@ pub fn runPhase(
     try emitModule(arena, w, tags.items, parsed, reference, reference_idx, default_idx, interps, plural_of, plural_list.items);
 
     const dst = try std.fs.path.join(arena, &.{ target_dir, GENERATED_FILENAME });
-    try cwd.writeFile(io, .{ .sub_path = dst, .data = out.writer.buffered() });
+    _ = try write_if_changed.writeIfChanged(io, cwd, dst, out.writer.buffered()); // #674
     return true;
 }
 

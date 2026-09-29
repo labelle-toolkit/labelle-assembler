@@ -11,6 +11,7 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const scanner = @import("../scanner.zig");
+const write_if_changed = @import("../write_if_changed.zig");
 const cache = @import("../cache.zig");
 const script_scanner = @import("../script_scanner.zig");
 const scene_name_lint = @import("../scene_name_lint.zig");
@@ -24,18 +25,23 @@ const idents = @import("../codegen/idents.zig");
 /// `<target>/packs/<name>/`). A missing source subdir is tolerated —
 /// `copyAndScanAbs` returns an empty list — so a pack can ship, say,
 /// `components/` + `events/` without a `prefabs/` and not error.
+///
+/// `rewritten`: the `ext` files are materialized by a later rewrite (prefabs,
+/// hooks), so they are scanned but not copied here — see
+/// `scanner.copyAndScanAbsOpts` (#674).
 fn scanPackSubdir(
     allocator: std.mem.Allocator,
     pack_src_dir: []const u8,
     dst_base: []const u8,
     subdir: []const u8,
     ext: []const u8,
+    rewritten: bool,
 ) ![][]const u8 {
     const src = try std.fs.path.join(allocator, &.{ pack_src_dir, subdir });
     defer allocator.free(src);
     const dst = try std.fs.path.join(allocator, &.{ dst_base, subdir });
     defer allocator.free(dst);
-    return scanner.copyAndScanAbs(allocator, src, dst, ext);
+    return scanner.copyAndScanAbsOpts(allocator, src, dst, ext, !rewritten);
 }
 
 /// Select the decl-module subset of `plugins` (labelle-assembler#481).
@@ -179,23 +185,25 @@ pub fn scanPack(
         try cwd.createDirPath(io, dst_base);
     }
 
-    const component_names = try scanPackSubdir(allocator, pack_src_dir, dst_base, "components", ".zig");
+    const component_names = try scanPackSubdir(allocator, pack_src_dir, dst_base, "components", ".zig", false);
     errdefer scanner.freeNames(allocator, component_names);
-    const event_names = try scanPackSubdir(allocator, pack_src_dir, dst_base, "events", ".zig");
+    const event_names = try scanPackSubdir(allocator, pack_src_dir, dst_base, "events", ".zig", false);
     errdefer scanner.freeNames(allocator, event_names);
-    const prefab_names = try scanPackSubdir(allocator, pack_src_dir, dst_base, "prefabs", ".jsonc");
+    const prefab_names = try scanPackSubdir(allocator, pack_src_dir, dst_base, "prefabs", ".jsonc", true);
     errdefer scanner.freeNames(allocator, prefab_names);
     // hooks/ (#440): scanned + registered into the game-root hook pipeline
     // under the `<pack>__` ident prefix (see the hook block-writers).
-    const hook_names = try scanPackSubdir(allocator, pack_src_dir, dst_base, "hooks", ".zig");
+    const hook_names = try scanPackSubdir(allocator, pack_src_dir, dst_base, "hooks", ".zig", true);
     errdefer scanner.freeNames(allocator, hook_names);
 
     // Local→prefixed ref rewrite (#440): rewrite the copied prefab JSONC so a
     // pack's own component references (`"Worker"`) and prefab compositions
     // (`{ "prefab": "worker" }`) become the namespaced forms
-    // (`"citizens__Worker"` / `"citizens__worker"`). Done against the copied
-    // (destination) files so the source pack tree is never mutated.
-    try rewritePackPrefabRefs(allocator, dst_base, pack_name, component_names, prefab_names);
+    // (`"citizens__Worker"` / `"citizens__worker"`). Reads the SOURCE file and
+    // writes the (possibly rewritten) result to the destination only when it
+    // differs, so the source pack tree is never mutated and an unchanged
+    // prefab keeps its mtime (#674).
+    try rewritePackPrefabRefs(allocator, pack_src_dir, dst_base, pack_name, component_names, prefab_names);
 
     // Verb-surface files (RFC §6, #498 PR 4): a pack's root-level
     // `queries.zig` / `commands.zig` are copied beside the convention
@@ -207,7 +215,7 @@ pub fn scanPack(
     // …and rewrite the copied hook sources so a handler written with the pack's
     // bare local event name receives its `<pack>__`-prefixed event (chatgpt-codex
     // #3). Same "mutate the copy, never the source" discipline.
-    try rewritePackHookHandlers(allocator, dst_base, pack_name, event_names, hook_names);
+    try rewritePackHookHandlers(allocator, pack_src_dir, dst_base, pack_name, event_names, hook_names);
 
     return .{
         .name = name_owned,
@@ -279,6 +287,7 @@ fn copyPackRootFile(
 ///     not component count).
 fn rewritePackPrefabRefs(
     allocator: std.mem.Allocator,
+    pack_src_dir: []const u8,
     dst_base: []const u8,
     pack_name: []const u8,
     component_names: []const []const u8,
@@ -310,14 +319,18 @@ fn rewritePackPrefabRefs(
     const cwd = std.Io.Dir.cwd();
     const prefabs_dir = try std.fs.path.join(allocator, &.{ dst_base, "prefabs" });
     defer allocator.free(prefabs_dir);
+    const src_prefabs_dir = try std.fs.path.join(allocator, &.{ pack_src_dir, "prefabs" });
+    defer allocator.free(src_prefabs_dir);
 
     for (prefab_names) |name| {
         const rel = try std.fmt.allocPrint(allocator, "{s}.jsonc", .{name});
         defer allocator.free(rel);
         const path = try std.fs.path.join(allocator, &.{ prefabs_dir, rel });
         defer allocator.free(path);
+        const src_path = try std.fs.path.join(allocator, &.{ src_prefabs_dir, rel });
+        defer allocator.free(src_path);
 
-        const src = cwd.readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        const src = cwd.readFileAlloc(io, src_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
         };
@@ -331,12 +344,9 @@ fn rewritePackPrefabRefs(
         // NOT attach at load — warn now instead of failing silently there.
         warnLeftoverBareKeys(allocator, path, rewritten, keys.items);
 
-        // Only rewrite the file when the content actually changed — avoids
-        // churning mtimes (and the build cache) on prefabs with no local refs.
-        if (std.mem.eql(u8, rewritten, src)) continue;
-        var f = try cwd.createFile(io, path, .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, rewritten);
+        // The scan left this file to us (`scanPackSubdir(.., true)`): write
+        // it only when the staged copy differs — no mtime churn (#674).
+        _ = try write_if_changed.writeIfChanged(io, cwd, path, rewritten);
     }
 }
 
@@ -384,12 +394,16 @@ fn warnLeftoverBareKeys(
 /// events (nothing to prefix) or no hooks is a no-op.
 fn rewritePackHookHandlers(
     allocator: std.mem.Allocator,
+    pack_src_dir: []const u8,
     dst_base: []const u8,
     pack_name: []const u8,
     event_names: []const []const u8,
     hook_names: []const []const u8,
 ) !void {
-    if (event_names.len == 0 or hook_names.len == 0) return;
+    // No early return on `event_names.len == 0`: the scan left every hook file
+    // to this pass (`scanPackSubdir(.., true)`), so each is still materialized
+    // — verbatim when there is nothing to rename.
+    if (hook_names.len == 0) return;
 
     var prefix_buf: [128]u8 = undefined;
     const prefix = scan.packNamespacePrefix(pack_name, &prefix_buf);
@@ -398,14 +412,18 @@ fn rewritePackHookHandlers(
     const cwd = std.Io.Dir.cwd();
     const hooks_dir = try std.fs.path.join(allocator, &.{ dst_base, "hooks" });
     defer allocator.free(hooks_dir);
+    const src_hooks_dir = try std.fs.path.join(allocator, &.{ pack_src_dir, "hooks" });
+    defer allocator.free(src_hooks_dir);
 
     for (hook_names) |name| {
         const rel = try std.fmt.allocPrint(allocator, "{s}.zig", .{name});
         defer allocator.free(rel);
         const path = try std.fs.path.join(allocator, &.{ hooks_dir, rel });
         defer allocator.free(path);
+        const src_path = try std.fs.path.join(allocator, &.{ src_hooks_dir, rel });
+        defer allocator.free(src_path);
 
-        const src = cwd.readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        const src = cwd.readFileAlloc(io, src_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
         };
@@ -414,12 +432,12 @@ fn rewritePackHookHandlers(
         // `name` is the hook file stem (`overlay` / `combat/overlay`); the
         // rewrite scopes the rename to that file's receiver container
         // (`pathToPascal(name)`), so unrelated helpers are never touched.
-        const rewritten = try scan.rewritePackHookHandlerNames(allocator, src, event_names, prefix, name);
+        const rewritten = if (event_names.len == 0)
+            try allocator.dupe(u8, src)
+        else
+            try scan.rewritePackHookHandlerNames(allocator, src, event_names, prefix, name);
         defer allocator.free(rewritten);
 
-        if (std.mem.eql(u8, rewritten, src)) continue;
-        var f = try cwd.createFile(io, path, .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, rewritten);
+        _ = try write_if_changed.writeIfChanged(io, cwd, path, rewritten); // #674
     }
 }

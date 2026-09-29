@@ -33,6 +33,7 @@
 //! `b.dependency`-style path/module access).
 
 const std = @import("std");
+const write_if_changed = @import("write_if_changed.zig");
 const config = @import("config.zig");
 const cache = @import("cache.zig");
 
@@ -128,9 +129,7 @@ pub fn stage(
         const dest_name = try stagedName(allocator, d.plugin_name);
         defer allocator.free(dest_name);
 
-        const file = try dir.createFile(io, dest_name, .{});
-        defer file.close(io);
-        try file.writeStreamingAll(io, content);
+        _ = try write_if_changed.writeIfChanged(io, dir, dest_name, content); // #674
     }
 }
 
