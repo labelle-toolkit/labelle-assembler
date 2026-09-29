@@ -855,7 +855,10 @@ pub fn generate(
     // at generate instead. Covers scenes AND prefabs (a prefab body can
     // use `@` on its own ref-array entries). Unparseable pins (`local:`
     // dev overrides, branch pins) pass — see
-    // `engineSupportsTargetOverrides`.
+    // `engineSupportsTargetOverrides`. Flat pack-namespaced component keys
+    // (engine#806, labelle-assembler#652) shipped in the same engine
+    // release and are dropped the same way, so the gate covers them too
+    // (`sourceNeedsV211Keys`).
     if (!scene_manifest.engineSupportsTargetOverrides(cfg.engine_version)) {
         const prefabs_target = try std.fs.path.join(allocator, &.{ target_dir, "prefabs" });
         defer allocator.free(prefabs_target);
@@ -883,9 +886,9 @@ pub fn generate(
         if (hit) |offender| {
             defer allocator.free(offender);
             std.debug.print(
-                "labelle-assembler: '{s}' uses \"@<ref>\" target-override keys (labelle-engine#801), but the pinned engine v{s} predates them (needs >= v{s}).\n" ++
-                    "  An older engine silently DROPS `@` keys — the exact failure this syntax replaces.\n" ++
-                    "  Bump `engine_version` in project.labelle, or remove the `@` overrides.\n",
+                "labelle-assembler: '{s}' uses \"@<ref>\" target-override keys (labelle-engine#801) or flat \"<pack>__Pascal\" component keys (labelle-engine#806), but the pinned engine v{s} predates them (needs >= v{s}).\n" ++
+                    "  An older engine silently DROPS those keys — the exact failure this syntax replaces.\n" ++
+                    "  Bump `engine_version` in project.labelle, or remove the `@` overrides / move namespaced keys into a \"components\"/\"overrides\" wrapper.\n",
                 .{ offender, cfg.engine_version, scene_manifest.MIN_ENGINE_FOR_TARGET_OVERRIDES },
             );
             return error.EngineTooOldForTargetOverrides;

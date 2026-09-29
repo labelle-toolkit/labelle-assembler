@@ -331,3 +331,47 @@ test "pack rewrite: an escaped @ target's value is a component map exactly when 
     defer std.testing.allocator.free(inert);
     try std.testing.expectEqualStrings(src, inert);
 }
+
+// ── Version gate: keys an engine older than v2.11.0 drops (codex on #798) ──
+
+test "version gate: flat namespaced keys need v2.11 exactly where the engine reads them (table)" {
+    const cases = [_]struct { src: []const u8, needs: bool }{
+        // Flat on an entity (file root, child, bundle element): engine#806.
+        .{ .src = "{ \"prefab\": \"room\", \"rooms__Room\": {} }", .needs = true },
+        .{ .src = "{ \"children\": [ { \"rooms__Room\": {} } ] }", .needs = true },
+        .{ .src = "[ { \"rooms__Room\": {} } ]", .needs = true },
+        // `@` targets: engine#801, same release.
+        .{ .src = "{ \"prefab\": \"m\", \"@slot\": { \"Storage\": {} } }", .needs = true },
+        // Wrapped namespaced keys always loaded; PascalCase always loaded.
+        .{ .src = "{ \"prefab\": \"room\", \"overrides\": { \"rooms__Room\": {} } }", .needs = false },
+        .{ .src = "{ \"components\": { \"rooms__Room\": {} } }", .needs = false },
+        .{ .src = "{ \"prefab\": \"room\", \"Room\": {} }", .needs = false },
+        // Not component-shaped, or inside opaque payload.
+        .{ .src = "{ \"prefab\": \"room\", \"capacity__oops\": 1 }", .needs = false },
+        .{ .src = "{ \"Config\": { \"a__B\": 1 } }", .needs = false },
+        // Unloadable on every engine: nothing for the gate to catch.
+        .{ .src = "{ \"prefab\": \"room\", \"rooms__\\u0052oom\": {} }", .needs = false },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("src {s}\n", .{c.src});
+        try std.testing.expectEqual(c.needs, scene_manifest.sourceNeedsV211Keys(c.src));
+    }
+    // The `@`-only probe stays `@`-only.
+    try std.testing.expect(!scene_manifest.sourceUsesTargetKeys("{ \"rooms__Room\": {} }"));
+}
+
+// ── std.json best-effort scanners: engine-unloadable files are empty ──────
+
+test "scanTilemapAssets: an escaped key the engine cannot load fabricates no tilemap (codex on #798)" {
+    const plain = try scene_manifest.scanTilemapAssets(std.testing.allocator,
+        \\{ "components": { "Tilemap": { "asset_name": "room_map" } } }
+    );
+    defer scene_manifest.freeTilemapAssets(std.testing.allocator, plain);
+    try std.testing.expectEqual(@as(usize, 1), plain.len);
+
+    const escaped = try scene_manifest.scanTilemapAssets(std.testing.allocator,
+        \\{ "components": { "\u0054ilemap": { "asset_name": "room_map" } } }
+    );
+    defer scene_manifest.freeTilemapAssets(std.testing.allocator, escaped);
+    try std.testing.expectEqual(@as(usize, 0), escaped.len);
+}

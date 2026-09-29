@@ -92,6 +92,25 @@ pub const builtin_component_names = [_][]const u8{
 /// positive here costs one loud generate error naming the file; 256
 /// levels of nesting is not a real scene either way.
 pub fn sourceUsesTargetKeys(src: []const u8) bool {
+    return sourceUsesKeyFeature(src, .target);
+}
+
+/// Key syntaxes that an older engine silently drops, so the version gate
+/// looks for them. Both arrived in engine v2.11.0.
+pub const KeyFeature = enum {
+    /// `@<ref>` target keys at entity / component-map scope (engine#801).
+    target,
+    /// Flat pack-namespaced `<prefix>__<Pascal>` component keys at ENTITY
+    /// scope (engine#806, labelle-assembler#652). Inside a
+    /// `components`/`overrides` map they were always accepted, so only the
+    /// flat position counts.
+    flat_namespaced,
+};
+
+/// True iff `src` uses `feature` in a position where the engine gives it
+/// meaning. Same scope walk and fail-closed depth rule as
+/// `sourceUsesTargetKeys`.
+pub fn sourceUsesKeyFeature(src: []const u8, comptime feature: KeyFeature) bool {
     var stack_buf: [256]Scope = undefined;
     var sp: usize = 0;
     var pending_key: ?[]const u8 = null;
@@ -150,8 +169,13 @@ pub fn sourceUsesTargetKeys(src: []const u8) bool {
             const is_key = nextSignificantIsColon(src, j + 1);
             if (is_key) {
                 const scope = if (sp > 0) stack_buf[sp - 1] else .entity;
-                if (scope == .entity or scope == .component_map) {
-                    if (isTargetKey(content)) return true;
+                switch (feature) {
+                    .target => if (scope == .entity or scope == .component_map) {
+                        if (isTargetKey(content)) return true;
+                    },
+                    .flat_namespaced => if (scope == .entity) {
+                        if (isComponentKeyShape(content) and !scene_keys.isPascalCase(content)) return true;
+                    },
                 }
                 pending_key = content;
             } else {

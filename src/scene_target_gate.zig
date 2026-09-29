@@ -18,9 +18,20 @@ pub fn sourceUsesTargetKeys(src: []const u8) bool {
     return @import("scene_name_lint.zig").sourceUsesTargetKeys(src);
 }
 
+/// True iff `src` uses key syntax an engine older than
+/// `MIN_ENGINE_FOR_TARGET_OVERRIDES` silently drops: `@` target keys
+/// (engine#801) or flat pack-namespaced `<prefix>__<Pascal>` component
+/// keys at entity scope (engine#806, labelle-assembler#652). Both landed
+/// in engine v2.11.0, so one gate covers both.
+pub fn sourceNeedsV211Keys(src: []const u8) bool {
+    const lint = @import("scene_name_lint.zig");
+    return lint.sourceUsesKeyFeature(src, .target) or lint.sourceUsesKeyFeature(src, .flat_namespaced);
+}
+
 /// First engine release that understands `@` target-override keys
-/// (labelle-engine#801). Bump ONLY if the engine-side feature slips to a
-/// later minor.
+/// (labelle-engine#801); flat pack-namespaced keys (engine#806) shipped in
+/// the same release, so the gate covers both. Bump ONLY if the engine-side
+/// feature slips to a later minor.
 pub const MIN_ENGINE_FOR_TARGET_OVERRIDES = "2.11.0";
 
 /// True iff the pinned engine version understands `@` target overrides.
@@ -66,7 +77,7 @@ pub fn findTargetKeyUsage(
                 continue;
             },
         };
-        const used = sourceUsesTargetKeys(source);
+        const used = sourceNeedsV211Keys(source);
         allocator.free(source);
         if (used) return rel;
         allocator.free(rel);
@@ -112,7 +123,7 @@ pub fn findTargetKeyUsageInTree(
                         continue;
                     },
                 };
-                const used = sourceUsesTargetKeys(source);
+                const used = sourceNeedsV211Keys(source);
                 allocator.free(source);
                 if (used) return rel;
                 allocator.free(rel);

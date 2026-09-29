@@ -620,6 +620,10 @@ pub fn scanTilemapAssets(
     allocator: std.mem.Allocator,
     source: []const u8,
 ) ![]const []const u8 {
+    // A file with a string escape the engine's JSONC parser rejects never
+    // loads, so it declares no tilemap. `std.json` would decode e.g. an
+    // escaped `Tilemap` key and fabricate a registration (codex on #798).
+    if (scene_keys.firstInvalidEscape(source) != null) return &.{};
     const stripped = stripJsonc(allocator, source) catch return &.{};
     defer allocator.free(stripped);
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, stripped, .{}) catch return &.{};
@@ -651,6 +655,8 @@ pub fn scanScenePrefabRefs(
     const bytes = cwd.readFileAlloc(io, scene_path, allocator, .limited(8 * 1024 * 1024)) catch return &.{};
     defer allocator.free(bytes);
 
+    // Unloadable to the engine = unparseable here (see `scanTilemapAssets`).
+    if (scene_keys.firstInvalidEscape(bytes) != null) return &.{};
     const stripped = stripJsonc(allocator, bytes) catch return &.{};
     defer allocator.free(stripped);
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, stripped, .{}) catch return &.{};
@@ -945,6 +951,7 @@ pub fn freeManifests(allocator: std.mem.Allocator, manifests: []const SceneManif
 
 const target_gate = @import("scene_target_gate.zig");
 pub const sourceUsesTargetKeys = target_gate.sourceUsesTargetKeys;
+pub const sourceNeedsV211Keys = target_gate.sourceNeedsV211Keys;
 pub const MIN_ENGINE_FOR_TARGET_OVERRIDES = target_gate.MIN_ENGINE_FOR_TARGET_OVERRIDES;
 pub const engineSupportsTargetOverrides = target_gate.engineSupportsTargetOverrides;
 pub const findTargetKeyUsage = target_gate.findTargetKeyUsage;
