@@ -75,6 +75,7 @@ const write_if_changed = @import("write_if_changed.zig");
 const config = @import("config.zig");
 const provider_settings = @import("provider_settings.zig");
 const android_moved_keys = @import("android_moved_keys.zig");
+const ios_moved_keys = @import("ios_moved_keys.zig");
 const target_keys = @import("target_keys.zig");
 
 // ============================================================================
@@ -489,6 +490,9 @@ fn parseTypedDiag(
     // (labelle-cli#405): name the key and its new home instead of the typed
     // parse's bare "unexpected field". Malformed ZON is left to the typed parse.
     try android_moved_keys.check(gpa, source);
+    // Likewise the whole `.ios` block moved to providers/ios.json
+    // (labelle-ios provider, labelle-cli#471 I4).
+    try ios_moved_keys.check(gpa, source);
     const cfg = try std.zon.parse.fromSliceAlloc(config.ProjectConfig, gpa, source, diag, .{});
     // Defensive: the pre-pass only ever drops a ParseZon the typed parse
     // reproduces, so a source that reaches here has already passed the
@@ -1916,6 +1920,36 @@ test "parseProjectConfig: a moved `.android` packaging key fails with the provid
     for (removed) |src| {
         try testing.expectError(error.AndroidKeyMovedToProvider, parseProjectConfig(arena.allocator(), src));
     }
+}
+
+test "parseProjectConfig: a moved `.ios` key fails with the provider hint (labelle-cli#471 I4)" {
+    // As for `.android`: a distinct error proves the hinting path ran, not
+    // just the typed parse's bare ParseZon.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const removed = [_][:0]const u8{
+        ".{ .name = \"g\", .ios = .{ .app_name = \"G\" } }",
+        ".{ .name = \"g\", .ios = .{ .bundle_id = \"com.labelle.g\" } }",
+        ".{ .name = \"g\", .ios = .{ .team_id = \"ABCDE12345\" } }",
+        ".{ .name = \"g\", .ios = .{ .minimum_ios = \"15.0\" } }",
+        ".{ .name = \"g\", .ios = .{ .orientation = .landscape } }",
+        ".{ .name = \"g\", .ios = .{ .device_family = \"1,2\" } }",
+        ".{ .name = \"g\", .ios = .{ .simulator = .{ .device = null } } }",
+        ".{ .name = \"g\", .ios = .{ .destination = \"simulator\" } }",
+        // Also through the `.params` extraction path.
+        ".{ .name = \"g\", .plugins = .{ .{ .name = \"p\", .version = \"1.0.0\", .params = .{ .x = 1 } } }, .ios = .{ .bundle_id = \"com.labelle.g\" } }",
+    };
+    for (removed) |src| {
+        try testing.expectError(error.IosKeyMovedToProvider, parseProjectConfig(arena.allocator(), src));
+    }
+}
+
+test "parseProjectConfig: an empty `.ios` block parses; a typo in it is a strict parse error (labelle-cli#471 I4)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const cfg = try parseProjectConfig(arena.allocator(), ".{ .name = \"g\", .ios = .{} }");
+    try testing.expect(cfg.ios != null);
+    try testing.expectError(error.ParseZon, parseProjectConfig(arena.allocator(), ".{ .name = \"g\", .ios = .{ .bundle_idd = \"x\" } }"));
 }
 
 test "parseProjectConfig: the three kept `.android` codegen keys still parse (labelle-cli#405)" {
