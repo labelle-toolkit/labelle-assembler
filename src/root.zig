@@ -94,6 +94,7 @@ test {
     _ = @import("scene_override_check.zig");
     _ = @import("tilemap_scan_test.zig"); // covers tilemap_scan + tilemap_scene_scan
     _ = @import("asset_validator.zig");
+    _ = @import("catalog_key_check.zig");
     _ = @import("pack_resources.zig");
     _ = @import("language_policy.zig");
     _ = @import("plugin_params.zig");
@@ -949,6 +950,13 @@ pub fn generate(
     // source before the copy or it survives in the staged target (codex
     // #639 review).
     try flow_scanner.pruneStaleSidecars(allocator, game_dir);
+
+    // Reject static asset-catalog keys (`.catalog = "<key>"` literals and
+    // component fields listed in `catalog_keys`) that no resource
+    // registers; otherwise the typo only surfaces on the device as
+    // `AssetNotRegistered` (#738). Same merged game + pack resource list.
+    // After the sidecar prune, so a stale flow sidecar can't fail it.
+    try @import("catalog_key_check.zig").validate(allocator, game_dir, cfg.resources);
 
     try scanner.linkDir(allocator, game_dir, target_dir, "scripts");
 
