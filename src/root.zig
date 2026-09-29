@@ -101,6 +101,7 @@ test {
     _ = @import("language_policy.zig");
     _ = @import("plugin_params.zig");
     _ = @import("android_moved_keys.zig");
+    _ = @import("ios_moved_keys.zig");
     _ = @import("target_keys.zig");
     _ = @import("scripting_splice.zig");
     _ = @import("scripting_declare.zig");
@@ -152,7 +153,6 @@ pub const GuiLifecycle = config.GuiLifecycle;
 pub const PluginDep = config.PluginDep;
 pub const IosConfig = config.IosConfig;
 pub const AndroidConfig = config.AndroidConfig;
-pub const Orientation = config.Orientation;
 pub const LayerSpace = config.LayerSpace;
 pub const LayerDef = config.LayerDef;
 pub const ResourceDef = config.ResourceDef;

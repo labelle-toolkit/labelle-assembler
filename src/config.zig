@@ -366,34 +366,14 @@ pub const PluginDep = struct {
 
 // ── iOS Configuration ──────────────────────────────────────────────
 
-/// Screen-orientation policy for the mobile platforms.
-///
-/// The CLI maps these onto the iOS `UISupportedInterfaceOrientations` plist
-/// array (Android orientation moved to `providers/android.json`, owned by the
-/// labelle-android provider — labelle-cli#405); this enum only has to
-/// *parse* — `project.labelle` is parsed strictly, so a value the CLI knows
-/// and the assembler doesn't fails at generate time before the CLI ever sees
-/// it. Both copies must move together (labelle-cli#341/#342).
-pub const Orientation = enum {
-    portrait,
-    /// Android: `"landscape"` — ONE landscape direction; a 180° flip does not
-    /// rotate the game. iOS: both landscape directions (the platforms differ
-    /// here by design). Kept single-direction on Android deliberately.
-    landscape,
-    /// Landscape only, but EITHER direction — Android `"sensorLandscape"`.
-    /// iOS emits the same array as `.landscape`, which already allowed both.
-    sensor_landscape,
-    all,
-};
-
-pub const IosConfig = struct {
-    app_name: []const u8 = "",
-    bundle_id: []const u8 = "",
-    team_id: []const u8 = "",
-    minimum_ios: []const u8 = "15.0",
-    orientation: Orientation = .all,
-    device_family: []const u8 = "1,2",
-};
+/// The project.labelle `.ios` block — DEPRECATED, and empty on purpose
+/// (labelle-cli#471, item I4). The assembler's codegen never read it; its
+/// former keys (`app_name`, `bundle_id`, `team_id`, `minimum_ios`,
+/// `orientation`, `device_family`) configured the CLI's legacy iOS packaging,
+/// which moved to the labelle-ios provider (`providers/ios.json`). A strict
+/// parse that meets one fails with a "move it" hint (`ios_moved_keys.zig`);
+/// `.ios = .{}` still parses so an emptied block is not an error.
+pub const IosConfig = struct {};
 
 // ── Android Configuration ──────────────────────────────────────────
 
@@ -1366,8 +1346,10 @@ pub const ProjectConfig = struct {
     /// Defaults to a single "running" state when omitted.
     states: []const []const u8 = &.{"running"},
 
-    /// iOS configuration — parsed from project.labelle `.ios` section.
-    /// Defaults to null (derived from project name/title when absent).
+    /// DEPRECATED `.ios` block — kept only so an emptied `.ios = .{}` parses;
+    /// every former key moved to `providers/ios.json` (labelle-ios provider,
+    /// labelle-cli#471 I4) and fails with a hint (`ios_moved_keys.zig`).
+    /// Codegen never reads it.
     ios: ?IosConfig = null,
 
     /// Android configuration — parsed from project.labelle `.android` section.
@@ -1867,39 +1849,4 @@ test "AndroidConfig: a removed packaging key is a strict parse error (labelle-cl
             std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, ".{ ." ++ kv ++ " }", &diag, .{}),
         );
     }
-}
-
-test "Orientation: every value parses from ZON on the ios block (labelle-cli#341)" {
-    // The assembler parses `project.labelle` strictly, so it is the gate: a
-    // value the CLI's manifest emitter understands but this enum lacks fails
-    // at generate time, before the CLI is ever reached. (Android orientation
-    // moved to providers/android.json, labelle-cli#405.)
-    // Arena, not `std.zon.parse.free`: IosConfig carries `[]const u8` fields
-    // that default to a static `""`, and freeing those through the testing
-    // allocator aborts on a bad free.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    inline for (.{
-        .{ "portrait", Orientation.portrait },
-        .{ "landscape", Orientation.landscape },
-        .{ "sensor_landscape", Orientation.sensor_landscape },
-        .{ "all", Orientation.all },
-    }) |case| {
-        const src: [:0]const u8 = ".{ .orientation = ." ++ case[0] ++ " }";
-        const ios = try std.zon.parse.fromSliceAlloc(IosConfig, alloc, src, null, .{});
-        try std.testing.expectEqual(case[1], ios.orientation);
-    }
-}
-
-test "Orientation: defaults stay `.all` and an unknown value is a hard parse error" {
-    const alloc = std.testing.allocator;
-    try std.testing.expectEqual(Orientation.all, (IosConfig{}).orientation);
-
-    var diag: std.zon.parse.Diagnostics = .{};
-    defer diag.deinit(alloc);
-    try std.testing.expectError(
-        error.ParseZon,
-        std.zon.parse.fromSliceAlloc(IosConfig, alloc, ".{ .orientation = .sensorLandscape }", &diag, .{}),
-    );
 }
