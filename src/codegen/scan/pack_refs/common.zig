@@ -3,7 +3,8 @@
 //! split of `scan/pack_refs.zig` (labelle-assembler#534 follow-up).
 //!
 //! Owns the low-level JSONC byte scanners (`skipTrivia`/`scanString`/
-//! `scanValue`/`scanBalanced`), the pure key classifiers (`isPascalCase`/
+//! `scanValue`/`scanBalanced`), the key classifiers (`isTargetKey`/
+//! `isFlatComponentKey`, re-exported from `scene_keys.zig`, plus
 //! `isEntityListKey`/`containsKey`), and the container-shape probes that
 //! mirror the engine's `unified_format.zig` (`isOnlyMetaHeaderObject`/
 //! `bundleHeaderOpen`/`rootWrapperValueOpen`/`bundleHeaderLegacyEntitiesOffset`).
@@ -13,6 +14,7 @@
 //! the free functions here directly.
 
 const std = @import("std");
+const scene_keys = @import("../../../scene_keys.zig");
 
 pub const Error = error{ Malformed, OutOfMemory };
 
@@ -124,42 +126,18 @@ pub fn scanBalanced(src: []const u8, at: usize) Error!usize {
     return error.Malformed;
 }
 
-/// Byte-parity twin of the engine's `unified_format.zig` `isPascalCase`
-/// (RFC #596): an entity-scope key is a flat component declaration iff its
-/// first byte is an ASCII uppercase letter; everything else (lowercase
-/// structural keys like `prefab`/`children`/`meta`/`ref`, empty, non-ASCII
-/// start) is structural. The flat-wrap transform must classify keys EXACTLY
-/// like the engine's flat loader, or the copy's shape drifts from what the
-/// author's file would have meant at game root.
-pub fn isPascalCase(name: []const u8) bool {
-    if (name.len == 0) return false;
-    return name[0] >= 'A' and name[0] <= 'Z';
-}
-
-/// Byte-parity twin of the engine's `unified_format.zig` `isTargetKey`
-/// (labelle-engine#801): `"@<ref>"` on a prefab reference's override map
-/// targets a ref-named entity inside the referenced prefab's body. Like
-/// PascalCase component keys, `@` keys are flat patch CONTENT at entity
-/// scope — pass 1 must move them into the synthesized wrapper and pass 2
-/// must open a component map for their values, or the copy's shape drifts
-/// from the author's meaning.
-pub fn isTargetKey(name: []const u8) bool {
-    if (name.len > 1 and name[0] == '@') return true;
-    // The JSON-escaped spelling decodes to `@` at engine load. These
-    // walkers classify RAW bytes, so recognize it here too — otherwise
-    // pass 1 leaves an escaped target outside the synthesized wrapper
-    // and pass 2 treats its value as opaque payload, silently losing
-    // the pack-namespace rewrite on a supported engine (codex P2 on
-    // #650). The PascalCase analog (`\u0057orker`) is the broader
-    // pre-existing class tracked in #651.
-    return name.len > 6 and std.mem.startsWith(u8, name, "\\u0040");
-}
-
-/// A flat patch-content key at entity scope: PascalCase component
-/// (RFC #596 axis 2) or `@` target (labelle-engine#801).
-pub fn isFlatComponentKey(name: []const u8) bool {
-    return isPascalCase(name) or isTargetKey(name);
-}
+/// Key classification is shared with every other scene walker through
+/// `scene_keys.zig` (labelle-assembler#651, #652): byte-parity with the
+/// engine's `unified_format.zig`, applied to RAW key spans (see that
+/// module for why raw bytes classify exactly like the engine's decoded
+/// keys, and why an escape the engine rejects makes a key inert). A flat
+/// patch-content key at entity scope is a component-shaped key
+/// (PascalCase or `<prefix>__<Pascal>`, engine#806) or a `@` target
+/// (engine#801). Pass 1 must move all of them into the synthesized
+/// wrapper, and pass 2 must open a component map for a target's value, or
+/// the copy's shape drifts from the author's meaning.
+pub const isTargetKey = scene_keys.rawIsTargetKey;
+pub const isFlatComponentKey = scene_keys.rawIsFlatComponentKey;
 
 /// The two array-valued entity-list keys the engine walks (`children` on any
 /// entity scope, legacy `entities` at file level). Shared between pass 2's
@@ -179,9 +157,9 @@ pub fn containsKey(keys: []const []const u8, needle: []const u8) bool {
 /// Byte-parity twin of the engine's `unified_format.zig` `isFileHeader`
 /// (RFC #596, #516): true iff the object opening at `open` is a file-level
 /// metadata header — it carries a `"meta"` key and NO entity-shape key
-/// (`prefab`, `children`, `components`, `overrides`, `ref`, or any
-/// PascalCase key). Other lowercase keys are tolerated on a header, exactly
-/// as the engine tolerates them. `{}` carries no `meta` and is NOT a header
+/// (`prefab`, `children`, `components`, `overrides`, `ref`, or any flat
+/// content key: component-shaped or `@` target, `isFlatComponentKey`).
+/// Other lowercase keys are tolerated on a header, exactly as the engine tolerates them. `{}` carries no `meta` and is NOT a header
 /// (the engine treats it as an entity and rejects it at load), and any
 /// object this scanner cannot fully account for is not a header either —
 /// both rewrite passes then keep treating the element as an entity, so the

@@ -90,6 +90,7 @@ test {
     _ = @import("scene_name_lint.zig");
     _ = @import("scene_manifest.zig");
     _ = @import("scene_manifest_test.zig");
+    _ = @import("scene_keys_test.zig"); // #651/#652 key classification
     _ = @import("scene_override_check.zig");
     _ = @import("tilemap_scan_test.zig"); // covers tilemap_scan + tilemap_scene_scan
     _ = @import("asset_validator.zig");
@@ -855,7 +856,10 @@ pub fn generate(
     // at generate instead. Covers scenes AND prefabs (a prefab body can
     // use `@` on its own ref-array entries). Unparseable pins (`local:`
     // dev overrides, branch pins) pass — see
-    // `engineSupportsTargetOverrides`.
+    // `engineSupportsTargetOverrides`. Flat pack-namespaced component keys
+    // (engine#806, labelle-assembler#652) shipped in the same engine
+    // release and are dropped the same way, so the gate covers them too
+    // (`sourceNeedsV211Keys`).
     if (!scene_manifest.engineSupportsTargetOverrides(cfg.engine_version)) {
         const prefabs_target = try std.fs.path.join(allocator, &.{ target_dir, "prefabs" });
         defer allocator.free(prefabs_target);
@@ -883,9 +887,9 @@ pub fn generate(
         if (hit) |offender| {
             defer allocator.free(offender);
             std.debug.print(
-                "labelle-assembler: '{s}' uses \"@<ref>\" target-override keys (labelle-engine#801), but the pinned engine v{s} predates them (needs >= v{s}).\n" ++
-                    "  An older engine silently DROPS `@` keys — the exact failure this syntax replaces.\n" ++
-                    "  Bump `engine_version` in project.labelle, or remove the `@` overrides.\n",
+                "labelle-assembler: '{s}' uses \"@<ref>\" target-override keys (labelle-engine#801) or flat \"<pack>__Pascal\" component keys (labelle-engine#806), but the pinned engine v{s} predates them (needs >= v{s}).\n" ++
+                    "  An older engine silently DROPS those keys — the exact failure this syntax replaces.\n" ++
+                    "  Bump `engine_version` in project.labelle, or remove the `@` overrides / move namespaced keys into a \"components\"/\"overrides\" wrapper.\n",
                 .{ offender, cfg.engine_version, scene_manifest.MIN_ENGINE_FOR_TARGET_OVERRIDES },
             );
             return error.EngineTooOldForTargetOverrides;
@@ -1254,6 +1258,33 @@ pub fn generate(
     defer {
         for (pack_scans.items) |*p| p.deinit(allocator);
         pack_scans.deinit(allocator);
+    }
+
+    // Flat namespaced keys in pack prefabs (engine#806) are gated on the
+    // STAGED, rewritten copies: pack rewrite pass 1 wraps any entity that
+    // declares a pack-local component, and a wrapped key loads on every
+    // engine. Only keys still flat after that would be dropped by an
+    // engine older than v2.11.0 (codex on #798).
+    if (!scene_manifest.engineSupportsTargetOverrides(cfg.engine_version)) {
+        // Prefabs only: a pack's other staged `.jsonc` (locales, …) is not
+        // entity data.
+        var flat_hit: ?[]const u8 = null;
+        for (pack_scans.items) |ps| {
+            const staged_prefabs = try std.fs.path.join(allocator, &.{ target_dir, "packs", ps.name, "prefabs" });
+            defer allocator.free(staged_prefabs);
+            flat_hit = try scene_manifest.findFlatNamespacedKeyUsageInTree(allocator, staged_prefabs);
+            if (flat_hit != null) break;
+        }
+        if (flat_hit) |offender| {
+            defer allocator.free(offender);
+            std.debug.print(
+                "labelle-assembler: '{s}' uses flat \"<pack>__Pascal\" component keys (labelle-engine#806), but the pinned engine v{s} predates them (needs >= v{s}).\n" ++
+                    "  An older engine silently DROPS those keys.\n" ++
+                    "  Bump `engine_version` in project.labelle, or move the namespaced keys into a \"components\"/\"overrides\" wrapper.\n",
+                .{ offender, cfg.engine_version, scene_manifest.MIN_ENGINE_FOR_TARGET_OVERRIDES },
+            );
+            return error.EngineTooOldForTargetOverrides;
+        }
     }
 
     // ── Asset-Plugins Phase 1: copy + namespace + validate pack assets ──

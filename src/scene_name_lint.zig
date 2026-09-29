@@ -41,6 +41,7 @@
 const std = @import("std");
 const check = @import("check.zig");
 const scanner = @import("scanner.zig");
+const scene_keys = @import("scene_keys.zig");
 
 // ── Inputs ────────────────────────────────────────────────────────────────
 
@@ -69,12 +70,14 @@ pub const builtin_component_names = [_][]const u8{
     "VideoComponent",
 };
 
-
 // ── `@` target-override usage detection (labelle-engine#801) ──────────────
 
 /// True iff `src` uses `@` target-override syntax (labelle-engine#801): a
-/// `"@<ref>"` (or JSON-escaped `"\u0040<ref>"`) object KEY at an entity or
-/// component-map scope. Scope-tracked with the same `childScope` model as
+/// `"@<ref>"` object KEY at an entity or component-map scope. The
+/// JSON-escaped `"\u0040<ref>"` spelling does NOT count: the engine's JSONC
+/// parser rejects `\u` escapes and fails the whole file on every version, so
+/// there is no silent drop for the gate to catch (labelle-assembler#651,
+/// `scene_keys.zig`). Scope-tracked with the same `childScope` model as
 /// `collectComponentRefs`, so `@`-keys inside opaque component PAYLOAD
 /// (`{ "Config": { "@id": "x" } }`) never count — payload keys are ordinary
 /// data, and a false positive here would spuriously hard-fail the
@@ -89,6 +92,25 @@ pub const builtin_component_names = [_][]const u8{
 /// positive here costs one loud generate error naming the file; 256
 /// levels of nesting is not a real scene either way.
 pub fn sourceUsesTargetKeys(src: []const u8) bool {
+    return sourceUsesKeyFeature(src, .target);
+}
+
+/// Key syntaxes that an older engine silently drops, so the version gate
+/// looks for them. Both arrived in engine v2.11.0.
+pub const KeyFeature = enum {
+    /// `@<ref>` target keys at entity / component-map scope (engine#801).
+    target,
+    /// Flat pack-namespaced `<prefix>__<Pascal>` component keys at ENTITY
+    /// scope (engine#806, labelle-assembler#652). Inside a
+    /// `components`/`overrides` map they were always accepted, so only the
+    /// flat position counts.
+    flat_namespaced,
+};
+
+/// True iff `src` uses `feature` in a position where the engine gives it
+/// meaning. Same scope walk and fail-closed depth rule as
+/// `sourceUsesTargetKeys`.
+pub fn sourceUsesKeyFeature(src: []const u8, comptime feature: KeyFeature) bool {
     var stack_buf: [256]Scope = undefined;
     var sp: usize = 0;
     var pending_key: ?[]const u8 = null;
@@ -147,8 +169,13 @@ pub fn sourceUsesTargetKeys(src: []const u8) bool {
             const is_key = nextSignificantIsColon(src, j + 1);
             if (is_key) {
                 const scope = if (sp > 0) stack_buf[sp - 1] else .entity;
-                if (scope == .entity or scope == .component_map) {
-                    if (isTargetKey(content)) return true;
+                switch (feature) {
+                    .target => if (scope == .entity or scope == .component_map) {
+                        if (isTargetKey(content)) return true;
+                    },
+                    .flat_namespaced => if (scope == .entity) {
+                        if (isComponentKeyShape(content) and !scene_keys.isPascalCase(content)) return true;
+                    },
                 }
                 pending_key = content;
             } else {
@@ -160,13 +187,6 @@ pub fn sourceUsesTargetKeys(src: []const u8) bool {
         i += 1;
     }
     return false;
-}
-
-/// A `"\u0040<ref>"` key — the JSON-escaped spelling of `@` that decodes
-/// to a target key at engine load (CodeRabbit on #650). Raw-byte check:
-/// backslash, `u0040`, then at least one ref character.
-fn isEscapedTargetKey(content: []const u8) bool {
-    return content.len > 6 and std.mem.startsWith(u8, content, "\\u0040");
 }
 
 // ── Component-reference collection ─────────────────────────────────────────
@@ -249,20 +269,11 @@ fn childArrayScope(parent: ?Scope, pending_key: ?[]const u8) Scope {
     return .array_other;
 }
 
-/// True iff a key's first byte is an ASCII upper-case letter — the
-/// PascalCase convention RFC #596 axis 2 uses to mark component keys.
-fn isPascalCase(key: []const u8) bool {
-    return key.len > 0 and key[0] >= 'A' and key[0] <= 'Z';
-}
-
-/// `"@<ref>"` target-override key (labelle-engine#801) — patch structure,
-/// not a component reference; its VALUE is a component map.
-fn isTargetKey(key: []const u8) bool {
-    if (key.len > 1 and key[0] == '@') return true;
-    // Raw JSON-escaped spelling — same rule as
-    // `pack_refs/common.isTargetKey` (codex P2 on #650).
-    return key.len > 6 and std.mem.startsWith(u8, key, "\\u0040");
-}
+/// Key classification: shared with the pack rewrite and the scene manifest
+/// through `scene_keys.zig` (byte-parity with the engine, applied to raw
+/// key spans; labelle-assembler#651, #652).
+const isTargetKey = scene_keys.rawIsTargetKey;
+const isComponentKeyShape = scene_keys.rawIsComponentKeyShape;
 
 /// True iff the next significant byte at/after `from` (skipping whitespace
 /// and JSONC comments) is a `:` — i.e. the preceding string literal was an
@@ -375,8 +386,10 @@ pub fn collectComponentRefs(arena: std.mem.Allocator, src: []const u8) ![]CompRe
                     // except a `@` target (labelle-engine#801), whose
                     // value opens another component map instead.
                     .component_map => !isTargetKey(content),
-                    // A flat-form PascalCase key on an entity is a component.
-                    .entity => isPascalCase(content),
+                    // A flat-form component-shaped key on an entity is a
+                    // component: PascalCase, or `<prefix>__<Pascal>` since
+                    // engine#806 (labelle-assembler#652).
+                    .entity => isComponentKeyShape(content),
                     else => false,
                 };
                 if (is_ref) {
