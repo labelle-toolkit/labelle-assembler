@@ -17,8 +17,11 @@
 //!      multiline strings need no special casing). A key computed at
 //!      runtime (`.catalog = w.mask`) is left to the runtime
 //!      `AssetNotRegistered` path, which still guards it. A key the game
-//!      registers itself — the leading string literal of any
-//!      `register...("<key>", ...)` call — counts as registered.
+//!      registers itself — the leading string literal of an
+//!      `assets.register("<key>", ...)` or `register...FromMemory("<key>",
+//!      ...)` call — counts as registered. Generated flow sidecars (a
+//!      `.zig` beside its `.flow.jsonc`) are skipped: generate rewrites
+//!      them later.
 //!   2. **Component fields that hold a catalog key.** A component opts
 //!      its string fields in with a declaration in its struct:
 //!
@@ -28,12 +31,13 @@
 //!              ...
 //!          };
 //!
-//!      Read with the Zig parser from each root-level component struct.
-//!      Every string value those fields take in `prefabs/` and `scenes/`
-//!      is checked (component sites located by the scene walker
-//!      `scene_name_lint.collectComponentRefs`, so opaque payload that
-//!      happens to reuse a component name is not), and so is each
-//!      field's string-literal default in the component.
+//!      Read with the Zig parser from the file-stem component struct (the
+//!      one decl the registry exposes). Every string value those fields
+//!      take in `prefabs/` and `scenes/` is checked (component sites
+//!      located by the scene walker `scene_name_lint.collectComponentRefs`,
+//!      so opaque payload that happens to reuse a component name is not),
+//!      and so is each field's string-literal default in the component.
+//!      An entry that names no field of the struct is itself an error.
 //!
 //! Every unregistered key is reported — file, line, the component/field
 //! (or `.catalog` literal) that authored it, and the closest registered
@@ -44,6 +48,7 @@ const asset_validator = @import("asset_validator.zig");
 const scanner = @import("scanner.zig");
 const scene_name_lint = @import("scene_name_lint.zig");
 const i18n_locales = @import("i18n_locales.zig");
+const idents = @import("codegen/idents.zig");
 
 pub const Error = error{ UnregisteredCatalogKey, OutOfMemory };
 
@@ -55,6 +60,10 @@ pub const Site = union(enum) {
     /// default in the component, where the component lists `field` in
     /// its `catalog_keys`.
     component_field: struct { component: []const u8, field: []const u8 },
+    /// A `catalog_keys` entry (the finding's `key`) naming no field of
+    /// the component: the opt-in itself is misspelled, so nothing it was
+    /// meant to cover would be checked.
+    unknown_field: struct { component: []const u8 },
 };
 
 pub const Finding = struct {
@@ -74,6 +83,8 @@ pub const KeyDecl = struct {
     /// String-literal defaults of those fields in the component source,
     /// which apply wherever a prefab/scene omits the field.
     defaults: []const Default = &.{},
+    /// `catalog_keys` entries that are not fields of the struct.
+    unknown: []const Literal = &.{},
 };
 
 pub const Default = struct { field: []const u8, key: []const u8, line: usize };
@@ -82,7 +93,7 @@ pub const Default = struct { field: []const u8, key: []const u8, line: usize };
 pub const ZigKeys = struct {
     /// `.catalog = "<key>"` literals.
     catalog: []const Literal,
-    /// Leading string argument of `register...(` calls.
+    /// Leading string argument of asset-registration calls.
     registered: []const []const u8,
 };
 
@@ -147,9 +158,22 @@ pub fn check(
     // Component declarations come from `components/` only.
     var decls: std.ArrayList(KeyDecl) = .empty;
     for (zig_files.items[0..component_file_count]) |f| {
-        const file_decls = try parseKeyDecls(arena, f.source);
-        try decls.appendSlice(arena, file_decls);
-        for (file_decls) |decl| for (decl.defaults) |d| {
+        // The registry exposes only the file-stem Pascal decl
+        // (`components/<path>.zig` -> `pathToPascal(<path>)`).
+        var buf: [128]u8 = undefined;
+        const stem = idents.pathToPascal(f.rel["components/".len..], &buf);
+        const decl = (try parseKeyDecls(arena, f.source, try arena.dupe(u8, stem))) orelse continue;
+        try decls.append(arena, decl);
+        for (decl.unknown) |u| {
+            try findings.append(arena, .{
+                .file = f.rel,
+                .line = u.line,
+                .site = .{ .unknown_field = .{ .component = decl.component } },
+                .key = u.key,
+                .suggestion = null,
+            });
+        }
+        for (decl.defaults) |d| {
             if (isRegistered(d.key, resources)) continue;
             try findings.append(arena, .{
                 .file = f.rel,
@@ -158,7 +182,7 @@ pub fn check(
                 .key = d.key,
                 .suggestion = try suggest(arena, d.key, resources),
             });
-        };
+        }
     }
 
     if (decls.items.len > 0) {
@@ -186,7 +210,16 @@ pub fn checkJsonSource(
 ) error{OutOfMemory}!void {
     const refs = scene_name_lint.collectComponentRefs(arena, source) catch return error.OutOfMemory;
     for (refs) |ref| {
-        const decl = findDecl(decls, ref.name) orelse continue;
+        // A key spelled with JSON escapes (`"WaterShader"`) names the
+        // same component once decoded.
+        const name = if (std.mem.indexOfScalar(u8, ref.name, '\\') == null)
+            ref.name
+        else
+            std.json.parseFromSliceLeaky([]const u8, arena, source[ref.offset - 1 .. ref.offset + ref.name.len + 1], .{}) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+        const decl = findDecl(decls, name) orelse continue;
         const span = componentObject(source, ref.offset + ref.name.len) orelse continue;
         const body = source[span[0]..span[1]];
         const stripped = try i18n_locales.stripJsonc(arena, body);
@@ -303,101 +336,122 @@ pub fn suggest(
 // ── Zig sources ────────────────────────────────────────────────────────
 
 /// Token-level scan of one Zig source for `.catalog = "<key>"` literals
-/// and `register...("<key>"` calls. Comments, whitespace and line breaks
-/// are the tokenizer's business; a literal with an escape is skipped
-/// (not a plain catalog key).
+/// and asset-registration calls. Comments, whitespace and line breaks are
+/// the tokenizer's business; a literal with an escape is skipped (not a
+/// plain catalog key).
+///
+/// Only the asset catalog's own registration shapes count as registering
+/// a key: `assets.register("<key>", ...)` and the engine's
+/// `register...FromMemory("<key>", ...)` shims. Any other `register...`
+/// (scenes, hooks, ...) does not populate the catalog.
 pub fn scanZigKeys(arena: std.mem.Allocator, src: []const u8) error{OutOfMemory}!ZigKeys {
     const src_z = try arena.dupeZ(u8, src);
     var catalog: std.ArrayList(Literal) = .empty;
     var registered: std.ArrayList([]const u8) = .empty;
 
-    // A 4-token window: the three before `cur`.
-    var w: [3]std.zig.Token = undefined;
+    // The four tokens before `cur`, oldest first.
+    var w: [4]std.zig.Token = undefined;
     var seen: usize = 0;
     var tok = std.zig.Tokenizer.init(src_z);
     while (true) {
         const cur = tok.next();
         if (cur.tag == .eof) break;
-        if (cur.tag == .string_literal and seen >= 3) {
-            const key = plainString(src, cur);
+        if (cur.tag == .string_literal and seen >= 4) key: {
+            const key = plainString(src, cur) orelse break :key;
             // `.catalog = "<key>"`
-            if (key != null and w[0].tag == .period and w[1].tag == .identifier and
-                std.mem.eql(u8, src[w[1].loc.start..w[1].loc.end], "catalog") and w[2].tag == .equal)
-            {
-                try catalog.append(arena, .{ .key = key.?, .line = lineAt(src, cur.loc.start) });
+            if (w[1].tag == .period and isIdent(src, w[2], "catalog") and w[3].tag == .equal) {
+                try catalog.append(arena, .{ .key = key, .line = lineAt(src, cur.loc.start) });
             }
-            // `register...("<key>"`
-            if (key != null and w[1].tag == .identifier and
-                std.mem.startsWith(u8, src[w[1].loc.start..w[1].loc.end], "register") and w[2].tag == .l_paren)
-            {
-                try registered.append(arena, key.?);
-            }
+            if (w[3].tag != .l_paren or w[2].tag != .identifier) break :key;
+            const callee = src[w[2].loc.start..w[2].loc.end];
+            // `assets.register("<key>"` / `register...FromMemory("<key>"`
+            const asset_register = std.mem.eql(u8, callee, "register") and
+                w[1].tag == .period and isIdent(src, w[0], "assets");
+            const from_memory = std.mem.startsWith(u8, callee, "register") and
+                std.mem.endsWith(u8, callee, "FromMemory");
+            if (asset_register or from_memory) try registered.append(arena, key);
         }
-        w[0] = w[1];
-        w[1] = w[2];
-        w[2] = cur;
+        w = .{ w[1], w[2], w[3], cur };
         seen += 1;
     }
     return .{ .catalog = catalog.items, .registered = registered.items };
 }
 
-/// Every root-level `const Name = struct { ... }` in `src` that declares
-/// `pub const catalog_keys = .{ "a", "b" };` as a DIRECT member, with the
-/// string-literal defaults of those fields. A source that does not parse
-/// yields nothing (the Zig build reports it).
-pub fn parseKeyDecls(arena: std.mem.Allocator, src: []const u8) error{OutOfMemory}![]KeyDecl {
+fn isIdent(src: []const u8, t: std.zig.Token, name: []const u8) bool {
+    return t.tag == .identifier and std.mem.eql(u8, src[t.loc.start..t.loc.end], name);
+}
+
+/// The root-level `const <component> = struct { ... }` of a component
+/// file, if it declares `pub const catalog_keys = .{ "a", "b" };` as a
+/// direct member: its fields, their string-literal defaults, and any
+/// entry that is not one of its fields. Other root declarations (helper
+/// structs) are ignored: the registry exposes only the file-stem decl.
+/// A source that does not parse yields null (the Zig build reports it).
+pub fn parseKeyDecls(arena: std.mem.Allocator, src: []const u8, component: []const u8) error{OutOfMemory}!?KeyDecl {
     const src_z = try arena.dupeZ(u8, src);
     var ast = try std.zig.Ast.parse(arena, src_z, .zig);
-    if (ast.errors.len > 0) return &.{};
+    if (ast.errors.len > 0) return null;
 
-    var out: std.ArrayList(KeyDecl) = .empty;
     for (ast.rootDecls()) |decl| {
         const vd = ast.fullVarDecl(decl) orelse continue;
-        const name = ast.tokenSlice(vd.ast.mut_token + 1);
-        const init_node = vd.ast.init_node.unwrap() orelse continue;
+        if (!std.mem.eql(u8, ast.tokenSlice(vd.ast.mut_token + 1), component)) continue;
+        const init_node = vd.ast.init_node.unwrap() orelse return null;
         var buf: [2]std.zig.Ast.Node.Index = undefined;
-        const container = ast.fullContainerDecl(&buf, init_node) orelse continue;
-        if (ast.tokenTag(container.ast.main_token) != .keyword_struct) continue;
+        const container = ast.fullContainerDecl(&buf, init_node) orelse return null;
+        if (ast.tokenTag(container.ast.main_token) != .keyword_struct) return null;
 
-        var keys: ?[]const []const u8 = null;
+        var keys: ?[]const Literal = null;
+        var field_names: std.ArrayList([]const u8) = .empty;
         var lits: std.ArrayList(Default) = .empty;
         for (container.ast.members) |m| {
             if (ast.fullVarDecl(m)) |mvd| {
                 if (!std.mem.eql(u8, ast.tokenSlice(mvd.ast.mut_token + 1), "catalog_keys")) continue;
                 const list = mvd.ast.init_node.unwrap() orelse continue;
-                keys = try stringElements(arena, &ast, list);
+                keys = try stringElements(arena, &ast, src, list);
             } else if (ast.fullContainerField(m)) |field| {
                 if (field.ast.tuple_like) continue;
+                const field_name = ast.tokenSlice(field.ast.main_token);
+                try field_names.append(arena, field_name);
                 const value = field.ast.value_expr.unwrap() orelse continue;
                 if (ast.nodeTag(value) != .string_literal) continue;
                 const tok_i = ast.nodeMainToken(value);
                 const key = plainTokenString(ast.tokenSlice(tok_i)) orelse continue;
-                try lits.append(arena, .{
-                    .field = ast.tokenSlice(field.ast.main_token),
-                    .key = key,
-                    .line = lineAt(src, ast.tokenStart(tok_i)),
-                });
+                try lits.append(arena, .{ .field = field_name, .key = key, .line = lineAt(src, ast.tokenStart(tok_i)) });
             }
         }
-        const fields = keys orelse continue;
+        const entries = keys orelse return null;
+        var fields: std.ArrayList([]const u8) = .empty;
+        var unknown: std.ArrayList(Literal) = .empty;
         var defaults: std.ArrayList(Default) = .empty;
-        for (fields) |f| for (lits.items) |d| {
-            if (std.mem.eql(u8, d.field, f)) try defaults.append(arena, d);
-        };
-        try out.append(arena, .{ .component = name, .fields = fields, .defaults = defaults.items });
+        for (entries) |e| {
+            if (!contains(field_names.items, e.key)) {
+                try unknown.append(arena, e);
+                continue;
+            }
+            try fields.append(arena, e.key);
+            for (lits.items) |d| if (std.mem.eql(u8, d.field, e.key)) try defaults.append(arena, d);
+        }
+        return .{ .component = component, .fields = fields.items, .defaults = defaults.items, .unknown = unknown.items };
     }
-    return out.items;
+    return null;
 }
 
-/// The string-literal elements of an anonymous list `.{ "a", "b" }`.
-fn stringElements(arena: std.mem.Allocator, ast: *const std.zig.Ast, node: std.zig.Ast.Node.Index) error{OutOfMemory}![]const []const u8 {
+fn contains(list: []const []const u8, s: []const u8) bool {
+    for (list) |x| if (std.mem.eql(u8, x, s)) return true;
+    return false;
+}
+
+/// The string-literal elements (with lines) of an anonymous list
+/// `.{ "a", "b" }`.
+fn stringElements(arena: std.mem.Allocator, ast: *const std.zig.Ast, src: []const u8, node: std.zig.Ast.Node.Index) error{OutOfMemory}![]const Literal {
     var buf: [2]std.zig.Ast.Node.Index = undefined;
     const list = ast.fullArrayInit(&buf, node) orelse return &.{};
-    var out: std.ArrayList([]const u8) = .empty;
+    var out: std.ArrayList(Literal) = .empty;
     for (list.ast.elements) |el| {
         if (ast.nodeTag(el) != .string_literal) continue;
-        const s = plainTokenString(ast.tokenSlice(ast.nodeMainToken(el))) orelse continue;
-        try out.append(arena, s);
+        const tok_i = ast.nodeMainToken(el);
+        const s = plainTokenString(ast.tokenSlice(tok_i)) orelse continue;
+        try out.append(arena, .{ .key = s, .line = lineAt(src, ast.tokenStart(tok_i)) });
     }
     return out.items;
 }
@@ -453,8 +507,8 @@ fn collectDir(
     defer dir.close(io);
     var it = dir.iterate();
     while (it.next(io) catch return) |entry| {
-        if (entry.name.len > 0 and entry.name[0] == '.') continue;
-        // Caches, vendored trees and nested repositories are not game source.
+        // Caches, vendored trees and nested repositories are not game
+        // source (the same prune the component/script scanners apply).
         if (entry.kind == .directory and scanner.isSkippableDir(dir, entry.name)) continue;
         const child_abs = try std.fs.path.join(arena, &.{ abs, entry.name });
         const child_rel = try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, entry.name });
@@ -462,6 +516,13 @@ fn collectDir(
             .directory => try collectDir(arena, child_abs, child_rel, ext, out),
             .file, .sym_link => {
                 if (!std.mem.endsWith(u8, entry.name, ext)) continue;
+                // A flow's generated `.zig` sidecar is rewritten from its
+                // `.flow.jsonc` later in generate; checking the stale copy
+                // would reject a key the edited flow no longer uses.
+                if (std.mem.eql(u8, ext, ".zig")) {
+                    const flow = try std.fmt.allocPrint(arena, "{s}.flow.jsonc", .{entry.name[0 .. entry.name.len - ".zig".len]});
+                    if (dir.access(io, flow, .{})) |_| continue else |_| {}
+                }
                 const source = std.Io.Dir.cwd().readFileAlloc(io, child_abs, arena, .limited(max_file_bytes)) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => continue,
@@ -477,6 +538,15 @@ fn printFinding(arena: std.mem.Allocator, f: Finding) void {
     const what = switch (f.site) {
         .catalog_literal => std.fmt.allocPrint(arena, "`.catalog = \"{s}\"`", .{f.key}),
         .component_field => |c| std.fmt.allocPrint(arena, "{s}.{s} = \"{s}\"", .{ c.component, c.field, f.key }),
+        .unknown_field => |c| {
+            const msg = std.fmt.allocPrint(
+                arena,
+                "labelle-assembler: {s}:{d}: {s}.catalog_keys lists '{s}', which is not a field of {s}; nothing it names would be checked.\n",
+                .{ f.file, f.line, c.component, f.key, c.component },
+            ) catch return;
+            std.Io.File.stderr().writeStreamingAll(config.globalIo(), msg) catch {};
+            return;
+        },
     } catch return;
     const hint = if (f.suggestion) |s|
         std.fmt.allocPrint(arena, "  Did you mean '{s}'?\n", .{s}) catch return

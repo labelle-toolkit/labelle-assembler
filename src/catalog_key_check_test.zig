@@ -44,7 +44,7 @@ test "scanZigKeys: .catalog literals with lines; comments, runtime keys and look
     try testing.expectEqual(@as(usize, 0), keys.registered.len);
 }
 
-test "scanZigKeys: leading string argument of register calls, any spacing" {
+test "scanZigKeys: only asset-registration calls register a key, any spacing" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const src =
@@ -52,8 +52,10 @@ test "scanZigKeys: leading string argument of register calls, any spacing" {
         \\try g.registerImageFromMemory (
         \\    "other_mask", bytes);
         \\r.registerCatalogTexture(handle, tex);
-        \\// register("commented")
-        \\unregister("not_a_registration");
+        \\g.registerSceneSimple("fog_mask", loader);
+        \\hooks.register("not_an_asset");
+        \\// assets.register("commented")
+        \\unregisterImageFromMemory("not_a_registration");
     ;
     const keys = try ck.scanZigKeys(arena.allocator(), src);
     try testing.expectEqual(@as(usize, 2), keys.registered.len);
@@ -61,11 +63,15 @@ test "scanZigKeys: leading string argument of register calls, any spacing" {
     try testing.expectEqualStrings("other_mask", keys.registered[1]);
 }
 
-test "parseKeyDecls: catalog_keys and defaults of the component struct itself" {
+test "parseKeyDecls: catalog_keys and defaults of the file-stem component only" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const src =
         \\const std = @import("std");
+        \\pub const Helper = struct {
+        \\    pub const catalog_keys = .{"mask"};
+        \\    mask: []const u8 = "helper_MISSING",
+        \\};
         \\pub const WaterShader = struct {
         \\    // pub const catalog_keys = .{ "commented" };
         \\    pub const Tuning = struct { mask: []const u8 = "nested_default" };
@@ -76,25 +82,44 @@ test "parseKeyDecls: catalog_keys and defaults of the component struct itself" {
         \\    reflection: []const u8 = default_reflection,
         \\};
         \\const default_reflection = "x";
-        \\pub const Plain = struct { x: f32 = 0 };
     ;
-    const decls = try ck.parseKeyDecls(arena.allocator(), src);
-    try testing.expectEqual(@as(usize, 1), decls.len);
-    try testing.expectEqualStrings("WaterShader", decls[0].component);
-    try testing.expectEqual(@as(usize, 2), decls[0].fields.len);
-    try testing.expectEqualStrings("mask", decls[0].fields[0]);
-    try testing.expectEqualStrings("reflection", decls[0].fields[1]);
-    // Only the OUTER `mask` has a literal default (not Tuning's).
-    try testing.expectEqual(@as(usize, 1), decls[0].defaults.len);
-    try testing.expectEqualStrings("reservoir_mask", decls[0].defaults[0].key);
-    try testing.expectEqual(@as(usize, 8), decls[0].defaults[0].line);
+    const decl = (try ck.parseKeyDecls(arena.allocator(), src, "WaterShader")).?;
+    try testing.expectEqualStrings("WaterShader", decl.component);
+    try testing.expectEqual(@as(usize, 2), decl.fields.len);
+    try testing.expectEqualStrings("mask", decl.fields[0]);
+    try testing.expectEqualStrings("reflection", decl.fields[1]);
+    try testing.expectEqual(@as(usize, 0), decl.unknown.len);
+    // Only the OUTER `mask` has a literal default (not Tuning's or Helper's).
+    try testing.expectEqual(@as(usize, 1), decl.defaults.len);
+    try testing.expectEqualStrings("reservoir_mask", decl.defaults[0].key);
+    try testing.expectEqual(@as(usize, 12), decl.defaults[0].line);
 }
 
-test "parseKeyDecls: a source that does not parse yields nothing" {
+test "parseKeyDecls: an entry naming no field is reported as unknown" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const decls = try ck.parseKeyDecls(arena.allocator(), "pub const A = struct { pub const catalog_keys = .{\"m\"} ");
-    try testing.expectEqual(@as(usize, 0), decls.len);
+    const src =
+        \\pub const WaterShader = struct {
+        \\    pub const catalog_keys = .{
+        \\        "maks",
+        \\    };
+        \\    mask: []const u8 = "reservoir_mask",
+        \\};
+    ;
+    const decl = (try ck.parseKeyDecls(arena.allocator(), src, "WaterShader")).?;
+    try testing.expectEqual(@as(usize, 0), decl.fields.len);
+    try testing.expectEqual(@as(usize, 1), decl.unknown.len);
+    try testing.expectEqualStrings("maks", decl.unknown[0].key);
+    try testing.expectEqual(@as(usize, 3), decl.unknown[0].line);
+}
+
+test "parseKeyDecls: no declaration, other component, or unparseable source yields null" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expect((try ck.parseKeyDecls(a, "pub const A = struct { x: u8 = 0 };", "A")) == null);
+    try testing.expect((try ck.parseKeyDecls(a, "pub const A = struct { pub const catalog_keys = .{\"x\"}; x: []const u8 };", "B")) == null);
+    try testing.expect((try ck.parseKeyDecls(a, "pub const A = struct { pub const catalog_keys = .{\"m\"} ", "A")) == null);
 }
 
 test "suggest: edit distance first, prefix fallback for long suffixes" {
@@ -144,15 +169,20 @@ test "checkJsonSource: scene component maps are checked, payload reusing the nam
         \\{ "entities": [
         \\  { "prefab": "reservoir", "components": { "WaterShader": { "mask": "sky__clouds" } } },
         \\  { "components": { "Config": { "WaterShader": { "mask": "ordinary_value" } } } },
-        \\  { "components": { "WaterShader": { "reflection": "reservoir_reflect" } } }
+        \\  { "components": { "WaterShader": { "reflection": "reservoir_reflect" } } },
+        \\  { "components": { "WaterShader": { "mask": "escaped_MISSING" } } }
         \\] }
     ;
     var findings: std.ArrayList(ck.Finding) = .empty;
     try ck.checkJsonSource(a, "scenes/main.jsonc", src, &water_decl, &test_resources, &findings);
-    // Only the real component site with a typo; `Config`'s payload is opaque.
-    try testing.expectEqual(@as(usize, 1), findings.items.len);
+    // The real component sites with a typo (one spelled with a JSON
+    // escape); `Config`'s payload is opaque.
+    try testing.expectEqual(@as(usize, 2), findings.items.len);
     try testing.expectEqualStrings("reservoir_reflect", findings.items[0].key);
     try testing.expectEqual(@as(usize, 4), findings.items[0].line);
+    try testing.expectEqualStrings("escaped_MISSING", findings.items[1].key);
+    try testing.expectEqualStrings("WaterShader", findings.items[1].site.component_field.component);
+    try testing.expectEqual(@as(usize, 5), findings.items[1].line);
 }
 
 fn writeTree(dir: std.Io.Dir, files: []const [2][]const u8) !void {
@@ -188,6 +218,36 @@ test "check: a game with only registered keys produces no findings" {
     const findings = try ck.check(arena.allocator(), game_dir, &test_resources);
     try testing.expectEqual(@as(usize, 0), findings.len);
     try ck.validate(testing.allocator, game_dir, &test_resources);
+}
+
+test "check: dot-prefixed sources are scanned; flow sidecars and misspelled opt-ins handled" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTree(tmp.dir, &.{
+        .{
+            "components/water_shader.zig",
+            \\pub const WaterShader = struct {
+            \\    pub const catalog_keys = .{ "maks" };
+            \\    mask: []const u8 = "reservoir_mask",
+            \\};
+        },
+        // Compiled like any other script, so checked.
+        .{ "scripts/.effects/fx.zig", "const t = .{ .catalog = \"dot_MISSING\" };\n" },
+        // Generated from the flow later in generate: skipped.
+        .{ "scripts/flows/intro.zig", "const t = .{ .catalog = \"stale_MISSING\" };\n" },
+        .{ "scripts/flows/intro.flow.jsonc", "{}\n" },
+    });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const game_dir = try tmp.dir.realPathFileAlloc(config.globalIo(), ".", arena.allocator());
+    const findings = try ck.check(arena.allocator(), game_dir, &test_resources);
+    try testing.expectEqual(@as(usize, 2), findings.len);
+    try testing.expectEqualStrings("scripts/.effects/fx.zig", findings[0].file);
+    try testing.expectEqualStrings("dot_MISSING", findings[0].key);
+    try testing.expectEqualStrings("components/water_shader.zig", findings[1].file);
+    try testing.expectEqualStrings("WaterShader", findings[1].site.unknown_field.component);
+    try testing.expectEqualStrings("maks", findings[1].key);
+    try testing.expectEqual(@as(usize, 2), findings[1].line);
 }
 
 test "check: typo'd keys in a script literal and a prefab field are both reported" {
