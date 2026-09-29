@@ -147,7 +147,7 @@ seconds with `LABELLE_FIXED_DT=0.016666667` for deterministic comparison.
   driven by the test with `LABELLE_FIXED_DT`). A negative control corrupts the
   water shader source and must be caught by the same instrumentation.
   `--native .test-output/runtime/default.png` also compares frame 120 with
-  the native capture (Windows/Vulkan: mean channel error 0.087, 6 of 407,880
+  the native capture (Windows/Vulkan: mean channel error 0.032, 6 of 407,880
   pixels off by more than 8, none by more than 32). CI runs it in
   `.github/workflows/condenser-webgl2.yml`.
 - `python tools/verify_runtime.py`: **16 actual native runs** (macOS/Metal and

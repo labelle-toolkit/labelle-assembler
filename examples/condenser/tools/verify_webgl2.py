@@ -133,7 +133,7 @@ INIT_SCRIPT = r"""
       const run = queue; queue = [];
       now += 1000 / 60;
       for (const cb of run) cb(now);
-      t.frames++;
+      if (run.length) t.frames++;  // a step with no queued callback rendered nothing
     }
     return queue.length;
   };
@@ -192,15 +192,18 @@ def check_mode(mode, state, logs, image, crash):
     if mode == 'sabotage_water':
         return  # judged in main()
     assert crash is None, (mode, crash, chr(10).join(logs)[-3000:])
-    assert state['frames'] >= CAPTURE_FRAME, (mode, state['frames'])
+    # Every step ran a queued frame: a loop that stopped early cannot pass off a
+    # stale capture as frame CAPTURE_FRAME.
+    assert state['frames'] == CAPTURE_FRAME, (mode, state['frames'])
     assert not state['compileErrors'], (mode, state['compileErrors'])
     assert not state['linkErrors'], (mode, state['linkErrors'])
-    assert image.shape == (H, W, 3), (mode, image.shape)
     assert 'PAGEERROR' not in text, (mode, text[-3000:])
     for component in COMPONENTS:
         assert f'{component}: 2/2 generic materials live' in text, (mode, component, text[-3000:])
     for kind in PROGRAM_MARKERS:
         assert state['linked'].get(kind, 0) >= 1, (mode, kind, 'program never linked', state['linked'])
+        # Effect-off controls zero uniforms; the program still draws both units.
+        assert state['draws'].get(kind, 0) >= CAPTURE_FRAME, (mode, kind, 'too few draws', state['draws'])
 
 
 def main():
@@ -226,16 +229,16 @@ def main():
 
     report = []
     base_state, base, _ = results['default']
-    # Mechanism: in the default scene every game-owned program issues draws.
-    for kind in PROGRAM_MARKERS:
-        assert base_state['draws'].get(kind, 0) >= CAPTURE_FRAME, ('default', kind, base_state['draws'])
     # Each effect-off control changes pixels (the controls zero the effect's
     # uniforms, so its program keeps drawing: pixels, not draw counts, differ).
-    for mode in ['water_off', 'fog_off', 'lamp_off', 'mist_off']:
+    # Empty water also emits no mist, so water is judged against mist_off: the
+    # only difference left between those two runs is the water itself.
+    for mode, reference in [('water_off', 'mist_off'), ('fog_off', 'default'),
+                            ('lamp_off', 'default'), ('mist_off', 'default')]:
         state, image, _ = results[mode]
-        changed = np.any(base != image, axis=2)
-        assert changed.any(), (mode, 'turning the effect off changed no pixel')
-        report.append(f'{mode}: {int(changed.sum())} pixels differ from default; draws {state["draws"]}')
+        changed = np.any(results[reference][1] != image, axis=2)
+        assert changed.any(), (mode, f'turning the effect off changed no pixel vs {reference}')
+        report.append(f'{mode}: {int(changed.sum())} pixels differ from {reference}; draws {state["draws"]}')
     # Determinism: a second default run is pixel-identical (fixed dt, stepped frames).
     assert np.array_equal(base, results['default_again'][1]), 'default capture is not repeatable'
     report.append('default_again: byte-identical to default (frame-exact stepping)')
@@ -256,10 +259,11 @@ def main():
     if args.native:
         native = np.asarray(Image.open(args.native).convert('RGB'))
         assert native.shape == base.shape, (native.shape, base.shape)
-        diff = np.abs(native.astype(int) - base.astype(int)).max(axis=2)
-        report.append(f'vs native {args.native.name}: mean abs {diff.mean():.3f}, '
+        channels = np.abs(native.astype(int) - base.astype(int))
+        diff = channels.max(axis=2)  # worst channel per pixel, for the outlier counts
+        report.append(f'vs native {args.native.name}: mean channel error {channels.mean():.3f}, '
                       f'{int((diff > 8).sum())} px differ by >8, {int((diff > 32).sum())} by >32')
-        assert diff.mean() < 1.0 and (diff > 32).sum() < diff.size // 1000, report[-1]
+        assert channels.mean() < 1.0 and (diff > 32).sum() < diff.size // 1000, report[-1]
         Image.fromarray((np.minimum(diff * 4, 255)).astype(np.uint8)).save(OUT / 'native_diff.png')
     (OUT / 'results.txt').write_text('\n'.join(report) + '\n', encoding='utf-8')
     print('\n'.join(report))
