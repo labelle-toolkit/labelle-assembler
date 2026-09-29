@@ -8,8 +8,11 @@
     .backend = .bgfx,
     // Released game-shader-material stack (docs/shader-migration.md "Release
     // sequence" step 6): bgfx 0.21.0 is the first contract-v2 backend and
-    // requires core >= 2.0.0, so these four pins move together.
-    .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.22.0" },
+    // requires core >= 2.0.0, so these four pins move together. 0.25.2 is the
+    // first release that runs on the web: 0.22.0 fails to compile for wasm32
+    // (bgfx#115, fixed in 0.22.1) and up to 0.25.1 the material registry
+    // corrupts the emscripten heap on the first shader material (bgfx#136).
+    .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.25.2" },
     .y_axis = .down,
     .ecs = .zig_ecs,
     .initial_prefab = "main",
@@ -46,6 +49,9 @@
     .core_version = "2.0.0",
     .engine_version = "3.0.0",
     .gfx_version = "2.0.0",
-    .labelle_version = "1.67.0",
+    .labelle_version = "3.0.0",
     .assembler_version = "local:../../",
+    .plugins = .{
+        .{ .name = "web", .repo = "github.com/labelle-toolkit/labelle-web", .version = "0.3.2" },
+    },
 }

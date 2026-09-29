@@ -13,8 +13,10 @@ lay a second haze over the original plate.
 ## Dependencies
 
 `project.labelle` pins the released game-shader-material stack: core 2.0.0,
-gfx 2.0.0, engine 3.0.0 and the bgfx backend 0.21.0 (the first contract-v2
-backend; it requires core >= 2.0.0, so the four pins move together). Only the
+gfx 2.0.0, engine 3.0.0 and the bgfx backend 0.25.2 (contract v2, core >= 2.0.0;
+0.25.2 is the first release whose game-owned materials run on the web — see the
+comment on the pin). The `web` provider (labelle-web 0.3.2) is pinned in
+`.plugins` and `labelle.providers.lock` for the `wasm` target. Only the
 assembler is still selected as `local:../../`, like every example in this
 repository. To develop against unreleased sibling checkouts instead, switch the
 four pins to `local:../../../labelle-{core,gfx,engine,bgfx}` and regenerate.
@@ -135,6 +137,19 @@ seconds with `LABELLE_FIXED_DT=0.016666667` for deterministic comparison.
 - `python tools/verify_water_edges.py`: **13 native runs** covering the water
   edge cases of issue #734 — motion and brim coverage at `water_level = 1.0`,
   and an empty ripple window contributing nothing at age zero.
+- `python tools/verify_webgl2.py`: the same four game-owned materials under
+  **WebGL2** (headless Chromium via Playwright, SwiftShader), after
+  `labelle build --platform=wasm` (labelle CLI 3.0.0). The WebGL API is
+  instrumented: each of the water/fog/lamp/mist programs must compile, link
+  and issue draws, the engine must report every material live, each effect-off
+  control must change the frame, the left-only hook must leave the right unit
+  byte-identical, and a repeated run must be byte-identical (frame stepping is
+  driven by the test with `LABELLE_FIXED_DT`). A negative control corrupts the
+  water shader source and must be caught by the same instrumentation.
+  `--native .test-output/runtime/default.png` also compares frame 120 with
+  the native capture (Windows/Vulkan: mean channel error 0.087, 6 of 407,880
+  pixels off by more than 8, none by more than 32). CI runs it in
+  `.github/workflows/condenser-webgl2.yml`.
 - `python tools/verify_runtime.py`: **16 actual native runs** (macOS/Metal and
   Windows/Vulkan), eight live generic
   materials each, fixed-step captures, frame-60 left-only edits, zero width and
@@ -142,8 +157,8 @@ seconds with `LABELLE_FIXED_DT=0.016666667` for deterministic comparison.
 
 Windows/Vulkan runtime checks pass. The right 618x330 half is byte-identical
 across every left-control run. Results, logs and captures are under
-`.test-output/runtime/`; the directory is ignored. Other shader targets compile
-but have not been executed here. `preview.png` is the current native capture.
+`.test-output/runtime/`; the directory is ignored. WebGL2 (ESSL) runs too
+(`tools/verify_webgl2.py`); desktop GL compiles but has not been executed here. `preview.png` is the current native capture.
 
 Mist verification also checks clipping above each live water surface, empty
 reservoir suppression, zero opacity, moving versus frozen wisps, and a left-only
