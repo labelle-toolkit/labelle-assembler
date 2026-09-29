@@ -73,6 +73,8 @@ test {
     // main.zig code a test build never analyzes, so its tests need this.
     _ = @import("gui_resolve.zig");
     _ = @import("zon_escape.zig");
+    _ = @import("write_if_changed.zig"); // #674
+    _ = @import("deps_sync.zig"); // #674
     _ = @import("junction.zig");
     _ = @import("plugin_manifest.zig");
     _ = @import("plugin_build_hook.zig");
@@ -90,9 +92,11 @@ test {
     _ = @import("scene_name_lint.zig");
     _ = @import("scene_manifest.zig");
     _ = @import("scene_manifest_test.zig");
+    _ = @import("scene_keys_test.zig"); // #651/#652 key classification
     _ = @import("scene_override_check.zig");
     _ = @import("tilemap_scan_test.zig"); // covers tilemap_scan + tilemap_scene_scan
     _ = @import("asset_validator.zig");
+    _ = @import("catalog_key_check.zig");
     _ = @import("pack_resources.zig");
     _ = @import("language_policy.zig");
     _ = @import("plugin_params.zig");
@@ -209,6 +213,7 @@ pub const emitWindowIcon = @import("codegen/lifecycle/loop.zig").emitWindowIcon;
 pub const emitSystemLocale = @import("codegen/lifecycle/loop.zig").emitSystemLocale;
 pub const BuildZigOptions = build_files.BuildZigOptions;
 pub const generateBuildZigZon = build_files.generateBuildZigZon;
+pub const MINIMUM_ZIG_VERSION = build_files.MINIMUM_ZIG_VERSION;
 pub const deps_linker = build_files.deps_linker;
 // Stages the v2 backend build hook next to the generated build.zig
 // (`backend_build_hook.zig`) so the generated `@import` resolves — see the fn
@@ -856,7 +861,10 @@ pub fn generate(
     // at generate instead. Covers scenes AND prefabs (a prefab body can
     // use `@` on its own ref-array entries). Unparseable pins (`local:`
     // dev overrides, branch pins) pass — see
-    // `engineSupportsTargetOverrides`.
+    // `engineSupportsTargetOverrides`. Flat pack-namespaced component keys
+    // (engine#806, labelle-assembler#652) shipped in the same engine
+    // release and are dropped the same way, so the gate covers them too
+    // (`sourceNeedsV211Keys`).
     if (!scene_manifest.engineSupportsTargetOverrides(cfg.engine_version)) {
         const prefabs_target = try std.fs.path.join(allocator, &.{ target_dir, "prefabs" });
         defer allocator.free(prefabs_target);
@@ -884,9 +892,9 @@ pub fn generate(
         if (hit) |offender| {
             defer allocator.free(offender);
             std.debug.print(
-                "labelle-assembler: '{s}' uses \"@<ref>\" target-override keys (labelle-engine#801), but the pinned engine v{s} predates them (needs >= v{s}).\n" ++
-                    "  An older engine silently DROPS `@` keys — the exact failure this syntax replaces.\n" ++
-                    "  Bump `engine_version` in project.labelle, or remove the `@` overrides.\n",
+                "labelle-assembler: '{s}' uses \"@<ref>\" target-override keys (labelle-engine#801) or flat \"<pack>__Pascal\" component keys (labelle-engine#806), but the pinned engine v{s} predates them (needs >= v{s}).\n" ++
+                    "  An older engine silently DROPS those keys — the exact failure this syntax replaces.\n" ++
+                    "  Bump `engine_version` in project.labelle, or remove the `@` overrides / move namespaced keys into a \"components\"/\"overrides\" wrapper.\n",
                 .{ offender, cfg.engine_version, scene_manifest.MIN_ENGINE_FOR_TARGET_OVERRIDES },
             );
             return error.EngineTooOldForTargetOverrides;
@@ -947,6 +955,13 @@ pub fn generate(
     // source before the copy or it survives in the staged target (codex
     // #639 review).
     try flow_scanner.pruneStaleSidecars(allocator, game_dir);
+
+    // Reject static asset-catalog keys (`.catalog = "<key>"` literals and
+    // component fields listed in `catalog_keys`) that no resource
+    // registers; otherwise the typo only surfaces on the device as
+    // `AssetNotRegistered` (#738). Same merged game + pack resource list.
+    // After the sidecar prune, so a stale flow sidecar can't fail it.
+    try @import("catalog_key_check.zig").validate(allocator, game_dir, cfg.resources);
 
     try scanner.linkDir(allocator, game_dir, target_dir, "scripts");
 
@@ -1250,6 +1265,33 @@ pub fn generate(
         pack_scans.deinit(allocator);
     }
 
+    // Flat namespaced keys in pack prefabs (engine#806) are gated on the
+    // STAGED, rewritten copies: pack rewrite pass 1 wraps any entity that
+    // declares a pack-local component, and a wrapped key loads on every
+    // engine. Only keys still flat after that would be dropped by an
+    // engine older than v2.11.0 (codex on #798).
+    if (!scene_manifest.engineSupportsTargetOverrides(cfg.engine_version)) {
+        // Prefabs only: a pack's other staged `.jsonc` (locales, …) is not
+        // entity data.
+        var flat_hit: ?[]const u8 = null;
+        for (pack_scans.items) |ps| {
+            const staged_prefabs = try std.fs.path.join(allocator, &.{ target_dir, "packs", ps.name, "prefabs" });
+            defer allocator.free(staged_prefabs);
+            flat_hit = try scene_manifest.findFlatNamespacedKeyUsageInTree(allocator, staged_prefabs);
+            if (flat_hit != null) break;
+        }
+        if (flat_hit) |offender| {
+            defer allocator.free(offender);
+            std.debug.print(
+                "labelle-assembler: '{s}' uses flat \"<pack>__Pascal\" component keys (labelle-engine#806), but the pinned engine v{s} predates them (needs >= v{s}).\n" ++
+                    "  An older engine silently DROPS those keys.\n" ++
+                    "  Bump `engine_version` in project.labelle, or move the namespaced keys into a \"components\"/\"overrides\" wrapper.\n",
+                .{ offender, cfg.engine_version, scene_manifest.MIN_ENGINE_FOR_TARGET_OVERRIDES },
+            );
+            return error.EngineTooOldForTargetOverrides;
+        }
+    }
+
     // ── Asset-Plugins Phase 1: copy + namespace + validate pack assets ──
     // Runs AFTER `loadPackScans` copied each pack's convention dirs (its
     // prefabs are now under `<target>/packs/<pack>/prefabs/`). For every pack
@@ -1403,10 +1445,16 @@ pub fn generate(
     // Generate build.zig.zon
     // `cfg_modules` (not `cfg`): a light pack has no `build.zig`/module, so it
     // must not become a `.labelle_<name> = .{ .path }` dep (#481).
+    // The tests target stages its own backend package (`testsTargetConfig`
+    // swaps in `.null`); the exe pass must not sweep it, or every generate
+    // would delete it and the tests pass re-stage it (#674).
+    const tests_backend_link = try std.fmt.allocPrint(allocator, "labelle-{s}", .{testsTargetConfig(cfg).backendName()});
+    defer allocator.free(tests_backend_link);
     const zon = try build_files.generateBuildZigZon(allocator, cfg_modules, target_dir, output_dir, game_dir, .{
         // The tests target runs second — additive merge so the exe
         // target's deps (chosen-backend, plugins) survive. Issue #83.
-        .recreate_deps = !is_tests_target,
+        .prune_deps = !is_tests_target,
+        .keep_deps = &.{tests_backend_link},
         .materials = material_names.len != 0,
         .material_toolchain = material_toolchain,
         // manifest-v2 cutover: when the backend ships a v2 manifest, key the

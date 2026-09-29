@@ -9,7 +9,7 @@
     .fingerprint = 0x{{hash}},
     .name = .generated_game,
     .version = "{{version}}",
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "{{min_zig}}",
     .dependencies = .{
 
 .dep_core_path

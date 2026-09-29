@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "registry": "https://raw.githubusercontent.com/labelle-toolkit/labelle-registry/main/providers.json",
+  "providers": [
+    {
+      "package": "web",
+      "repo": "labelle-toolkit/labelle-web",
+      "version": "0.3.2",
+      "commit": "7552d17211f8734940de963752f0a3065295cd90",
+      "sha256": "7ae7cfce0de6ee36173add831ad982e3a1eab5942e51b40ae2a62248c4c9923e"
+    }
+  ]
+}

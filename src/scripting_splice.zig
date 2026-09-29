@@ -47,6 +47,7 @@
 //! nothing embeds.
 
 const std = @import("std");
+const write_if_changed = @import("write_if_changed.zig");
 const cache = @import("cache.zig");
 const config = @import("config.zig");
 const language_policy = @import("language_policy.zig");
@@ -1763,7 +1764,7 @@ pub fn freeEmbedScripts(allocator: std.mem.Allocator, scripts: []EmbedScript) vo
 /// the modules `mod.rs` reachably declares, and the crate's Cargo.toml
 /// lives in the plugin's `native/`, not the game dir. Idempotent: the
 /// primitive's correct-link no-op also serves the tests-target pass,
-/// whose deps tree is NOT re-staged (`recreate_deps = false`).
+/// whose deps pass never sweeps (`prune_deps = false`).
 pub fn stageNativeSources(
     allocator: std.mem.Allocator,
     game_dir: []const u8,
@@ -1912,7 +1913,7 @@ pub fn emitCsharpDevProject(
     defer allocator.free(name);
     const path = try std.fs.path.join(allocator, &.{ game_dir, name });
     defer allocator.free(path);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body });
+    _ = try write_if_changed.writeIfChanged(io, std.Io.Dir.cwd(), path, body); // #674
 }
 
 /// The dev `.csproj` bytes (see `emitCsharpDevProject`). `plugin_src_rel` is the

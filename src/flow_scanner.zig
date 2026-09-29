@@ -28,6 +28,7 @@
 //! diagnostics as logged-error test failures.
 
 const std = @import("std");
+const write_if_changed = @import("write_if_changed.zig");
 const flow_codegen = @import("flow_codegen");
 const script_scanner = @import("script_scanner.zig");
 const scanner = @import("scanner.zig");
@@ -302,7 +303,7 @@ pub fn scanAndEmit(
             try std.Io.Dir.cwd().createDirPath(io, parent);
         }
 
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dst_path, .data = generated });
+        _ = try write_if_changed.writeIfChanged(io, std.Io.Dir.cwd(), dst_path, generated); // #674
 
         // Flows aren't state-gated in v1 — they always run. Match the
         // global-script shape (`states = &.{}`, `subdir = null`) so

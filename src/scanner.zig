@@ -1,5 +1,6 @@
 /// File scanning and directory copy utilities for the labelle-cli generator.
 const std = @import("std");
+const write_if_changed = @import("write_if_changed.zig");
 const config = @import("config.zig");
 const junction = @import("junction.zig");
 
@@ -154,7 +155,7 @@ pub fn copyAndScan(allocator: std.mem.Allocator, src_base: []const u8, dst_base:
         names.deinit(allocator);
     }
 
-    try copyAndScanRecursive(allocator, cwd, src_path, dst_path, "", ext, &names);
+    try copyAndScanRecursive(allocator, cwd, src_path, dst_path, "", ext, true, &names);
 
     std.mem.sort([]const u8, names.items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {
@@ -188,6 +189,7 @@ fn copyAndScanRecursive(
     dst_path: []const u8,
     prefix: []const u8,
     ext: []const u8,
+    write_matching: bool,
     names: *std.ArrayList([]const u8),
 ) !void {
     const io = config.globalIo();
@@ -216,12 +218,14 @@ fn copyAndScanRecursive(
 
         switch (entry.kind) {
             .file => {
-                // Copy file
-                const content = try src_dir.readFileAlloc(io, entry.name, allocator, .limited(1024 * 1024));
-                defer allocator.free(content);
-                const out_file = try dst_dir.createFile(io, entry.name, .{});
-                defer out_file.close(io);
-                try out_file.writeStreamingAll(io, content);
+                const matches = std.mem.endsWith(u8, entry.name, ext);
+                if (write_matching or !matches) {
+                    const content = try src_dir.readFileAlloc(io, entry.name, allocator, .limited(1024 * 1024));
+                    defer allocator.free(content);
+                    // Write-if-changed (#674): an unchanged source leaves the
+                    // mirrored copy's mtime alone.
+                    _ = try write_if_changed.writeIfChanged(io, dst_dir, entry.name, content);
+                }
 
                 try written.append(allocator, try allocator.dupe(u8, entry.name));
 
@@ -251,7 +255,7 @@ fn copyAndScanRecursive(
                 else
                     try allocator.dupe(u8, entry.name);
                 defer allocator.free(sub_prefix);
-                try copyAndScanRecursive(allocator, cwd, sub_src, sub_dst, sub_prefix, ext, names);
+                try copyAndScanRecursive(allocator, cwd, sub_src, sub_dst, sub_prefix, ext, write_matching, names);
 
                 try written.append(allocator, try allocator.dupe(u8, entry.name));
             },
@@ -314,9 +318,9 @@ pub fn writeFile(dir_path: []const u8, filename: []const u8, content: []const u8
     const cwd = std.Io.Dir.cwd();
     var dir = try cwd.openDir(io, dir_path, .{});
     defer dir.close(io);
-    const file = try dir.createFile(io, filename, .{});
-    defer file.close(io);
-    try file.writeStreamingAll(io, content);
+    // Write-if-changed (#674): identical bytes keep the file's mtime, so a
+    // regenerate with unchanged inputs doesn't dirty Zig's cache / `--watch`.
+    _ = try write_if_changed.writeIfChanged(io, dir, filename, content);
 }
 
 /// Mirror files from `src_dir` to `dst_dir` (recursively) and return sorted
@@ -332,6 +336,16 @@ pub fn writeFile(dir_path: []const u8, filename: []const u8, content: []const u8
 /// a last segment, so `copyAndScan(src_base, dst_base, "scripts", ".zig")`
 /// can't express the shape. This helper splits the concerns cleanly.
 pub fn copyAndScanAbs(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []const u8, ext: []const u8) ![][]const u8 {
+    return copyAndScanAbsOpts(allocator, src_dir, dst_dir, ext, true);
+}
+
+/// `copyAndScanAbs`, except that with `write_matching = false` the files
+/// matching `ext` are only SCANNED (stem collected, dest subdirs created, kept
+/// out of the orphan sweep) and not written. For a caller that materializes
+/// those files itself from the source — the pack rewrites (`pack_scan`), which
+/// write the namespaced form. Copying first and rewriting after would rewrite
+/// every such file twice per generate, moving its mtime every run (#674).
+pub fn copyAndScanAbsOpts(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []const u8, ext: []const u8, write_matching: bool) ![][]const u8 {
     const cwd = std.Io.Dir.cwd();
 
     var names: std.ArrayList([]const u8) = .empty;
@@ -340,7 +354,7 @@ pub fn copyAndScanAbs(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir
         names.deinit(allocator);
     }
 
-    try copyAndScanRecursive(allocator, cwd, src_dir, dst_dir, "", ext, &names);
+    try copyAndScanRecursive(allocator, cwd, src_dir, dst_dir, "", ext, write_matching, &names);
 
     std.mem.sort([]const u8, names.items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {
@@ -376,10 +390,7 @@ pub fn copyDir(allocator: std.mem.Allocator, src_base: []const u8, dst_base: []c
 
         const content = try src_dir.readFileAlloc(io, entry.name, allocator, .limited(1024 * 1024));
         defer allocator.free(content);
-
-        const out_file = try dst_dir.createFile(io, entry.name, .{});
-        defer out_file.close(io);
-        try out_file.writeStreamingAll(io, content);
+        _ = try write_if_changed.writeIfChanged(io, dst_dir, entry.name, content); // #674
     }
 }
 
@@ -678,6 +689,9 @@ pub fn copyDirRecursiveAbs(allocator: std.mem.Allocator, src_path: []const u8, d
                 defer dst_dir.close(io);
                 // Streaming copy: no size cap and no whole-file allocation
                 // (assets routinely exceed any fixed readFileAlloc limit).
+                // Skipped when the copy is already current (#674): an
+                // unchanged asset keeps its identity and mtime.
+                if (write_if_changed.sameFiles(io, src_dir, entry.name, dst_dir, entry.name)) continue;
                 try src_dir.copyFile(entry.name, dst_dir, entry.name, io, .{});
             },
             .directory => {

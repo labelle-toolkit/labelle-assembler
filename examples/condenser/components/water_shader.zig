@@ -2,6 +2,9 @@
 const std = @import("std");
 pub const WaterShader = struct {
     pub const save = @import("labelle-core").Saveable(.transient, @This(), .{});
+    /// Fields holding asset-catalog keys; `labelle generate` checks every
+    /// prefab/scene value of these against the registered resources (#738).
+    pub const catalog_keys = .{ "mask", "reflection" };
     enabled: bool = true,
     mask: []const u8 = "reservoir_mask",
     reflection: []const u8 = "reservoir_reflection",

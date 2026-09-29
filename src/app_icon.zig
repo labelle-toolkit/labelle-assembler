@@ -11,6 +11,7 @@
 /// the default entirely — no behavior change for games that already
 /// ship their own icon assets.
 const std = @import("std");
+const write_if_changed = @import("write_if_changed.zig");
 const config = @import("config.zig");
 const ico = @import("ico.zig");
 
@@ -100,7 +101,7 @@ pub fn injectDefaultIcon(allocator: std.mem.Allocator, cfg: ProjectConfig, targe
 
     // Plain (non-exclusive) write: regenerating an existing target must
     // refresh the default icon rather than fail on a stale copy.
-    try cwd.writeFile(io, .{ .sub_path = icon_path, .data = default_icon_bytes });
+    _ = try write_if_changed.writeIfChanged(io, cwd, icon_path, default_icon_bytes); // #674: keep mtime when unchanged
 }
 
 // ── Desktop icon artifacts (labelle-cli#359) ─────────────────────────
@@ -181,7 +182,7 @@ pub fn writeDesktopIconArtifacts(allocator: std.mem.Allocator, cfg: ProjectConfi
     const custom_path = try std.fs.path.join(allocator, &.{ target_dir, custom_icon_rel_path });
     defer allocator.free(custom_path);
     if (hasOwnIcon(cfg)) {
-        try cwd.writeFile(io, .{ .sub_path = custom_path, .data = png });
+        _ = try write_if_changed.writeIfChanged(io, cwd, custom_path, png); // #674: keep mtime when unchanged
     } else {
         cwd.deleteFile(io, custom_path) catch |err| switch (err) {
             error.FileNotFound => {},
@@ -229,11 +230,11 @@ pub fn writeDesktopIconArtifacts(allocator: std.mem.Allocator, cfg: ProjectConfi
 
     const ico_path = try std.fs.path.join(allocator, &.{ target_dir, windows_ico_rel_path });
     defer allocator.free(ico_path);
-    try cwd.writeFile(io, .{ .sub_path = ico_path, .data = ico_bytes });
+    _ = try write_if_changed.writeIfChanged(io, cwd, ico_path, ico_bytes); // #674: keep mtime when unchanged
 
     const rc_path = try std.fs.path.join(allocator, &.{ target_dir, windows_rc_rel_path });
     defer allocator.free(rc_path);
-    try cwd.writeFile(io, .{ .sub_path = rc_path, .data = windows_rc_source });
+    _ = try write_if_changed.writeIfChanged(io, cwd, rc_path, windows_rc_source); // #674: keep mtime when unchanged
 }
 
 test "effectiveIconPath: falls back to the bundled default when unset" {

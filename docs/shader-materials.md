@@ -43,6 +43,32 @@ declared as a STANDALONE `.{ .name = ..., .image = "..." }` resource in
 carries the same constraint the retired built-in water effect had; budget the
 extra standalone PNGs when migrating.
 
+### Unregistered keys fail `generate`
+
+`labelle generate` checks static catalog keys against the registered
+resources (project `.resources` plus namespaced `<pack>__<name>` pack entries)
+and fails with the file, line, authoring site and closest registered key
+(`error.UnregisteredCatalogKey`, #738). It checks:
+
+- every `.catalog = "<key>"` string literal in `scripts/` and `components/`;
+- every prefab/scene value, and the string default, of a component field listed in that component's
+  `catalog_keys` declaration:
+
+```zig
+pub const WaterShader = struct {
+    pub const catalog_keys = .{ "mask", "reflection" };
+    mask: []const u8 = "reservoir_mask",
+    reflection: []const u8 = "reservoir_reflection",
+};
+```
+
+A key the game registers from code (the leading string literal of an
+`assets.register("<key>", ...)` or `register...FromMemory("<key>", ...)` call
+in `scripts/` or `components/`) counts as registered. A `catalog_keys` entry
+that names no field of the component fails `generate` too. A key computed at
+runtime (`.catalog = w.mask`) is not checked here; it still reports
+`AssetNotRegistered` at runtime. Pack sources are not scanned yet (#803).
+
 A binding that is registered but not yet resident returns `error.TextureNotReady`
 (streaming) or `error.AssetLoadFailed`; retry, do not treat either as fatal.
 Textures are sampled in the sprite's own UV space, so a mask normally spans

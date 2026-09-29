@@ -17,6 +17,7 @@
 //! Phase 3: packs ship their own constants, namespaced <pack>__<file>, and
 //! the game overrides them by filename -- see runPhase.
 const std = @import("std");
+const write_if_changed = @import("write_if_changed.zig");
 const Allocator = std.mem.Allocator;
 const yaml = @import("constants_yaml.zig");
 const usage = @import("usage_scan.zig");
@@ -235,7 +236,7 @@ pub fn runPhase(
     if (had_error) return error.ConstantsInvalid;
 
     const dst = try std.fs.path.join(arena, &.{ target_dir, GENERATED_FILENAME });
-    try cwd.writeFile(io, .{ .sub_path = dst, .data = out.writer.buffered() });
+    _ = try write_if_changed.writeIfChanged(io, cwd, dst, out.writer.buffered()); // #674
 
     // Phase 2: usage warnings. Never fails the build -- a warning that can be
     // wrong teaches people to ignore it, so the scan errs toward "used" and
