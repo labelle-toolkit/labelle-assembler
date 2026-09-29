@@ -301,6 +301,10 @@ pub fn createDepsLinks(
         cwd.access(io, abs, .{}) catch |err| switch (err) {
             error.FileNotFound => {
                 std.log.warn("could not link dep '{s}': source '{s}' does not exist — skipping", .{ dep.link_name, abs });
+                // Drop a stage left by an earlier generate: the zon still
+                // points here, and a stale tree would build silently instead
+                // of zig reporting the missing package (#674).
+                try cwd.deleteTree(io, dest);
                 continue;
             },
             else => return err,

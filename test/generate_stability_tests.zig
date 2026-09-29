@@ -183,6 +183,18 @@ pub const DEPS_NOT_WIPED = struct {
         try std.testing.expect(ws.exists("out/deps/labelle-dropped/build.zig"));
     }
 
+    test "a staged package whose source vanished is removed, not left to build silently" {
+        var ws = try Workspace.init();
+        defer ws.deinit();
+        const cfg = try ws.config();
+        try ws.link(cfg, .{});
+        try std.testing.expect(ws.exists("out/deps/labelle-fsm/build.zig"));
+
+        try ws.tmp.dir.deleteTree(io, "plugins/fsm");
+        try ws.link(cfg, .{});
+        try std.testing.expect(!ws.exists("out/deps/labelle-fsm"));
+    }
+
     test "a changed source file reaches the stage; its unchanged siblings keep their identity" {
         var ws = try Workspace.init();
         defer ws.deinit();

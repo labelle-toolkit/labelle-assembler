@@ -18,19 +18,18 @@
 //!     would re-fetch on every generate. The old wipe-and-relink staging never
 //!     copied them, so no stale copy of one exists to clean up.
 //!
-//! Two deliberate exceptions keep other generate phases' work stable:
+//! `preserve_top_zon`: a local package's top-level `build.zig.zon` is
+//! re-written by `deps_linker` (relative `.path` deps re-anchored for the deps
+//! location), so an EXISTING dest zon is left for that step to reconcile —
+//! syncing it back to the source bytes would make the rewrite churn it on
+//! every run. A missing one is linked like any file.
 //!
-//!   * `preserve_top_zon`: a local package's top-level `build.zig.zon` is
-//!     re-written by `deps_linker` (relative `.path` deps re-anchored for the
-//!     deps location), so an EXISTING dest zon is left for that step to
-//!     reconcile — syncing it back to the source bytes would make the rewrite
-//!     churn it on every run. A missing one is linked like any file.
-//!   * a dest LINK (symlink / junction) standing where the source has a
-//!     DIRECTORY is an overlay another phase placed on purpose —
-//!     `scripting_splice.stageNativeSources` links the game's sources over the
-//!     plugin's placeholder crate dir. It is kept, and never descended into:
-//!     recursing through it would mirror the placeholder into (and prune) the
-//!     game's own source tree.
+//! A dest LINK (symlink / junction) where the source has a DIRECTORY — the
+//! overlay `scripting_splice.stageNativeSources` places over the plugin's
+//! placeholder crate dir — is unlinked (never followed or descended into) and
+//! the source dir mirrored back. That phase re-places its link right after
+//! whenever the game still has native sources; when it no longer does, the
+//! restored placeholder is exactly what the build needs.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -104,12 +103,13 @@ fn syncDir(allocator: std.mem.Allocator, src_path: []const u8, dest_path: []cons
 
         switch (entry.kind) {
             .directory => {
+                // A link (overlay) or a file where the source has a dir:
+                // remove it — `removeEntry` unlinks, never follows.
                 if (isLink(dest_sub)) {
-                    // Overlay placed by another phase — keep, never descend.
-                    stats.kept += 1;
-                    continue;
+                    try removeEntry(dest_sub);
+                } else if (destKind(dest_sub)) |k| {
+                    if (k != .directory) try removeEntry(dest_sub);
                 }
-                if (destKind(dest_sub)) |k| if (k != .directory) try removeEntry(dest_sub);
                 try syncDir(allocator, src_sub, dest_sub, opts, false, stats);
             },
             .file => {
@@ -201,10 +201,15 @@ fn destKind(path: []const u8) ?std.Io.File.Kind {
     return st.kind;
 }
 
-/// True when `dest` needs no work: it is the source file itself (hardlink:
-/// same inode, size and mtime — the size/mtime check guards a coincidental
-/// inode match across two filesystems) or a regular file with the same bytes
-/// (the copy fallback).
+/// True when `dest` needs no work:
+///   * it IS the source file (hardlink: same inode, size and mtime — the
+///     size/mtime check guards a coincidental inode match across two
+///     filesystems); or
+///   * it is a standalone copy (`nlink == 1`: the copy fallback) with the
+///     same bytes and permissions.
+/// A dest hardlinked to some OTHER file (`nlink > 1`, different inode — e.g.
+/// the pin moved to another checkout with identical bytes) is relinked, so
+/// the stage tracks the currently resolved source, not the old tree.
 fn fileUpToDate(src: []const u8, dest: []const u8) bool {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
@@ -213,6 +218,8 @@ fn fileUpToDate(src: []const u8, dest: []const u8) bool {
     const ss = cwd.statFile(io, src, .{}) catch return false;
     if (ss.size != ds.size) return false;
     if (ss.inode == ds.inode and ss.mtime.nanoseconds == ds.mtime.nanoseconds) return true;
+    if (ds.nlink != 1) return false;
+    if (!std.meta.eql(ss.permissions, ds.permissions)) return false;
     return write_if_changed.sameFiles(io, cwd, src, cwd, dest);
 }
 
@@ -360,6 +367,56 @@ test "syncTree: preserve_top_zon keeps an existing (rewritten) dest zon, links a
     const s2 = try fx.sync(.{});
     try testing.expectEqual(@as(usize, 1), s2.linked);
     try testing.expectEqualStrings(".{}", try std.Io.Dir.cwd().readFile(testing.io, zon, &buf));
+}
+
+test "syncTree: a stage hardlinked to ANOTHER tree with identical bytes is relinked to the current source" {
+    // The pin moved to a different checkout whose files have the same bytes:
+    // byte equality must not keep the stage tied to the old tree.
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    _ = try fx.sync(.{});
+
+    try fx.tmp.dir.createDirPath(testing.io, "fork/src");
+    try fx.tmp.dir.writeFile(testing.io, .{ .sub_path = "fork/build.zig", .data = "// build" });
+    try fx.tmp.dir.writeFile(testing.io, .{ .sub_path = "fork/build.zig.zon", .data = ".{}" });
+    try fx.tmp.dir.writeFile(testing.io, .{ .sub_path = "fork/src/root.zig", .data = "pub const x = 1;" });
+    const fork = try fx.tmp.dir.realPathFileAlloc(testing.io, "fork", testing.allocator);
+    defer testing.allocator.free(fork);
+
+    var stats: Stats = .{};
+    try syncTree(testing.allocator, fork, fx.dest, .{}, &stats);
+    const staged = try fx.stat("src/root.zig");
+    const fork_file = try fx.tmp.dir.statFile(testing.io, "fork/src/root.zig", .{});
+    if (staged.nlink > 1) {
+        // Hardlinks available: every file now IS the fork's file.
+        try testing.expectEqual(@as(usize, 3), stats.linked);
+        try testing.expectEqual(fork_file.inode, staged.inode);
+    }
+}
+
+test "syncTree: a link overlay over a source dir is unlinked (never followed) and the dir restored" {
+    // `stageNativeSources` links the game's sources over the plugin's
+    // placeholder dir. When the game drops its native sources, the next sync
+    // must bring the placeholder back — and must not touch the link target.
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    _ = try fx.sync(.{});
+
+    try fx.tmp.dir.createDirPath(testing.io, "game/scripts");
+    try fx.tmp.dir.writeFile(testing.io, .{ .sub_path = "game/scripts/mod.rs", .data = "// game source" });
+    const game_scripts = try fx.tmp.dir.realPathFileAlloc(testing.io, "game/scripts", testing.allocator);
+    defer testing.allocator.free(game_scripts);
+    const overlay = try std.fs.path.join(testing.allocator, &.{ fx.dest, "src" });
+    defer testing.allocator.free(overlay);
+    try std.Io.Dir.cwd().deleteTree(testing.io, overlay);
+    std.Io.Dir.cwd().symLink(testing.io, game_scripts, overlay, .{ .is_directory = true }) catch return error.SkipZigTest;
+
+    _ = try fx.sync(.{});
+    try testing.expect(!isLink(overlay));
+    _ = try fx.stat("src/root.zig");
+    // The game's own file behind the old link is untouched.
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("// game source", try fx.tmp.dir.readFile(testing.io, "game/scripts/mod.rs", &buf));
 }
 
 test "syncTree: errors on missing source" {
