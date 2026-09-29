@@ -1485,11 +1485,20 @@ pub const ProjectConfig = struct {
             // engine 3.4.1 / gfx 2.2.0 in the same change, and
             // `version_floors.bgfx_core_floors` carries the 0.26.0 → 2.1.0
             // floor.
-            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.30.0" },
+            //
+            // 0.31.0 adds `window.systemLocale()` (labelle-bgfx#135), which
+            // the device-language startup resolution reads (#753), plus wasm
+            // emsdk fixes. Same core (2.1.0) / gfx (1.29.2) / labelle-android
+            // (0.2.0) pins and manifest as 0.30.0, so no `version_floors` entry.
+            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.31.0" },
             .wgpu => .{ .name = "wgpu", .repo = "github.com/labelle-toolkit/labelle-wgpu", .version = "0.3.0" },
             .null => .{ .name = "null", .repo = "github.com/labelle-toolkit/labelle-null", .version = "0.3.0" },
             .sdl => .{ .name = "sdl", .repo = "github.com/labelle-toolkit/labelle-sdl", .version = "0.3.1" },
-            .raylib => .{ .name = "raylib", .repo = "github.com/labelle-toolkit/labelle-raylib", .version = "0.3.0" },
+            // 0.3.1: a one-line "SDL2 not found" error instead of a linker
+            // failure, and an external EMSDK is honoured. Its build.zig.zon
+            // core pin moves 1.22.0 -> 1.26.0, below the scaffold core; same
+            // manifest as 0.3.0.
+            .raylib => .{ .name = "raylib", .repo = "github.com/labelle-toolkit/labelle-raylib", .version = "0.3.1" },
             // 0.2.1 declares the sokol callback lifecycle SHAPE in its v2
             // manifest (#461) — the assembler selects it from data instead of
             // the `cfg.backend == .sokol` enum branch.
@@ -1517,7 +1526,11 @@ pub const ProjectConfig = struct {
             // `labelle_android` when the project lists the `android` plugin
             // (cli#405 D11). Same core (1.32.0) / gfx (1.28.1) pins as 0.7.0,
             // so no `version_floors` entry. Needs assembler >= 0.116.1.
-            .sokol => .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.8.0" },
+            //
+            // 0.8.1 builds the iOS path again (simulator + device); its
+            // manifest drops the editor preview on iOS (`.preview = .none`).
+            // Same core/gfx pins and capabilities as 0.8.0.
+            .sokol => .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.8.1" },
         };
     }
 

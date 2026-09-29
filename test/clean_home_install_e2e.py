@@ -51,12 +51,12 @@ shutil.copyfile(archives[url], sys.argv[sys.argv.index('-o') + 1])
     .name = "clean_home", .labelle_version = "1.61.2",
     .core_version = "2.1.0", .engine_version = "3.4.1", .gfx_version = "2.2.0",
     .backend = .bgfx, .ecs = .mock, .gamepad = .none,
-    .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.30.0" },
+    .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.31.0" },
 ''' + pin_field + '\n}\n')
         expected = [
             ('labelle-core', '2.1.0'), ('labelle-engine', '3.4.1'),
             ('labelle-gfx', '2.2.0'), ('labelle-assembler', version),
-            ('labelle-bgfx', '0.30.0'), ('labelle-null', '0.3.0'),
+            ('labelle-bgfx', '0.31.0'), ('labelle-null', '0.3.0'),
         ]
         fixtures = {}
         for index, (repo, release) in enumerate(expected):

@@ -96,7 +96,7 @@ const BackendCoreFloor = struct {
 /// submit path (`materialBlendState`) switches exhaustively over core's
 /// shader-material `Blend` with a `.modulate2x` arm, a tag only core
 /// >= 2.1.0 declares (labelle-bgfx#137; the backend's build.zig.zon pins
-/// core 2.1.0 from 0.26.0 on). The builtin provider default is 0.30.0 and
+/// core 2.1.0 from 0.26.0 on). The builtin provider default is 0.31.0 and
 /// the scaffold trio's core is 2.1.0 — they move together.
 const bgfx_core_floors = [_]BackendCoreFloor{
     .{
@@ -635,7 +635,7 @@ pub fn enforce(cfg: config.ProjectConfig, ctx: []const u8) EnforceError!void {
 }
 
 test "the resolved-config gate judges an explicit .backend_package init can never see — #739" {
-    // The curated set: the builtin bgfx provider (0.30.0) hard-floors core
+    // The curated set: the builtin bgfx provider (0.31.0) hard-floors core
     // >= 2.1.0, so `base` rides the scaffold trio rather than a literal.
     const base: config.ProjectConfig = .{
         .name = "g",
@@ -860,24 +860,26 @@ test "scaffold core default pairs with the builtin bgfx provider — #731 review
     try checkBgfxProviderFloors(config.CORE_VERSION, bgfx.version);
 }
 
-test "builtin sokol 0.8.0 carries no core floor — same core/gfx pins as 0.7.0" {
-    // labelle-sokol v0.8.0 only adds labelle-android v0.2.0; its build.zig.zon
+test "builtin sokol 0.8.1 carries no core floor — same core/gfx pins as 0.7.0" {
+    // labelle-sokol v0.8.0 only added labelle-android v0.2.0 and v0.8.1 only
+    // fixes the iOS build; its build.zig.zon
     // keeps core 1.32.0 / gfx 1.28.1 and its material seam is probe-gated from
     // core 1.25.0 up, so neither the scaffold core nor an older pin is floored.
     const sokol = config.ProjectConfig.builtinProvider(.sokol) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("0.8.0", sokol.version);
+    try std.testing.expectEqualStrings("0.8.1", sokol.version);
     try std.testing.expect((try backendCoreFloorViolation("sokol", config.CORE_VERSION)) == null);
     try std.testing.expect((try backendCoreFloorViolation("sokol", "1.32.0")) == null);
 }
 
 test "bgfx-provider floors reject the #731 pairings" {
-    try checkBgfxProviderFloors("2.1.0", "0.30.0"); // the curated pairing (init defaults to bgfx)
+    try checkBgfxProviderFloors("2.1.0", "0.31.0"); // the curated pairing (init defaults to bgfx)
+    try checkBgfxProviderFloors("2.1.0", "0.30.0"); // the previous curated pairing — still coherent
     try checkBgfxProviderFloors("2.1.0", "0.26.0"); // the first provider on the 2.1.0 floor
     try checkBgfxProviderFloors("2.0.0", "0.25.2"); // the last provider below it — still coherent
     try checkBgfxProviderFloors("2.0.0", "0.21.0"); // the PR #733 curated pairing — still coherent
     // bgfx >= 0.26.0 names core's `Blend.modulate2x`: core 2.0.0 is a compile break.
     try std.testing.expectError(error.TestUnexpectedResult, checkBgfxProviderFloors("2.0.0", "0.26.0"));
-    try std.testing.expectError(error.TestUnexpectedResult, checkBgfxProviderFloors("2.0.0", "0.30.0"));
+    try std.testing.expectError(error.TestUnexpectedResult, checkBgfxProviderFloors("2.0.0", "0.31.0"));
     try checkBgfxProviderFloors("1.32.0", "0.20.0"); // the #736 curated pairing — still coherent
     // bgfx >= 0.21.0 is contract-v2: the hard floor is core 2.0.0, so the
     // #736 core is rejected under the new provider default.
@@ -900,7 +902,7 @@ test "init refuses --backend=bgfx --core-version=1.26.0 with a named diagnostic,
     // The front-door failure: the hard floor is the one reported (it is the
     // actionable one), the diagnostic names backend + REAL provider version,
     // the floor, the requested core, and recommends the curated core. Under
-    // the default provider (bgfx 0.30.0) the strictest hard floor is core
+    // the default provider (bgfx 0.31.0) the strictest hard floor is core
     // 2.1.0 (`Blend.modulate2x`, bgfx >= 0.26.0) and every older core trips it.
     const v = (try backendCoreFloorViolation("bgfx", "1.26.0")) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(FloorSeverity.compile_break, v.severity);
@@ -917,7 +919,7 @@ test "init refuses --backend=bgfx --core-version=1.26.0 with a named diagnostic,
     const c = (try backendCoreFloorViolation("bgfx", "1.32.0")) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(FloorSeverity.compile_break, c.severity);
     try std.testing.expectEqualStrings("2.1.0", c.core_floor);
-    // ...and so is the PR #733 curated core 2.0.0 under the 0.30.0 default:
+    // ...and so is the PR #733 curated core 2.0.0 under the 0.31.0 default:
     // it predates `Blend.modulate2x`.
     const v2 = (try backendCoreFloorViolation("bgfx", "2.0.0")) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(FloorSeverity.compile_break, v2.severity);
@@ -971,7 +973,7 @@ test "pinAtLeast normalizes the abbreviated `X.Y` pin form, and names a bad one 
 
 // ── absent `.backend` defaults to bgfx (2026-09-27) ──────────────────
 
-test "a project.labelle with NO .backend resolves to bgfx and the builtin bgfx 0.30.0 package" {
+test "a project.labelle with NO .backend resolves to bgfx and the builtin bgfx 0.31.0 package" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -991,11 +993,11 @@ test "a project.labelle with NO .backend resolves to bgfx and the builtin bgfx 0
     try std.testing.expectEqual(config.ProjectConfig.default_backend, cfg.effectiveBackend());
     try std.testing.expectEqual(config.Backend.bgfx, cfg.effectiveBackend());
 
-    // ...and it resolves to the builtin official bgfx provider at 0.30.0.
+    // ...and it resolves to the builtin official bgfx provider at 0.31.0.
     const bp = cfg.effectiveBackendPackage() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("bgfx", bp.name);
     try std.testing.expectEqualStrings("github.com/labelle-toolkit/labelle-bgfx", bp.repo);
-    try std.testing.expectEqualStrings("0.30.0", bp.version);
+    try std.testing.expectEqualStrings("0.31.0", bp.version);
     try std.testing.expectEqual(config.Backend.bgfx, officialBackendOf(bp).?);
     try std.testing.expectEqualStrings("bgfx", cfg.backendName());
     try std.testing.expect(cfg.isEnumTagBacked());
@@ -1021,7 +1023,7 @@ test "a project.labelle with NO .backend resolves to bgfx and the builtin bgfx 0
 
 test "a project with NO .backend and a core below bgfx's floor is refused with a named diagnostic" {
     // BREAKING for projects that relied on the implicit raylib default: the
-    // same file now resolves to bgfx 0.30.0, whose hard floor is core 2.1.0.
+    // same file now resolves to bgfx 0.31.0, whose hard floor is core 2.1.0.
     // `generate`/`check` run `enforce`, which must refuse BEFORE the build
     // with a message naming bgfx, the floor, and the fix — not let the
     // project die in the backend's material switch.
@@ -1039,11 +1041,11 @@ test "a project with NO .backend and a core below bgfx's floor is refused with a
     const v = vd.backend orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(FloorSeverity.compile_break, v.severity);
     try std.testing.expectEqualStrings("bgfx", v.backend);
-    try std.testing.expectEqualStrings("0.30.0", v.backend_version);
+    try std.testing.expectEqualStrings("0.31.0", v.backend_version);
     try std.testing.expectEqualStrings("2.1.0", v.core_floor);
     var buf: [512]u8 = undefined;
     const msg = v.describe(&buf);
-    try std.testing.expect(std.mem.startsWith(u8, msg, "bgfx 0.30.0 requires labelle-core >= 2.1.0; got 2.0.0 ("));
+    try std.testing.expect(std.mem.startsWith(u8, msg, "bgfx 0.31.0 requires labelle-core >= 2.1.0; got 2.0.0 ("));
     try std.testing.expect(std.mem.indexOf(u8, msg, "--core-version=2.1.0") != null);
     // (`enforce` is `verdict` + the log line; calling it here would log an
     // error, which the test runner counts as a failure.)
