@@ -116,6 +116,10 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "engine_version", engine_version);
     options.addOption([]const u8, "gfx_version", gfx_version);
     options.addOption([]const u8, "assembler_version", assembler_version);
+    // The generated game's `build.zig.zon` `.minimum_zig_version` (#674):
+    // read from THIS package's own manifest so the two can never drift (the
+    // template used to hardcode "0.15.2" while the assembler required 0.16.0).
+    options.addOption([]const u8, "minimum_zig_version", minimum_zig_version);
 
     // Test-only options: the exact zig binary driving THIS build, so the
     // plugin-build-steps e2e (`test/plugin_build_steps_tests.zig`, #586) can
@@ -363,6 +367,9 @@ pub fn build(b: *std.Build) void {
         "test/preview_mode_tests.zig",
         "test/script_scanner_tests.zig",
         "test/deps_linker_tests.zig",
+        // Byte-stable, non-destructive generate (#674): a second generate with
+        // unchanged inputs rewrites nothing and never wipes deps/.
+        "test/generate_stability_tests.zig",
         "test/template_dynamic_test.zig",
         "test/scanner_symlink_tests.zig",
         "test/scanner_orphan_tests.zig",
@@ -625,3 +632,15 @@ fn assertMaterialTestRootCoverage(b: *std.Build) void {
         .{},
     );
 }
+
+/// `.minimum_zig_version` from this package's `build.zig.zon`, extracted at
+/// comptime from the embedded manifest (a full ZON parse would need every
+/// field declared). A missing field is a compile error, not a silent default.
+const minimum_zig_version: []const u8 = blk: {
+    @setEvalBranchQuota(200_000);
+    const zon = @embedFile("build.zig.zon");
+    const key = ".minimum_zig_version = \"";
+    const start = (std.mem.indexOf(u8, zon, key) orelse @compileError("build.zig.zon has no .minimum_zig_version")) + key.len;
+    const len = std.mem.indexOfScalar(u8, zon[start..], '"') orelse @compileError("unterminated .minimum_zig_version");
+    break :blk zon[start..][0..len];
+};

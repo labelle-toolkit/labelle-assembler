@@ -71,6 +71,7 @@
 //! everywhere: no staged module, no build.zig wiring, no output drift.
 
 const std = @import("std");
+const write_if_changed = @import("write_if_changed.zig");
 const config = @import("config.zig");
 const provider_settings = @import("provider_settings.zig");
 const android_moved_keys = @import("android_moved_keys.zig");
@@ -1195,9 +1196,7 @@ pub fn stage(
         defer gpa.free(content);
         const dest_name = try stagedName(gpa, r.plugin_name);
         defer gpa.free(dest_name);
-        const file = try dir.createFile(io, dest_name, .{});
-        defer file.close(io);
-        try file.writeStreamingAll(io, content);
+        _ = try write_if_changed.writeIfChanged(io, dir, dest_name, content); // #674
     }
 }
 

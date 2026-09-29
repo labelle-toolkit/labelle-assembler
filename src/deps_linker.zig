@@ -8,6 +8,8 @@ const std = @import("std");
 const config = @import("config.zig");
 const cache = @import("cache.zig");
 const backend_registry = @import("backend_registry.zig");
+const deps_sync = @import("deps_sync.zig");
+const write_if_changed = @import("write_if_changed.zig");
 
 const ProjectConfig = config.ProjectConfig;
 
@@ -63,12 +65,21 @@ pub fn stagesAndroidGamepad(cfg: ProjectConfig) bool {
 }
 
 pub const DepsLinkOptions = struct {
-    /// True (default) wipes `deps_dir` before re-creating it. The tests
-    /// target (issue #83) sets this to false because the exe target's
-    /// generate already populated `deps_dir` with the chosen-backend
-    /// links — wiping it would orphan the exe's deps. The tests pass
-    /// only adds the null backend's link to the existing dir.
-    recreate: bool = true,
+    /// True (default) removes top-level `deps/` entries this pass did not
+    /// stage (a dropped plugin, a switched backend) — except `keep`. Every
+    /// staged package is reconciled IN PLACE either way (`deps_sync`, #674):
+    /// `deps/` is never wiped, so unchanged files keep their identity and
+    /// mtime and a live `zig build --watch` keeps its directory watches.
+    ///
+    /// The tests target (issue #83) runs second and sets this to false: it
+    /// only adds the null backend's package to the dir the exe pass
+    /// reconciled, and must not sweep the exe's chosen-backend package.
+    prune: bool = true,
+    /// Top-level entries the prune must leave alone: the packages ANOTHER
+    /// pass of the same generate stages. The exe pass passes the tests
+    /// target's backend link here — otherwise each generate would sweep it
+    /// and the tests pass would re-stage it, churning the tree every run.
+    keep: []const []const u8 = &.{},
 };
 
 pub fn createDepsLinks(
@@ -253,19 +264,14 @@ pub fn createDepsLinks(
     const deps_dir = try std.fs.path.join(allocator, &.{ target_dir, "deps" });
     defer allocator.free(deps_dir);
 
-    if (opts.recreate) cwd.deleteTree(io, deps_dir) catch {};
+    // Never wiped (#674): each package below is reconciled in place, and
+    // only top-level entries no pass stages are swept (`prune`).
     try cwd.createDirPath(io, deps_dir);
+    if (opts.prune) try pruneStaleDeps(allocator, deps_dir, deps.items, opts.keep);
 
     for (deps.items) |dep| {
         const dest = try std.fs.path.join(allocator, &.{ deps_dir, dep.link_name });
         defer allocator.free(dest);
-
-        // In additive mode (recreate=false), skip links that already
-        // exist — created by a previous target's pass. Hardlinking on
-        // top of an existing tree would error.
-        if (!opts.recreate) {
-            if (cwd.access(io, dest, .{})) |_| continue else |_| {}
-        }
 
         // realPathFileAlloc returns [:0]u8 (sentinel-terminated) but we
         // unify the type with dep.abs_path []const u8. Dupe to a plain
@@ -287,7 +293,7 @@ pub fn createDepsLinks(
         // path is still emitted in the zon, so zig surfaces a clear
         // "missing package" error at build time.
         //
-        // Operational errors at hardlinkTree time (PermissionDenied,
+        // Operational errors at syncTree time (PermissionDenied,
         // NoSpaceLeft, cross-device hardlink, etc.) propagate as fatal
         // — better to fail noisily than silently produce an incomplete
         // deps/ tree that confuses the user with a misleading error
@@ -299,7 +305,10 @@ pub fn createDepsLinks(
             },
             else => return err,
         };
-        try hardlinkTree(allocator, abs, dest);
+        // A package whose top-level zon `rewriteZonPaths` re-anchors below
+        // keeps its existing (rewritten) dest zon — the rewrite reconciles it.
+        var stats: deps_sync.Stats = .{};
+        try deps_sync.syncTree(allocator, abs, dest, .{ .preserve_top_zon = zonIsRewritten(cfg, dep.link_name) }, &stats);
     }
 
     // Rewrite relative .path deps in local plugins' build.zig.zon files.
@@ -307,16 +316,11 @@ pub fn createDepsLinks(
     // which is wrong from .labelle/deps/. Resolve each path against the original
     // abs location and recompute the relative path from the new dest location.
     //
-    // Only run in `recreate=true` (first-pass) mode. In additive mode the
-    // first pass already rewrote every dest zon to be relative to its
-    // .labelle/deps/<plugin>/ location; running rewriteZonPaths again on
-    // those already-rewritten files would re-resolve the new paths against
-    // the original `abs_src` (the plugin's source-tree location) and
-    // produce a corrupted target (one extra `../` in practice). The set of
-    // local plugins is identical between passes — only the bundled
-    // backend/ECS deps differ — and bundled deps don't have local `.path`
-    // entries to rewrite, so skipping is safe.
-    if (opts.recreate) {
+    // Idempotent (#674): the rewrite always reads the SOURCE package's zon
+    // (never the already-rewritten dest), and writes only when the result
+    // differs from what is staged — so it runs on every pass, and a second
+    // generate leaves the rewritten zon (and its mtime) alone.
+    {
         for (cfg.plugins) |plugin| {
             if (!plugin.isLocal()) continue;
 
@@ -347,7 +351,7 @@ pub fn createDepsLinks(
                 try cache.toMainCheckoutPath(allocator, abs_src, project_dir);
             defer allocator.free(resolution_src);
 
-            try rewriteZonPaths(allocator, resolution_src, abs_dest);
+            try rewriteZonPaths(allocator, abs_src, resolution_src, abs_dest);
         }
 
         // A LOCAL external backend (`backend_package` with a `local:`/`@libs`
@@ -380,7 +384,7 @@ pub fn createDepsLinks(
                 try cache.toMainCheckoutPath(allocator, abs_src, project_dir);
             defer allocator.free(resolution_src);
 
-            try rewriteZonPaths(allocator, resolution_src, abs_dest);
+            try rewriteZonPaths(allocator, abs_src, resolution_src, abs_dest);
         }
 
         // Also rewrite GUI plugin/bridge paths — the GUI is resolved separately
@@ -406,105 +410,50 @@ pub fn freeDepEntries(allocator: std.mem.Allocator, deps: []const DepEntry) void
     allocator.free(deps);
 }
 
-/// Recursively hardlink a directory tree. Creates directories, hardlinks files.
-/// Falls back to copy for files that can't be hardlinked (cross-device).
-fn hardlinkTree(allocator: std.mem.Allocator, src_path: []const u8, dest_path: []const u8) !void {
+/// Whether `rewriteZonPaths` owns the top-level `build.zig.zon` of the
+/// package staged as `link_name`: local plugins, a local external backend,
+/// and the GUI plugin/bridge — exactly the rewrite loop's set above.
+fn zonIsRewritten(cfg: ProjectConfig, link_name: []const u8) bool {
+    if (std.mem.eql(u8, link_name, "labelle-gui") or std.mem.eql(u8, link_name, "gui-bridge"))
+        return cfg.resolved_gui != null;
+    if (!std.mem.startsWith(u8, link_name, "labelle-")) return false;
+    const name = link_name["labelle-".len..];
+    for (cfg.plugins) |plugin| {
+        if (plugin.isLocal() and std.mem.eql(u8, plugin.name, name)) return true;
+    }
+    if (cfg.backend_package) |bp| {
+        if (bp.isLocal() and std.mem.eql(u8, bp.name, name)) return true;
+    }
+    return false;
+}
+
+/// Sweep top-level `deps/` entries that neither this pass (`staged`) nor
+/// another pass of the same generate (`keep`) stages.
+fn pruneStaleDeps(allocator: std.mem.Allocator, deps_dir: []const u8, staged: []const DepEntry, keep: []const []const u8) !void {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(io, dest_path);
-
-    var src_dir = try cwd.openDir(io, src_path, .{ .iterate = true });
-    defer src_dir.close(io);
-
-    var iter = src_dir.iterate();
-    while (try iter.next(io)) |entry| {
-        const src_sub = try std.fs.path.join(allocator, &.{ src_path, entry.name });
-        defer allocator.free(src_sub);
-        const dest_sub = try std.fs.path.join(allocator, &.{ dest_path, entry.name });
-        defer allocator.free(dest_sub);
-
-        switch (entry.kind) {
-            .directory => {
-                // Skip build/VCS/generated dirs inside a staged package. Besides
-                // the obvious .zig-cache/zig-out/.git, skip:
-                //   - zig-pkg: the fetched-dependency cache, whose hashed subpaths
-                //     (…/N-V-…/upstream/node_modules/…) blow past the OS path limit
-                //     → copyFile errors with NameTooLong and crashes staging.
-                //   - .labelle: generated output. Critical when a package repo
-                //     ships an example *inside itself* (labelle-bgfx/examples/…):
-                //     staging the package while generating that example would copy
-                //     the example's own .labelle output back into the stage.
-                // None of these are part of the package's importable modules.
-                if (std.mem.eql(u8, entry.name, ".zig-cache") or
-                    std.mem.eql(u8, entry.name, "zig-out") or
-                    std.mem.eql(u8, entry.name, "zig-pkg") or
-                    std.mem.eql(u8, entry.name, ".labelle") or
-                    std.mem.eql(u8, entry.name, ".git"))
-                    continue;
-
-                try hardlinkTree(allocator, src_sub, dest_sub);
-            },
-            .file => {
-                try hardlinkOrCopy(allocator, src_sub, dest_sub);
-            },
-            .sym_link => {
-                // Read symlink target and recreate it
-                var target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-                const target_len = src_dir.readLink(io, entry.name, &target_buf) catch continue;
-                const target = target_buf[0..target_len];
-                cwd.symLink(io, target, dest_sub, .{}) catch {};
-            },
-            else => {},
+    var stale: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (stale.items) |n| allocator.free(n);
+        stale.deinit(allocator);
+    }
+    {
+        var dir = try cwd.openDir(io, deps_dir, .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        outer: while (try it.next(io)) |entry| {
+            for (staged) |d| if (std.mem.eql(u8, d.link_name, entry.name)) continue :outer;
+            for (keep) |k| if (std.mem.eql(u8, k, entry.name)) continue :outer;
+            try stale.append(allocator, try allocator.dupe(u8, entry.name));
         }
     }
-}
-
-/// Create a hardlink, falling back to copy if hardlinks aren't supported
-/// (cross-device, Windows without NTFS, etc).
-/// Create a hardlink, falling back to copy. Works on macOS, Linux, and Windows.
-/// Hardlinks share disk space (zero cost) and work without admin privileges.
-fn hardlinkOrCopy(allocator: std.mem.Allocator, src: []const u8, dest: []const u8) !void {
-    const io = config.globalIo();
-    const cwd = std.Io.Dir.cwd();
-    const builtin = @import("builtin");
-
-    if (comptime builtin.os.tag == .windows) {
-        // Windows: use CreateHardLinkW from kernel32
-        windowsHardLink(allocator, src, dest) catch {
-            try cwd.copyFile(src, cwd, dest, io, .{});
-        };
-    } else {
-        // POSIX: hardLink (formerly posix.link)
-        cwd.hardLink(src, cwd, dest, io, .{}) catch {
-            try cwd.copyFile(src, cwd, dest, io, .{});
-        };
+    for (stale.items) |name| {
+        const p = try std.fs.path.join(allocator, &.{ deps_dir, name });
+        defer allocator.free(p);
+        try cwd.deleteTree(io, p);
     }
 }
 
-/// Windows hardlink via kernel32.CreateHardLinkW.
-/// Works on NTFS without admin privileges.
-fn windowsHardLink(allocator: std.mem.Allocator, src: []const u8, dest: []const u8) !void {
-    const builtin = @import("builtin");
-    if (comptime builtin.os.tag != .windows) unreachable;
-
-    // Zig 0.16 removed `std.os.windows.sliceToPrefixedFileW`; convert the
-    // UTF-8 paths to NUL-terminated UTF-16LE ourselves. CreateHardLinkW is
-    // a Win32 (not NT) call, so a plain wide path — no `\??\` prefix — is
-    // what it expects.
-    const src_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, src);
-    defer allocator.free(src_w);
-    const dest_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, dest);
-    defer allocator.free(dest_w);
-
-    const result = CreateHardLinkW(dest_w.ptr, src_w.ptr, null);
-    if (result == 0) return error.PermissionDenied;
-}
-
-extern "kernel32" fn CreateHardLinkW(
-    lpFileName: [*:0]const u16,
-    lpExistingFileName: [*:0]const u16,
-    lpSecurityAttributes: ?*anyopaque,
-) callconv(.winapi) c_int;
 
 /// Resolve src/dest to absolute paths and call rewriteZonPaths.
 /// `project_dir` is used to remap abs_src to its main-checkout equivalent
@@ -522,29 +471,38 @@ fn rewriteLocalDep(allocator: std.mem.Allocator, cwd: std.Io.Dir, src_path: []co
     else
         try cache.toMainCheckoutPath(allocator, abs_src, project_dir);
     defer allocator.free(resolution_src);
-    try rewriteZonPaths(allocator, resolution_src, abs_dest);
+    try rewriteZonPaths(allocator, abs_src, resolution_src, abs_dest);
 }
 
-/// Rewrite relative `.path` dependencies in a hardlinked build.zig.zon.
-/// `src_dir` is the original absolute path of the package.
+/// Stage a package's `build.zig.zon` under .labelle/deps/ with its relative
+/// `.path` dependencies re-anchored for the new location.
+/// `pkg_dir` is the package's real source dir — the zon is ALWAYS read from
+/// there, never from the staged copy, so the rewrite is idempotent (#674).
+/// `src_dir` is the resolution anchor for relative paths (the package dir or
+/// its main-checkout equivalent, see `firstPathDepResolvesInWorktree`).
 /// `dest_dir` is the new absolute path under .labelle/deps/.
 ///
 /// For each `.path = "../some/dep"` entry, resolves it against src_dir to get
 /// the absolute target, then computes the relative path from dest_dir.
-/// Writes via a temp file + rename to avoid corrupting the original hardlinked file.
-fn rewriteZonPaths(allocator: std.mem.Allocator, src_dir: []const u8, dest_dir: []const u8) !void {
+/// Writes only when the staged zon differs from the result, via delete +
+/// temp file + rename so a hardlinked staged zon never writes through to the
+/// original package file.
+fn rewriteZonPaths(allocator: std.mem.Allocator, pkg_dir: []const u8, src_dir: []const u8, dest_dir: []const u8) !void {
     const zon_path = try std.fs.path.join(allocator, &.{ dest_dir, "build.zig.zon" });
     defer allocator.free(zon_path);
+    const pkg_zon = try std.fs.path.join(allocator, &.{ pkg_dir, "build.zig.zon" });
+    defer allocator.free(pkg_zon);
 
     const io = config.globalIo();
-    const content = std.Io.Dir.cwd().readFileAlloc(io, zon_path, allocator, .limited(256 * 1024)) catch |err| {
-        std.debug.print("labelle: warning: could not read {s}: {any}\n", .{ zon_path, err });
-        return;
+    const content = std.Io.Dir.cwd().readFileAlloc(io, pkg_zon, allocator, .limited(256 * 1024)) catch |err| switch (err) {
+        // No zon in the package: nothing to stage or rewrite.
+        error.FileNotFound => return,
+        else => {
+            std.debug.print("labelle: warning: could not read {s}: {any}\n", .{ pkg_zon, err });
+            return;
+        },
     };
     defer allocator.free(content);
-
-    // Quick check: skip files without relative .path deps
-    if (std.mem.indexOf(u8, content, ".path") == null) return;
 
     var result: std.ArrayList(u8) = .empty;
     defer result.deinit(allocator);
@@ -600,8 +558,9 @@ fn rewriteZonPaths(allocator: std.mem.Allocator, src_dir: []const u8, dest_dir: 
         i += 1;
     }
 
-    // Only write if changed
-    if (!std.mem.eql(u8, content, result.items)) {
+    // Only write if the STAGED zon differs from the result (#674) — on a
+    // repeat generate it already holds exactly these bytes.
+    if (!write_if_changed.sameContent(io, std.Io.Dir.cwd(), zon_path, result.items)) {
         const cwd = std.Io.Dir.cwd();
 
         // Delete the hardlink first so we never rewrite the original package file.
@@ -735,16 +694,15 @@ test "rewriteZonPaths: rewrites relative path deps" {
         \\}
     ;
 
-    const dest_zon = try tmp.dir.createFile(std.testing.io, "project/.labelle/deps/labelle-needs_machine/build.zig.zon", .{});
-    defer dest_zon.close(std.testing.io);
-    try dest_zon.writeStreamingAll(std.testing.io, zon_content);
+    // The zon lives in the SOURCE package; the rewrite reads it from there.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/libs/needs_machine/build.zig.zon", .data = zon_content });
 
     const src_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "project/libs/needs_machine", alloc);
     defer alloc.free(src_abs);
     const dest_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "project/.labelle/deps/labelle-needs_machine", alloc);
     defer alloc.free(dest_abs);
 
-    try rewriteZonPaths(alloc, src_abs, dest_abs);
+    try rewriteZonPaths(alloc, src_abs, src_abs, dest_abs);
 
     const result = try tmp.dir.readFileAlloc(std.testing.io, "project/.labelle/deps/labelle-needs_machine/build.zig.zon", alloc, .limited(64 * 1024));
     defer alloc.free(result);
@@ -753,6 +711,24 @@ test "rewriteZonPaths: rewrites relative path deps" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"../../../labelle-fsm\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, result, ".path = \"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "../../../../labelle-fsm") != null);
+
+    // The source package's zon is never written through.
+    const original = try tmp.dir.readFileAlloc(std.testing.io, "project/libs/needs_machine/build.zig.zon", alloc, .limited(64 * 1024));
+    defer alloc.free(original);
+    try std.testing.expectEqualStrings(zon_content, original);
+
+    // #674: a second rewrite (the next generate, or the tests-target pass)
+    // re-derives from the SOURCE, so it neither double-rewrites the path nor
+    // touches the staged file — same inode, same mtime, same bytes.
+    const staged = "project/.labelle/deps/labelle-needs_machine/build.zig.zon";
+    const before = try tmp.dir.statFile(std.testing.io, staged, .{});
+    try rewriteZonPaths(alloc, src_abs, src_abs, dest_abs);
+    const after = try tmp.dir.statFile(std.testing.io, staged, .{});
+    try std.testing.expectEqual(before.inode, after.inode);
+    try std.testing.expectEqual(before.mtime.nanoseconds, after.mtime.nanoseconds);
+    const again = try tmp.dir.readFileAlloc(std.testing.io, staged, alloc, .limited(64 * 1024));
+    defer alloc.free(again);
+    try std.testing.expectEqualStrings(result, again);
 }
 
 test "rewriteZonPaths: skips files without .path deps" {
@@ -776,95 +752,28 @@ test "rewriteZonPaths: skips files without .path deps" {
         \\}
     ;
 
-    const dest_zon = try tmp.dir.createFile(std.testing.io, "dest/build.zig.zon", .{});
-    defer dest_zon.close(std.testing.io);
-    try dest_zon.writeStreamingAll(std.testing.io, zon_content);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/build.zig.zon", .data = zon_content });
+    // Staged copy already current (what syncTree's hardlink leaves).
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dest/build.zig.zon", .data = zon_content });
+    const before = try tmp.dir.statFile(std.testing.io, "dest/build.zig.zon", .{});
 
     const src_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "src", alloc);
     defer alloc.free(src_abs);
     const dest_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "dest", alloc);
     defer alloc.free(dest_abs);
 
-    try rewriteZonPaths(alloc, src_abs, dest_abs);
+    try rewriteZonPaths(alloc, src_abs, src_abs, dest_abs);
 
     const result = try tmp.dir.readFileAlloc(std.testing.io, "dest/build.zig.zon", alloc, .limited(64 * 1024));
     defer alloc.free(result);
     try std.testing.expectEqualStrings(zon_content, result);
+    // Nothing to rewrite and already current: not re-written.
+    const after = try tmp.dir.statFile(std.testing.io, "dest/build.zig.zon", .{});
+    try std.testing.expectEqual(before.inode, after.inode);
+    try std.testing.expectEqual(before.mtime.nanoseconds, after.mtime.nanoseconds);
 }
 
-test "hardlinkTree: errors on missing source" {
-    // Pins the precondition that createDepsLinks's source-pre-check relies
-    // on — if hardlinkTree were ever changed to silently succeed on a
-    // missing source, the source-FileNotFound branch in createDepsLinks
-    // would never trigger and the worktree cascade bug (#87) could
-    // re-emerge through a different path.
-    const alloc = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "dest_parent");
-    const dest_parent = try tmp.dir.realPathFileAlloc(std.testing.io, "dest_parent", alloc);
-    defer alloc.free(dest_parent);
-
-    const missing_src = try std.fs.path.join(alloc, &.{ dest_parent, "does_not_exist" });
-    defer alloc.free(missing_src);
-    const dest = try std.fs.path.join(alloc, &.{ dest_parent, "linked" });
-    defer alloc.free(dest);
-
-    const result = hardlinkTree(alloc, missing_src, dest);
-    try std.testing.expectError(error.FileNotFound, result);
-}
-
-test "hardlinkTree: skips zig-pkg/.labelle/.git/.zig-cache/zig-out, stages real files" {
-    // Regression for the local-backend staging crash: a package repo with a
-    // populated zig-pkg/ (deep hashed dep paths) or an in-repo example's
-    // .labelle/ output used to be copied wholesale → NameTooLong + an invalid
-    // free. These dirs must be skipped; real module files must still stage.
-    const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    const cwd = std.Io.Dir.cwd();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    // Source package tree: build/cache/VCS dirs + real module files.
-    for ([_][]const u8{ "pkg/src", "pkg/zig-pkg/deep", "pkg/.labelle/out", "pkg/.git", "pkg/.zig-cache", "pkg/zig-out" }) |d|
-        try tmp.dir.createDirPath(io, d);
-    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/build.zig", .data = "// build" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/src/root.zig", .data = "pub const x = 1;" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/zig-pkg/deep/huge.txt", .data = "x" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/.labelle/out/main.zig", .data = "x" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/.git/HEAD", .data = "ref" });
-
-    const src = try tmp.dir.realPathFileAlloc(io, "pkg", alloc);
-    defer alloc.free(src);
-    const base = try tmp.dir.realPathFileAlloc(io, ".", alloc);
-    defer alloc.free(base);
-    const dest = try std.fs.path.join(alloc, &.{ base, "staged" });
-    defer alloc.free(dest);
-
-    try hardlinkTree(alloc, src, dest);
-
-    const exists = struct {
-        fn f(c: std.Io.Dir, i: anytype, d: []const u8, sub: []const u8, a: std.mem.Allocator) bool {
-            const p = std.fs.path.join(a, &.{ d, sub }) catch return false;
-            defer a.free(p);
-            c.access(i, p, .{}) catch return false;
-            return true;
-        }
-    }.f;
-
-    // Real files staged.
-    try std.testing.expect(exists(cwd, io, dest, "build.zig", alloc));
-    try std.testing.expect(exists(cwd, io, dest, "src/root.zig", alloc));
-    // Build/cache/VCS/output dirs skipped.
-    try std.testing.expect(!exists(cwd, io, dest, "zig-pkg", alloc));
-    try std.testing.expect(!exists(cwd, io, dest, ".labelle", alloc));
-    try std.testing.expect(!exists(cwd, io, dest, ".git", alloc));
-    try std.testing.expect(!exists(cwd, io, dest, ".zig-cache", alloc));
-    try std.testing.expect(!exists(cwd, io, dest, "zig-out", alloc));
-}
+// syncTree (the staging primitive) is tested in deps_sync.zig.
 
 // ── External-backend gating (open-config, epic #386 Phase 5) ─────────
 

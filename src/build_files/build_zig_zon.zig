@@ -14,6 +14,9 @@ const manifest_v2 = @import("../codegen/manifest_v2.zig");
 const manifest_v2_splice = @import("../codegen/manifest_v2_splice.zig");
 const zonPath = @import("../zon_escape.zig").zonPath;
 pub const deps_linker = @import("../deps_linker.zig");
+/// The generated zon's `.minimum_zig_version` — the assembler's own floor,
+/// read from its `build.zig.zon` by build.zig (#674).
+pub const MINIMUM_ZIG_VERSION = @import("build_options").minimum_zig_version;
 
 const ProjectConfig = config.ProjectConfig;
 
@@ -28,11 +31,15 @@ pub const BuildZigZonOptions = struct {
     materials: bool = false,
     /// Null = derive from cfg (`material_pipeline.toolchain`).
     material_toolchain: ?@import("../material_schema.zig").Toolchain = null,
-    /// True (default) wipes the shared `.labelle/deps/` directory before
-    /// recreating it. The tests target (issue #83) sets this to false so
-    /// the second-pass generation merges its null-backend dep into the
-    /// existing dir without orphaning the exe target's chosen-backend dep.
-    recreate_deps: bool = true,
+    /// True (default) sweeps top-level `.labelle/deps/` entries this pass
+    /// does not stage (except `keep_deps`); the dir itself is never wiped —
+    /// staged packages are reconciled in place (#674). The tests target
+    /// (issue #83) sets this to false so its second pass only adds its
+    /// null-backend dep without sweeping the exe target's chosen backend.
+    prune_deps: bool = true,
+    /// Top-level deps entries the prune leaves alone — see
+    /// `deps_linker.DepsLinkOptions.keep`.
+    keep_deps: []const []const u8 = &.{},
     /// Which backend manifest file to load, relative to the resolved backend
     /// package root (manifest-v2, epic #453 item 3, PR 7). Null (default) keeps
     /// the PRODUCTION path 100% unchanged: emsdk is emitted for any wasm build
@@ -90,7 +97,7 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
     // errors during `zig build` — see labelle-toolkit/labelle-cli#174.
     const deps_parent = output_dir orelse target_dir;
     const resolved_deps: ?[]const deps_linker.DepEntry = if (deps_parent != null and project_dir != null)
-        deps_linker.createDepsLinks(allocator, cfg, deps_parent.?, project_dir.?, .{ .recreate = opts.recreate_deps }) catch |err| blk: {
+        deps_linker.createDepsLinks(allocator, cfg, deps_parent.?, project_dir.?, .{ .prune = opts.prune_deps, .keep = opts.keep_deps }) catch |err| blk: {
             // OOM is not recoverable by retrying with cache-relative
             // paths — those need allocation too. Propagate so the caller
             // can fail cleanly instead of papering over the failure.
@@ -149,7 +156,7 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
     var hash_buf: [16]u8 = undefined;
     const hash_str = std.fmt.bufPrint(&hash_buf, "{x}", .{hash}) catch unreachable;
 
-    try tpl.renderSection(build_zig_zon_tmpl, "header", .{ .hash = hash_str, .version = cfg.version }, w);
+    try tpl.renderSection(build_zig_zon_tmpl, "header", .{ .hash = hash_str, .version = cfg.version, .min_zig = MINIMUM_ZIG_VERSION }, w);
 
     if (opts.materials) {
         // Chosen from the project's bgfx pin: the shader container must match

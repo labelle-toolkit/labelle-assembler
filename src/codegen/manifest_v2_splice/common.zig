@@ -12,6 +12,7 @@
 //! cover the emission shape.
 
 const std = @import("std");
+const write_if_changed = @import("../../write_if_changed.zig");
 const config = @import("../../config.zig");
 const manifest_v2 = @import("../manifest_v2.zig");
 const core_diamond = @import("../core_diamond.zig");
@@ -161,9 +162,7 @@ pub fn stageBackendBuildHook(
 
     var dir = try cwd.openDir(io, target_dir, .{});
     defer dir.close(io);
-    const file = try dir.createFile(io, hook_import_name, .{});
-    defer file.close(io);
-    try file.writeStreamingAll(io, content);
+    _ = try write_if_changed.writeIfChanged(io, dir, hook_import_name, content); // #674
     return true;
 }
 

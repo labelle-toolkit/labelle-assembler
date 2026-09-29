@@ -73,6 +73,8 @@ test {
     // main.zig code a test build never analyzes, so its tests need this.
     _ = @import("gui_resolve.zig");
     _ = @import("zon_escape.zig");
+    _ = @import("write_if_changed.zig"); // #674
+    _ = @import("deps_sync.zig"); // #674
     _ = @import("junction.zig");
     _ = @import("plugin_manifest.zig");
     _ = @import("plugin_build_hook.zig");
@@ -207,6 +209,7 @@ pub const windows_icon_resource_block = build_files.windows_icon_resource_block;
 pub const emitWindowIcon = @import("codegen/lifecycle/loop.zig").emitWindowIcon;
 pub const BuildZigOptions = build_files.BuildZigOptions;
 pub const generateBuildZigZon = build_files.generateBuildZigZon;
+pub const MINIMUM_ZIG_VERSION = build_files.MINIMUM_ZIG_VERSION;
 pub const deps_linker = build_files.deps_linker;
 // Stages the v2 backend build hook next to the generated build.zig
 // (`backend_build_hook.zig`) so the generated `@import` resolves — see the fn
@@ -1401,10 +1404,16 @@ pub fn generate(
     // Generate build.zig.zon
     // `cfg_modules` (not `cfg`): a light pack has no `build.zig`/module, so it
     // must not become a `.labelle_<name> = .{ .path }` dep (#481).
+    // The tests target stages its own backend package (`testsTargetConfig`
+    // swaps in `.null`); the exe pass must not sweep it, or every generate
+    // would delete it and the tests pass re-stage it (#674).
+    const tests_backend_link = try std.fmt.allocPrint(allocator, "labelle-{s}", .{testsTargetConfig(cfg).backendName()});
+    defer allocator.free(tests_backend_link);
     const zon = try build_files.generateBuildZigZon(allocator, cfg_modules, target_dir, output_dir, game_dir, .{
         // The tests target runs second — additive merge so the exe
         // target's deps (chosen-backend, plugins) survive. Issue #83.
-        .recreate_deps = !is_tests_target,
+        .prune_deps = !is_tests_target,
+        .keep_deps = &.{tests_backend_link},
         .materials = material_names.len != 0,
         .material_toolchain = material_toolchain,
         // manifest-v2 cutover: when the backend ships a v2 manifest, key the

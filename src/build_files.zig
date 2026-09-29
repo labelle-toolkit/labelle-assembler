@@ -30,6 +30,7 @@ pub const windows_icon_resource_block = build_zig.windows_icon_resource_block;
 pub const deps_linker = build_zig_zon.deps_linker;
 pub const BuildZigZonOptions = build_zig_zon.BuildZigZonOptions;
 pub const generateBuildZigZon = build_zig_zon.generateBuildZigZon;
+pub const MINIMUM_ZIG_VERSION = build_zig_zon.MINIMUM_ZIG_VERSION;
 
 // Pull both sub-modules' analysis into `build_files.zig` so `zig build test`
 // keeps compiling everything that used to live here.
