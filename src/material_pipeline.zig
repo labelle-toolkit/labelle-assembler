@@ -174,6 +174,12 @@ pub fn stage(a: std.mem.Allocator, game_dir: []const u8, target_dir: []const u8,
         for (names.items) |n| a.free(n);
         names.deinit(a);
     }
+    // Shader targets the platform needs, checked here so a missing variant
+    // fails `labelle generate` instead of the Zig build (#812). Only the
+    // platforms decidable without `-Dtarget` (android, wasm, ios); desktop's
+    // mtl-vs-spv choice waits for `material_build.create`, which checks the
+    // same rule (`schema.missingTargetsMessage`) against the real target.
+    var missing_targets = false;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .directory or entry.name[0] == '.') continue;
@@ -206,6 +212,12 @@ pub fn stage(a: std.mem.Allocator, game_dir: []const u8, target_dir: []const u8,
             std.log.err("materials/{s}: fragment '{s}' unavailable ({s})", .{ rel, parsed.value.fragment, @errorName(err) });
             return error.MissingMaterialFragment;
         };
+        if (try schema.missingTargetsMessage(a, entry.name, @tagName(cfg.platform), null, parsed.value.targets)) |msg| {
+            defer a.free(msg);
+            // Silenced in tests (a logged err fails the test runner), like component_collisions.
+            if (!@import("builtin").is_test) std.log.err("{s}", .{msg});
+            missing_targets = true;
+        }
         const name = try a.dupe(u8, entry.name);
         errdefer a.free(name);
         try names.append(a, name);
@@ -219,6 +231,7 @@ pub fn stage(a: std.mem.Allocator, game_dir: []const u8, target_dir: []const u8,
             std.log.err("materials/: game-owned materials require material contract v2 (labelle-bgfx >= {s} on labelle-core >= {s}); project pins {s} {s}. Bump the pin, or drop it to take the default.", .{ min_bgfx_for_materials, min_core_for_materials, v.what, v.pinned });
             return error.MaterialContractUnsupported;
         }
+        if (missing_targets) return error.MissingMaterialShaderTargets;
         std.mem.sort([]const u8, names.items, {}, struct {
             fn less(_: void, x: []const u8, y: []const u8) bool {
                 return std.mem.lessThan(u8, x, y);
@@ -377,4 +390,39 @@ test "contractViolation: the 0.21.0 floor applies to the OFFICIAL labelle-bgfx o
         .backend_package = .{ .name = "bgfx_v2", .repo = "github.com/acme/bgfx", .version = "0.1.0" },
         .core_version = "1.32.0",
     }));
+}
+
+test "stage: an Android material needs essl AND spv at generate time; wasm essl-only still passes (#812)" {
+    const a = std.testing.allocator;
+    const tio = std.testing.io;
+    const T = struct {
+        fn run(targets: []const u8, platform: config.Platform) ![][]const u8 {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            try tmp.dir.createDirPath(tio, "game/materials/room_lamp");
+            try tmp.dir.createDirPath(tio, "out");
+            const json = try std.fmt.allocPrint(std.testing.allocator, "{{\"version\":1,\"fragment\":\"lamp.sc\",\"targets\":{s}}}", .{targets});
+            defer std.testing.allocator.free(json);
+            try tmp.dir.writeFile(tio, .{ .sub_path = "game/materials/room_lamp/material.json", .data = json });
+            try tmp.dir.writeFile(tio, .{ .sub_path = "game/materials/room_lamp/lamp.sc", .data = "void main() {}\n" });
+            const root = try tmp.dir.realPathFileAlloc(tio, ".", std.testing.allocator);
+            defer std.testing.allocator.free(root);
+            const game = try std.fs.path.join(std.testing.allocator, &.{ root, "game" });
+            defer std.testing.allocator.free(game);
+            const out = try std.fs.path.join(std.testing.allocator, &.{ root, "out" });
+            defer std.testing.allocator.free(out);
+            return stage(std.testing.allocator, game, out, .{ .name = "g", .backend = .bgfx, .platform = platform });
+        }
+    };
+    try std.testing.expectError(error.MissingMaterialShaderTargets, T.run("[\"essl\"]", .android));
+    const ok = try T.run("[\"essl\",\"spv\"]", .android);
+    defer scanner.freeNames(a, ok);
+    try std.testing.expectEqual(@as(usize, 1), ok.len);
+    const web = try T.run("[\"essl\"]", .wasm);
+    defer scanner.freeNames(a, web);
+    try std.testing.expectEqual(@as(usize, 1), web.len);
+    // Desktop is decided by -Dtarget, so generate leaves it to the build graph.
+    const desk = try T.run("[\"essl\"]", .desktop);
+    defer scanner.freeNames(a, desk);
+    try std.testing.expectEqual(@as(usize, 1), desk.len);
 }
