@@ -65,8 +65,8 @@ pub const toolchain_api142: Toolchain = .{
 /// that table, so compiled materials are unchanged; the pin moves to keep
 /// one zbgfx commit across the toolkit.
 pub const toolchain_api161: Toolchain = .{
-    .url = "https://github.com/labelle-toolkit/zbgfx/archive/ca7fca67e702ff0ec83a6ab1cbb9ab5adc19b642.tar.gz",
-    .hash = "zbgfx-0.12.0-Sm4IxBnLDAe6b0tLyUlvs3J4KF_77Xibwj29DOkKwMzV",
+    .url = "https://github.com/labelle-toolkit/zbgfx/archive/00be71e39e162dd52f227a4440cd05a94afc41f7.tar.gz",
+    .hash = "zbgfx-0.12.0-Sm4IxP7kDAeTLPSbajOwMSXtT9drIcs-IOspJJA-RnJp",
     .glsl_profile = "330",
     .api = "161",
 };
