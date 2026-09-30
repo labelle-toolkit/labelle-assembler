@@ -244,6 +244,63 @@ pub fn platform(target: Target, project_platform: []const u8) []const u8 {
         .dx11 => "windows",
     };
 }
+/// The shader targets a material must list to build for `project_platform`
+/// (`config.Platform`'s tag name, or `"tests"`).
+///
+/// Android needs BOTH `essl` (GLES) and `spv` (Vulkan): any Android build can
+/// end up on either renderer (the Vulkan default, `auto`, a runtime override,
+/// or a GLES fallback/crash guard), so a missing variant must fail the build,
+/// not the device (labelle-bgfx#172 D6, labelle-assembler#812). wasm is
+/// WebGL2 only (`essl`); iOS is Metal (`mtl`). Desktop depends on the Zig
+/// target: `mtl` on Darwin, `spv` elsewhere.
+///
+/// `darwin` is whether the Zig target OS is Darwin, or null when it isn't
+/// known yet (at `labelle generate`, before `-Dtarget` is chosen). Returns null
+/// when the requirement can't be decided (desktop without a target) or
+/// doesn't apply (`"tests"` builds no renderer).
+pub fn requiredTargets(project_platform: []const u8, darwin: ?bool) ?[]const Target {
+    if (std.mem.eql(u8, project_platform, "tests")) return null;
+    if (std.mem.eql(u8, project_platform, "android")) return &.{ .essl, .spv };
+    if (std.mem.eql(u8, project_platform, "wasm")) return &.{.essl};
+    if (std.mem.eql(u8, project_platform, "ios")) return &.{.mtl};
+    const is_darwin = darwin orelse return null;
+    return if (is_darwin) &.{.mtl} else &.{.spv};
+}
+/// Why material `name` can't build for `project_platform`, naming every
+/// missing target, or null when its `targets` cover `requiredTargets` (or
+/// the requirement can't be decided yet). Caller owns the message. Shared by
+/// `labelle generate` (`material_pipeline.stage`, for the platforms it can
+/// decide) and the generated build graph (`material_build.create`, with the
+/// real target), so both report the same text.
+pub fn missingTargetsMessage(a: std.mem.Allocator, name: []const u8, project_platform: []const u8, darwin: ?bool, targets: []const Target) !?[]u8 {
+    const required = requiredTargets(project_platform, darwin) orelse return null;
+    var missing: [@typeInfo(Target).@"enum".fields.len]Target = undefined;
+    var n: usize = 0;
+    for (required) |r| {
+        if (std.mem.indexOfScalar(Target, targets, r) == null) {
+            missing[n] = r;
+            n += 1;
+        }
+    }
+    if (n == 0) return null;
+    var out = std.Io.Writer.Allocating.init(a);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.print("material '{s}': {s}", .{ name, project_platform });
+    if (std.mem.eql(u8, project_platform, "desktop")) try w.writeAll(if (darwin.?) " (Darwin)" else " (non-Darwin)");
+    try w.writeAll(if (required.len == 1) " builds need target " else " builds need targets ");
+    try writeTargetList(w, required);
+    try w.writeAll(" (missing: ");
+    try writeTargetList(w, missing[0..n]);
+    try w.print("); add {s} to \"targets\" in materials/{s}/material.json", .{ if (n == 1) "it" else "them", name });
+    return try out.toOwnedSlice();
+}
+fn writeTargetList(w: *std.Io.Writer, list: []const Target) !void {
+    for (list, 0..) |t, i| {
+        if (i != 0) try w.writeAll(if (i + 1 == list.len) " and " else ", ");
+        try w.writeAll(@tagName(t));
+    }
+}
 // Zig string escaping is shared by descriptors and build-file generation.
 pub fn quote(w: *std.Io.Writer, s: []const u8) !void {
     try w.print("\"{f}\"", .{std.zig.fmtString(s)});
@@ -330,4 +387,35 @@ test "shaderc platform follows the real target for the ambiguous metal/essl pair
     // A platform string the pipeline never emits falls back to the language map.
     try std.testing.expectEqualStrings("osx", platform(.mtl, "tests"));
     try std.testing.expectEqualStrings("android", platform(.essl, "tests"));
+}
+
+test "required targets: android needs essl AND spv, wasm essl, ios mtl, desktop by target (#812)" {
+    const a = std.testing.allocator;
+    // Android with only essl fails and names spv.
+    const msg = (try missingTargetsMessage(a, "room_lamp", "android", false, &.{.essl})) orelse return error.TestExpectedFailure;
+    defer a.free(msg);
+    try std.testing.expectEqualStrings("material 'room_lamp': android builds need targets essl and spv (missing: spv); add it to \"targets\" in materials/room_lamp/material.json", msg);
+    // Android with neither names both.
+    const both = (try missingTargetsMessage(a, "fog", "android", null, &.{.mtl})) orelse return error.TestExpectedFailure;
+    defer a.free(both);
+    try std.testing.expect(std.mem.indexOf(u8, both, "(missing: essl and spv)") != null);
+    // essl + spv passes on Android, whatever else is listed.
+    try std.testing.expect((try missingTargetsMessage(a, "room_lamp", "android", false, &.{ .essl, .spv })) == null);
+    try std.testing.expect((try missingTargetsMessage(a, "room_lamp", "android", null, &.{ .mtl, .essl, .glsl, .spv })) == null);
+    // wasm with only essl still passes; without essl it fails.
+    try std.testing.expect((try missingTargetsMessage(a, "fog", "wasm", false, &.{.essl})) == null);
+    const web = (try missingTargetsMessage(a, "fog", "wasm", null, &.{.spv})) orelse return error.TestExpectedFailure;
+    defer a.free(web);
+    try std.testing.expect(std.mem.indexOf(u8, web, "wasm builds need target essl (missing: essl)") != null);
+    // iOS and Darwin desktop need mtl; other desktops spv.
+    try std.testing.expect((try missingTargetsMessage(a, "fog", "ios", null, &.{.mtl})) == null);
+    try std.testing.expect((try missingTargetsMessage(a, "fog", "desktop", true, &.{.mtl})) == null);
+    try std.testing.expect((try missingTargetsMessage(a, "fog", "desktop", false, &.{.spv})) == null);
+    const mac = (try missingTargetsMessage(a, "fog", "desktop", true, &.{.spv})) orelse return error.TestExpectedFailure;
+    defer a.free(mac);
+    try std.testing.expect(std.mem.indexOf(u8, mac, "desktop (Darwin) builds need target mtl (missing: mtl)") != null);
+    // Undecidable (desktop at generate time) or inapplicable (tests): no verdict.
+    try std.testing.expect(requiredTargets("desktop", null) == null);
+    try std.testing.expect((try missingTargetsMessage(a, "fog", "tests", true, &.{.essl})) == null);
+    try std.testing.expectEqualSlices(Target, &.{ .essl, .spv }, requiredTargets("android", null).?);
 }

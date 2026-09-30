@@ -92,6 +92,6 @@ build(False, "shader fog")
 required_target = "mtl" if sys.platform == "darwin" else "spv"
 descriptor["targets"] = [t for t in ("glsl", "essl") if t != required_target]
 (root / "materials/fog/material.json").write_text(json.dumps(descriptor), encoding="utf-8")
-build(False, "target requires '%s'" % required_target)
+build(False, "(missing: %s)" % required_target)
 print("PASS: 12 real shader variants, generated core descriptors, cached rebuild, include invalidation, escaping include rejection, compiler failure, missing target diagnostic")
 print("Evidence fixture:", root)

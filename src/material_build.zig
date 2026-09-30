@@ -22,17 +22,17 @@ pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     const files = b.addWriteFiles();
     const varying = b.addWriteFiles().add("sprite-varying.def.sc", schema.varying);
     var source = std.Io.Writer.Allocating.init(b.allocator);
+    var missing_targets = std.Io.Writer.Allocating.init(b.allocator);
     source.writer.writeAll("comptime { if (!@hasDecl(@import(\"labelle-core\").backend_contract, \"MATERIAL_CONTRACT_VERSION\") or @import(\"labelle-core\").backend_contract.MATERIAL_CONTRACT_VERSION != 2) @compileError(\"game-owned materials require material contract v2\"); }\n") catch @panic("OOM");
     for (inputs) |input| {
         if (!schema.materialName(input.name)) std.debug.panic("materials/{s}: invalid or reserved material name", .{input.name});
         const parsed = schema.parse(b.allocator, input.json) catch |err| std.debug.panic("materials/{s}/material.json: {s}", .{ input.name, @errorName(err) });
         const d = parsed.value;
-        var has_required = false;
-        const required: schema.Target = if (std.mem.eql(u8, platform, "wasm") or std.mem.eql(u8, platform, "android")) .essl else if (target.result.os.tag.isDarwin()) .mtl else .spv;
-        for (d.targets) |variant| if (variant == required) {
-            has_required = true;
-        };
-        if (!has_required and !std.mem.eql(u8, platform, "tests")) std.debug.panic("materials/{s}/material.json: target requires '{s}' in targets", .{ input.name, @tagName(required) });
+        // Android needs essl AND spv (#812); see `schema.requiredTargets`.
+        // A build error, not a panic: it names every material and missing target.
+        if (schema.missingTargetsMessage(b.allocator, input.name, platform, target.result.os.tag.isDarwin(), d.targets) catch @panic("OOM")) |msg| {
+            missing_targets.writer.print("{s}{s}", .{ if (missing_targets.written().len == 0) "" else "\n", msg }) catch @panic("OOM");
+        }
         schema.render(&source.writer, input.name, d) catch @panic("OOM");
         for (d.targets) |variant| {
             const run = if (override) |exe| b.addSystemCommand(&.{exe}) else b.addRunArtifact(tool.artifact("shaderc"));
@@ -56,6 +56,8 @@ pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             _ = files.addCopyFile(run.addOutputFileArg(out_name), out_name);
         }
     }
+    // Fails whatever consumes the materials module, with the message and no stack trace.
+    if (missing_targets.written().len != 0) files.step.dependOn(&b.addFail(missing_targets.written()).step);
     return b.createModule(.{ .root_source_file = files.add("materials.zig", source.written()), .target = target, .optimize = optimize, .imports = &.{.{ .name = "labelle-core", .module = core }} });
 }
 fn trackTree(b: *std.Build, run: *std.Build.Step.Run, path: std.Build.LazyPath, validate: bool) void {
