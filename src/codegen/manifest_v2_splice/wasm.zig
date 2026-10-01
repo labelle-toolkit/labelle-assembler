@@ -27,7 +27,7 @@ const hook_import_name = common.hook_import_name;
 /// inline (no `resolve_target` hook — the triple is fixed, design §3). The build
 /// fn is `void` (not the enum `!void`): the emcc `try` moved into the hook's
 /// `post_wire`, which panics on failure.
-pub fn renderWasmHeaderV2(m: BackendManifestV2, w: anytype) !void {
+pub fn renderWasmHeaderV2(m: BackendManifestV2, wasm_threads: bool, w: anytype) !void {
     _ = m.platforms.wasm orelse return error.V2PlatformUnsupported;
     try w.print(
         \\const std = @import("std");
@@ -42,10 +42,23 @@ pub fn renderWasmHeaderV2(m: BackendManifestV2, w: anytype) !void {
         \\    const target = b.resolveTargetQuery(.{{
         \\        .cpu_arch = .wasm32,
         \\        .os_tag = .emscripten,
-        \\    }});
-        \\
         \\
     , .{hook_import_name});
+    // Threaded web build (labelle-web#24): shared memory needs atomics +
+    // bulk_memory on EVERY object, and emcc can't add them at link time.
+    // Emitted only on a threaded generation, so a normal header is unchanged.
+    if (wasm_threads) {
+        try w.writeAll(
+            \\        // Threaded web build (labelle-web#24): shared memory needs these.
+            \\        .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory }),
+            \\
+        );
+    }
+    try w.writeAll(
+        \\    });
+        \\
+        \\
+    );
 }
 
 /// v2 wasm core/gfx/engine dep decls — the declarative half of the enum `deps`
@@ -144,6 +157,13 @@ pub fn renderWasmLinkV2(m: BackendManifestV2, cfg: ProjectConfig, w: anytype) !v
         try w.print("    wasm.root_module.linkLibrary({s});\n", .{ident});
     }
 
+    // Threaded web build (labelle-web#24): Zig defaults wasm to
+    // single-threaded EVEN WITH +atomics, so every module opts out explicitly.
+    // The walk runs after the linkLibrary calls so the backend archives (and
+    // anything they link) are reached through `link_objects`. A local struct
+    // keeps the helper out of the shared footer: a normal build is unchanged.
+    if (cfg.wasm_threads) try w.writeAll(wasm_threads_walk);
+
     // GENERATED (H-post): the emcc residual (design §2 (c)) — delegated to the
     // backend hook's `post_wire`. wasm carries no SDK context (`ios_sdk_path` /
     // `android_target_sdk` are null); the hook resolves emsdk via
@@ -171,6 +191,16 @@ pub fn renderWasmLinkV2(m: BackendManifestV2, cfg: ProjectConfig, w: anytype) !v
     // false in the hook). A preview build against a too-old hook fails with a
     // "no field named 'editor_preview'" error naming this line — the intended
     // upgrade signal (labelle-bgfx >= 0.6.1).
+    // Threaded web build: tell the hook's emcc arm to link pthreads. Same
+    // emit-only-when-set rule as editor_preview (needs a hook whose
+    // HookContext declares `wasm_threads`: labelle-bgfx#199).
+    if (cfg.wasm_threads) {
+        try w.writeAll(
+            \\        // Threaded web build (labelle-web#24): emcc links pthreads.
+            \\        .wasm_threads = true,
+            \\
+        );
+    }
     if (cfg.editor_preview) {
         try w.writeAll(
             \\        // Editor preview (labelle-studio Play mode): keep the `_editor_*`
@@ -185,6 +215,31 @@ pub fn renderWasmLinkV2(m: BackendManifestV2, cfg: ProjectConfig, w: anytype) !v
         \\
     );
 }
+
+/// The module-graph walk a threaded generation emits (see `renderWasmLinkV2`).
+pub const wasm_threads_walk =
+    \\
+    \\    // Threaded web build (labelle-web#24): mark EVERY module in the graph
+    \\    // multi-threaded. Zig defaults wasm to single-threaded even with the
+    \\    // atomics feature, which would leave `std.Thread` unusable.
+    \\    {
+    \\        const MultiThreaded = struct {
+    \\            fn mark(a: std.mem.Allocator, m: *std.Build.Module, seen: *std.AutoHashMapUnmanaged(*std.Build.Module, void)) void {
+    \\                if (seen.contains(m)) return;
+    \\                seen.put(a, m, {}) catch @panic("OOM");
+    \\                m.single_threaded = false;
+    \\                for (m.import_table.values()) |dep| mark(a, dep, seen);
+    \\                for (m.link_objects.items) |lo| switch (lo) {
+    \\                    .other_step => |cs| mark(a, cs.root_module, seen),
+    \\                    else => {},
+    \\                };
+    \\            }
+    \\        };
+    \\        var mt_seen: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
+    \\        MultiThreaded.mark(b.allocator, wasm.root_module, &mt_seen);
+    \\    }
+    \\
+;
 
 /// v2 wasm FOOTER — the build-fn close + the `overrideImport`/`unifyGfxSubpackageCore`
 /// helper defs (byte-identical to the enum `wasm_footer`/`android_footer` tails),
@@ -309,4 +364,61 @@ test "artifactIdent: wasm decl + link sites sanitize a free-form name consistent
         defer testing.allocator.free(link_line);
         try testing.expect(std.mem.indexOf(u8, link.written(), link_line) != null);
     }
+}
+
+test "wasm threads: off renders no thread wiring; on adds features, walk and hook field (labelle-web#24)" {
+    const artifacts = [_]BackendManifestV2.ArtifactDecl{.{ .name = "bgfx" }};
+    const m: BackendManifestV2 = .{
+        .manifest_version = 2,
+        .dir_name = "x",
+        .dep_name = "labelle_x",
+        .modules = &.{},
+        .platforms = .{ .wasm = .{
+            .entry = "main.zig",
+            .loop_style = .callback,
+            .target = .{ .triple = "wasm32-emscripten" },
+            .artifacts = &artifacts,
+            .package = .{ .web = .{} },
+        } },
+    };
+    const markers = [_][]const u8{ "cpu_features_add", "single_threaded = false", ".wasm_threads = true" };
+
+    inline for (.{ false, true }) |threads| {
+        const cfg = ProjectConfig{ .name = "g", .platform = .wasm, .wasm_threads = threads };
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        try renderWasmHeaderV2(m, threads, &out.writer);
+        try renderWasmLinkV2(m, cfg, &out.writer);
+        const text = out.written();
+        for (markers) |marker| {
+            try testing.expectEqual(threads, std.mem.indexOf(u8, text, marker) != null);
+        }
+        // The target query is closed either way.
+        try testing.expect(std.mem.indexOf(u8, text, ".os_tag = .emscripten,\n") != null);
+    }
+}
+
+test "wasm threads: the walk runs after the backend archives are linked" {
+    const artifacts = [_]BackendManifestV2.ArtifactDecl{.{ .name = "bgfx" }};
+    const m: BackendManifestV2 = .{
+        .manifest_version = 2,
+        .dir_name = "x",
+        .dep_name = "labelle_x",
+        .modules = &.{},
+        .platforms = .{ .wasm = .{
+            .entry = "main.zig",
+            .loop_style = .callback,
+            .target = .{ .triple = "wasm32-emscripten" },
+            .artifacts = &artifacts,
+            .package = .{ .web = .{} },
+        } },
+    };
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try renderWasmLinkV2(m, .{ .name = "g", .platform = .wasm, .wasm_threads = true }, &out.writer);
+    const text = out.written();
+    const link = std.mem.indexOf(u8, text, "linkLibrary(bgfx)").?;
+    const walk = std.mem.indexOf(u8, text, "MultiThreaded.mark(").?;
+    const hook = std.mem.indexOf(u8, text, "post_wire(").?;
+    try testing.expect(link < walk and walk < hook);
 }

@@ -80,6 +80,51 @@ pub fn applyEditorPreview(cfg: *ProjectConfig, env_value: ?[]const u8) void {
     }
 }
 
+/// Normalize the threaded-web-build request (labelle-web#24): WASM-ONLY, so
+/// it's NORMALIZED OFF on every other platform (a desktop build run with the
+/// var set stays byte-identical). On wasm, honor an explicit
+/// `cfg.wasm_threads` (`--wasm-threads`) or read `LABELLE_WASM_THREADS`.
+pub fn normalizeWasmThreads(allocator: std.mem.Allocator, cfg: *ProjectConfig) void {
+    const env = config.globalEnviron().getAlloc(allocator, "LABELLE_WASM_THREADS") catch null;
+    defer if (env) |v| allocator.free(v);
+    applyWasmThreads(cfg, env);
+    if (cfg.wasm_threads) {
+        std.log.info(
+            "labelle-assembler: threaded wasm build (LABELLE_WASM_THREADS) — atomics + bulk_memory, every module multi-threaded, emcc -pthread; serve it cross-origin isolated (COOP/COEP)",
+            .{},
+        );
+    }
+}
+
+/// Pure half of `normalizeWasmThreads`, so tests can supply the env value.
+pub fn applyWasmThreads(cfg: *ProjectConfig, env_value: ?[]const u8) void {
+    if (cfg.platform != .wasm) {
+        cfg.wasm_threads = false;
+    } else if (!cfg.wasm_threads) {
+        if (env_value) |v| cfg.wasm_threads = config.wasmThreadsEnvEnabled(v);
+    }
+}
+
+test "applyWasmThreads: wasm-only, env or flag (labelle-web#24)" {
+    var desktop = ProjectConfig{ .name = "g", .platform = .desktop, .wasm_threads = true };
+    applyWasmThreads(&desktop, "1");
+    try std.testing.expect(!desktop.wasm_threads);
+
+    var wasm_env = ProjectConfig{ .name = "g", .platform = .wasm };
+    applyWasmThreads(&wasm_env, "1");
+    try std.testing.expect(wasm_env.wasm_threads);
+
+    var wasm_off = ProjectConfig{ .name = "g", .platform = .wasm };
+    applyWasmThreads(&wasm_off, "0");
+    try std.testing.expect(!wasm_off.wasm_threads);
+    applyWasmThreads(&wasm_off, null);
+    try std.testing.expect(!wasm_off.wasm_threads);
+
+    var wasm_flag = ProjectConfig{ .name = "g", .platform = .wasm, .wasm_threads = true };
+    applyWasmThreads(&wasm_flag, null);
+    try std.testing.expect(wasm_flag.wasm_threads);
+}
+
 /// Editor-preview link-path gate (#526 review, codex P2). The `editor_*`
 /// exports reach the emcc link ONLY through the manifest-v2 wasm splice
 /// (`renderWasmLinkV2` → backend hook `post_wire`). On any other wasm build
