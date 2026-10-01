@@ -39,18 +39,18 @@ pub fn renderWasmHeaderV2(m: BackendManifestV2, wasm_threads: bool, w: anytype) 
         \\
         \\    // WASM/Emscripten: a STATIC wasm32-emscripten target (design §3 — a
         \\    // fixed .triple, so NO resolve_target hook; the target resolves here).
-        \\    const target = b.resolveTargetQuery(.{{
+        \\{s}    const target = b.resolveTargetQuery(.{{
         \\        .cpu_arch = .wasm32,
         \\        .os_tag = .emscripten,
         \\
-    , .{hook_import_name});
+    , .{ hook_import_name, if (wasm_threads) wasm_threads_option else "" });
     // Threaded web build (labelle-web#24): shared memory needs atomics +
     // bulk_memory on EVERY object, and emcc can't add them at link time.
     // Emitted only on a threaded generation, so a normal header is unchanged.
     if (wasm_threads) {
         try w.writeAll(
             \\        // Threaded web build (labelle-web#24): shared memory needs these.
-            \\        .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory }),
+            \\        .cpu_features_add = if (wasm_threads) std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory }) else .empty,
             \\
         );
     }
@@ -60,6 +60,17 @@ pub fn renderWasmHeaderV2(m: BackendManifestV2, wasm_threads: bool, w: anytype) 
         \\
     );
 }
+
+/// The build option a threaded generation declares BEFORE the target query
+/// (see `renderWasmHeaderV2`): `-Dwasm_threads=false` builds the same
+/// generated tree single-threaded, which is how the web provider makes the
+/// non-isolated fallback at export without regenerating (labelle-web#24).
+pub const wasm_threads_option =
+    \\    // Threaded web build (labelle-web#24). `-Dwasm_threads=false` builds
+    \\    // this same tree single-threaded: the provider's export fallback.
+    \\    const wasm_threads = b.option(bool, "wasm_threads", "Link Emscripten pthreads (default true; false = single-threaded fallback)") orelse true;
+    \\
+;
 
 /// v2 wasm core/gfx/engine dep decls — the declarative half of the enum `deps`
 /// section, WITHOUT the unrolled `overrideImport` diamond + `unifyGfxSubpackageCore`
@@ -196,8 +207,9 @@ pub fn renderWasmLinkV2(m: BackendManifestV2, cfg: ProjectConfig, w: anytype) !v
     // HookContext declares `wasm_threads`: labelle-bgfx#199).
     if (cfg.wasm_threads) {
         try w.writeAll(
-            \\        // Threaded web build (labelle-web#24): emcc links pthreads.
-            \\        .wasm_threads = true,
+            \\        // Threaded web build (labelle-web#24): emcc links pthreads
+            \\        // unless built with -Dwasm_threads=false (the fallback).
+            \\        .wasm_threads = wasm_threads,
             \\
         );
     }
@@ -222,7 +234,7 @@ pub const wasm_threads_walk =
     \\    // Threaded web build (labelle-web#24): mark EVERY module in the graph
     \\    // multi-threaded. Zig defaults wasm to single-threaded even with the
     \\    // atomics feature, which would leave `std.Thread` unusable.
-    \\    {
+    \\    if (wasm_threads) {
     \\        const MultiThreaded = struct {
     \\            fn mark(a: std.mem.Allocator, m: *std.Build.Module, seen: *std.AutoHashMapUnmanaged(*std.Build.Module, void)) void {
     \\                if (seen.contains(m)) return;
@@ -381,7 +393,7 @@ test "wasm threads: off renders no thread wiring; on adds features, walk and hoo
             .package = .{ .web = .{} },
         } },
     };
-    const markers = [_][]const u8{ "cpu_features_add", "single_threaded = false", ".wasm_threads = true" };
+    const markers = [_][]const u8{ "cpu_features_add", "single_threaded = false", ".wasm_threads = wasm_threads", "b.option(bool, \"wasm_threads\"" };
 
     inline for (.{ false, true }) |threads| {
         const cfg = ProjectConfig{ .name = "g", .platform = .wasm, .wasm_threads = threads };
