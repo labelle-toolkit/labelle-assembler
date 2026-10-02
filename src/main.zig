@@ -102,6 +102,10 @@ const usage =
     \\  --platform <name>       Override target platform (desktop, wasm, ios, android)
     \\  --target <name>         Alias for --platform (the CLI's target name)
     \\  --backend <name>        Override graphics backend (raylib, sokol, sdl, bgfx, wgpu)
+    \\  --wasm-threads          Threaded wasm build (Emscripten pthreads, labelle-web#24);
+    \\                          equivalent to LABELLE_WASM_THREADS=1. Wasm-only —
+    \\                          ignored on every other platform. Serve the result
+    \\                          cross-origin isolated (COOP/COEP).
     \\  --editor-preview        Editor-preview wasm build (labelle-studio Play mode);
     \\                          equivalent to LABELLE_EDITOR_PREVIEW=1. Wasm-only —
     \\                          ignored on every other platform.
