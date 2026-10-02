@@ -432,6 +432,12 @@ pub const HookContext = struct {
     /// build; only an editor-preview generation requires a hook that
     /// declares it (labelle-bgfx >= 0.6.1).
     editor_preview: bool = false,
+
+    /// Threaded web build (labelle-web#24, wasm only): the hook's emcc arm
+    /// links Emscripten pthreads. DEFAULTED like `editor_preview`: emitted
+    /// only on a threaded generation, so normal builds stay byte-identical
+    /// and keep compiling against hooks that predate the field.
+    wasm_threads: bool = false,
 };
 
 // ── Header-first bounded version parse (design §3/§6) ─────────────────────

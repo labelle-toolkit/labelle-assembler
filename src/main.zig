@@ -102,6 +102,10 @@ const usage =
     \\  --platform <name>       Override target platform (desktop, wasm, ios, android)
     \\  --target <name>         Alias for --platform (the CLI's target name)
     \\  --backend <name>        Override graphics backend (raylib, sokol, sdl, bgfx, wgpu)
+    \\  --wasm-threads          Threaded wasm build (Emscripten pthreads, labelle-web#24);
+    \\                          equivalent to LABELLE_WASM_THREADS=1. Wasm-only —
+    \\                          ignored on every other platform. Serve the result
+    \\                          cross-origin isolated (COOP/COEP).
     \\  --editor-preview        Editor-preview wasm build (labelle-studio Play mode);
     \\                          equivalent to LABELLE_EDITOR_PREVIEW=1. Wasm-only —
     \\                          ignored on every other platform.
@@ -211,6 +215,7 @@ fn cmdGenerate(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args
     // name can be reported against the backend it resolved to.
     var target_override: ?[]const u8 = null;
     var editor_preview = false;
+    var wasm_threads = false;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--project-root")) {
@@ -257,6 +262,11 @@ fn cmdGenerate(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args
             // this flag is the direct spelling for local testing. `generate`
             // normalizes it off for non-wasm platforms.
             editor_preview = true;
+        } else if (std.mem.eql(u8, arg, "--wasm-threads")) {
+            // Threaded web build (labelle-web#24). The provider's activation
+            // path is LABELLE_WASM_THREADS=1; this is the direct spelling.
+            // `generate` normalizes it off for non-wasm platforms.
+            wasm_threads = true;
         } else {
             std.log.err("labelle-assembler generate: unknown flag '{s}'", .{arg});
             std.process.exit(2);
@@ -292,6 +302,7 @@ fn cmdGenerate(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args
         cfg.platform = p;
     }
     if (editor_preview) cfg.editor_preview = true;
+    if (wasm_threads) cfg.wasm_threads = true;
 
     // Resolve GUI plugin (reads gui.labelle manifest from plugin directory)
     // and populates cfg.resolved_gui. Must run before gen.generate so the

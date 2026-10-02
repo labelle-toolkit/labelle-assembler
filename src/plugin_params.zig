@@ -513,6 +513,26 @@ pub fn parseProjectConfig(
     gpa: std.mem.Allocator,
     source: [:0]const u8,
 ) !config.ProjectConfig {
+    const cfg = try parseProjectConfigFields(gpa, source);
+    // `.wasm_threads` is per-generation (LABELLE_WASM_THREADS / --wasm-threads,
+    // set by the web provider's `"threads": true`). Set in project.labelle it
+    // would generate a threaded build behind the provider's back: served
+    // without COOP/COEP and exported without the single-threaded fallback, so
+    // the page fails to start (labelle-web#24).
+    if (cfg.wasm_threads) {
+        std.debug.print(
+            "labelle-assembler: project.labelle: `.wasm_threads` is not a project setting; turn threads on with \"threads\": true in the web provider's config (providers/web.json)\n",
+            .{},
+        );
+        return error.WasmThreadsInProjectConfig;
+    }
+    return cfg;
+}
+
+fn parseProjectConfigFields(
+    gpa: std.mem.Allocator,
+    source: [:0]const u8,
+) !config.ProjectConfig {
     // The typed ProjectConfig parse is comptime-heavy (the callers'
     // pre-#591 parse sites carried the same quota).
     @setEvalBranchQuota(10000);
@@ -1361,6 +1381,20 @@ test "parseProjectConfig: heterogeneous bag parses; bag attached; other fields i
     // The blanked `.{}` parses to a present-but-empty typed Params.
     try testing.expect(cfg.plugins[0].params != null);
     try testing.expect(cfg.plugins[0].params.?.language == null);
+}
+
+test "parseProjectConfig: `.wasm_threads` in project.labelle is rejected (labelle-web#24)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src: [:0]const u8 =
+        \\.{ .name = "g", .wasm_threads = true }
+    ;
+    try testing.expectError(error.WasmThreadsInProjectConfig, parseProjectConfig(arena.allocator(), src));
+    // `false` (the default) is harmless and still parses.
+    const off: [:0]const u8 =
+        \\.{ .name = "g", .wasm_threads = false }
+    ;
+    _ = try parseProjectConfig(arena.allocator(), off);
 }
 
 test "parseProjectConfig: `.plugin_events = .all` parses; omitted defaults to .consumed (#630)" {

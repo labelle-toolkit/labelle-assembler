@@ -1043,7 +1043,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // manifest-v2 wasm: the header imports the backend hook and resolves the
         // STATIC wasm32-emscripten target inline (design §3 — a fixed .triple, so NO
         // resolve_target hook).
-        try manifest_v2_splice.renderWasmHeaderV2(manifest, w);
+        try manifest_v2_splice.renderWasmHeaderV2(manifest, cfg.wasm_threads, w);
     } else if (cfg.platform == .ios) {
         // manifest-v2 ios: the header imports the backend hook and resolves BOTH the
         // ios target and the SDK path via `resolve_target` (design §4).

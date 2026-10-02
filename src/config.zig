@@ -48,6 +48,13 @@ pub fn globalEnviron() std.process.Environ {
 /// the empty string — is OFF, so `LABELLE_EDITOR_PREVIEW=0` explicitly
 /// disables preview even when a wrapper exported the var. Pure so the parsing
 /// rule is unit-testable without touching the process environment.
+/// Interpret the `LABELLE_WASM_THREADS` env-var value (labelle-web#24): the
+/// same spelling rules as `LABELLE_EDITOR_PREVIEW` (`1`/`true` on, anything
+/// else off).
+pub fn wasmThreadsEnvEnabled(value: []const u8) bool {
+    return editorPreviewEnvEnabled(value);
+}
+
 pub fn editorPreviewEnvEnabled(value: []const u8) bool {
     return std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true");
 }
@@ -1384,6 +1391,18 @@ pub const ProjectConfig = struct {
     /// `generate` normalizes this OFF for every non-wasm platform, so a
     /// stray env var can never perturb a desktop/android/ios build.
     editor_preview: bool = false,
+
+    /// Threaded web build (Emscripten pthreads, labelle-web#24). Like
+    /// `editor_preview`, NOT meant to be set in `project.labelle`: activated
+    /// per-generation by `LABELLE_WASM_THREADS=1` (the web provider runs its
+    /// threaded build with it set, next to a single-threaded fallback build)
+    /// or by the assembler's own `--wasm-threads` flag, and normalized OFF for
+    /// every non-wasm platform. When true, the generated wasm build.zig gives
+    /// the target the `atomics` + `bulk_memory` features, marks EVERY module
+    /// in the graph `single_threaded = false` (Zig defaults wasm to
+    /// single-threaded even with +atomics), and threads `.wasm_threads =
+    /// true` into the backend hook's `post_wire` so emcc links pthreads.
+    wasm_threads: bool = false,
 
     /// Check if a plugin is enabled by name.
     pub fn hasPlugin(self: ProjectConfig, name: []const u8) bool {

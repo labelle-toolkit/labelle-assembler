@@ -378,6 +378,8 @@ pub fn generate(
     // access goes through the process `Environ` (`config.globalEnviron`),
     // same as `cache/env.zig`.
     generate_phases.normalizeEditorPreview(allocator, &cfg);
+    // Threaded web build (labelle-web#24): same per-generation, wasm-only shape.
+    generate_phases.normalizeWasmThreads(allocator, &cfg);
 
     const io = config.globalIo();
 
