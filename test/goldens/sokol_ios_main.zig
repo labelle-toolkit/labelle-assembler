@@ -438,6 +438,7 @@ export fn init() callconv(.c) void {
     const allocator = gpa.allocator();
     g = AssembledGame.init(allocator);
     g.setHooks(&hooks);
+    if (comptime @hasDecl(AssembledGame, "bindCursorWindow")) g.bindCursorWindow(window);
     // ── Image asset backend wiring (Asset Streaming RFC, #53) ──
     // `engine.ImageLoader.setBackend` installs function-pointer adapters
     // that marshal between `BackendGfx`'s `DecodedImage`/`Texture` and

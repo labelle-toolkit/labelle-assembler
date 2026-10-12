@@ -1801,3 +1801,25 @@ pub const WINDOW_ICON = struct {
         }
     }
 };
+
+
+pub const CURSOR_BINDING = struct {
+    fn verify(source: []const u8) !void {
+        const bind = std.mem.indexOf(u8, source, "if (comptime @hasDecl(AssembledGame, \"bindCursorWindow\")) g.bindCursorWindow(window);") orelse return error.MissingCursorBinding;
+        const init = std.mem.indexOf(u8, source, "g = AssembledGame.init(") orelse return error.MissingInit;
+        const setup = std.mem.indexOf(u8, source, "runner.setup(&g);") orelse return error.MissingSetup;
+        try std.testing.expect(init < bind and bind < setup);
+    }
+    test "loop startup binds cursor after game init and before scripts" {
+        const source = try SYSTEM_LOCALE.generateMain(.desktop, raylib_lifecycle);
+        defer std.testing.allocator.free(source);
+        try verify(source);
+    }
+    test "callback startup binds cursor after game init and before scripts" {
+        h.setBgfxAndroidLifecycle();
+        defer h.clearLifecycleOverrides();
+        const source = try SYSTEM_LOCALE.generateMain(.android, bgfx_android_lifecycle);
+        defer std.testing.allocator.free(source);
+        try verify(source);
+    }
+};

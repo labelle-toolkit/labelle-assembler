@@ -457,6 +457,7 @@ pub fn build(b: *std.Build) void {
         // index-aligned, and a bad declaration is a hard error.
         "test/hook_ordering_tests.zig",
         "test/animation_assets_tests.zig",
+        "test/cursor_binding_tests.zig",
         // The HOOK ROUTE INSPECTOR (labelle-assembler#724,
         // docs/design/hook-route-inspection.md). The load-bearing test
         // generates a `main.zig` through the real emitter and compares the
@@ -477,6 +478,7 @@ pub fn build(b: *std.Build) void {
         "test/i18n_system_locale_tests.zig",
     };
 
+    const cursor_test_step = b.step("test-cursor", "Test generated cursor binding and startup ordering");
     for (test_files) |test_file| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
@@ -492,6 +494,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         const run_test = b.addRunArtifact(t);
+        if (std.mem.eql(u8, test_file, "test/cursor_binding_tests.zig") or std.mem.eql(u8, test_file, "test/main_zig_tests.zig")) cursor_test_step.dependOn(&run_test.step);
         test_step.dependOn(&run_test.step);
         if (std.mem.eql(u8, test_file, "test/build_zig_tests.zig") or std.mem.eql(u8, test_file, "test/build_zig_zon_tests.zig")) material_test_step.dependOn(&run_test.step);
         if (std.mem.eql(u8, test_file, "test/apk_assets_tests.zig")) {
