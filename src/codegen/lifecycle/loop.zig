@@ -73,6 +73,12 @@ pub fn emitSystemLocale(w: anytype) !void {
     try w.writeAll("    }\n\n");
 }
 
+/// Bind the optional shared cursor seam before any script setup runs. Older
+/// engines fold this away; newer engines adapt older window backends safely.
+pub fn emitCursorBinding(w: anytype) !void {
+    try w.writeAll("    if (comptime @hasDecl(AssembledGame, \"bindCursorWindow\")) g.bindCursorWindow(window);\n");
+}
+
 pub fn Mixin(comptime Self: type) type {
     return struct {
         pub fn buildSetupCode(self: *Self) ![]const u8 {
@@ -86,6 +92,8 @@ pub fn Mixin(comptime Self: type) type {
             const w = &alloc_writer.writer;
 
             try @import("../blocks/animation_assets.zig").emit(w, self.animation_jsonc_names, .try_style);
+
+            try emitCursorBinding(w);
 
             // Window icon hand-off (labelle-cli#359). Desktop only: the
             // loop templates call `window.initWindow` before `{{setup_code}}`,
