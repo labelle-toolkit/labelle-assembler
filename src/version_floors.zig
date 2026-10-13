@@ -284,6 +284,7 @@ const TrioFloor = struct {
 /// that compiles — hence the assertion, with the distinction recorded here
 /// so nobody later "fixes" a legitimate compile failure by relaxing it.
 const trio_floors = [_]TrioFloor{
+    .{ .subject = .engine, .subject_at_least = "4.1.0", .requires = .core, .floor = "2.2.0", .severity = .compile_break, .why = "engine 4.1.0 uses core CursorControls, which only core >= 2.2.0 declares" },
     .{ .subject = .gfx, .subject_at_least = "2.0.0", .requires = .core, .floor = "2.0.0", .severity = .compile_break, .why = "gfx 2.x dispatches material draws through core's `shader_material` contract, which only core >= 2.0.0 declares" },
     .{ .subject = .gfx, .subject_at_least = "2.0.0", .requires = .engine, .floor = "3.0.0", .severity = .compile_break, .why = "an engine below 3.0.0 still compiles the PixelWater simulation the 2.0.0 line removed from core and gfx" },
     .{ .subject = .engine, .subject_at_least = "3.0.0", .requires = .core, .floor = "2.0.0", .severity = .compile_break, .why = "engine 3.x's entity material API is built on core 2.0.0's `shader_material` contract" },
@@ -1053,4 +1054,12 @@ test "a project with NO .backend and a core below bgfx's floor is refused with a
     var ray = cfg;
     ray.backend = .raylib;
     try std.testing.expect(!(try verdict(ray)).refused());
+}
+
+test "shared cursor engine requires core 2.2.0" {
+    const hit = (try trioFloorViolation("2.1.0", "4.1.0", "2.2.0")).?;
+    try std.testing.expectEqualStrings("2.2.0", hit.floor.floor);
+    try std.testing.expectEqual(FloorSeverity.compile_break, hit.severity());
+    try std.testing.expect((try trioFloorViolation("2.2.0", "4.1.0", "2.2.0")) == null);
+    try std.testing.expect((try trioFloorViolation("2.1.0", "4.0.0", "2.2.0")) == null);
 }
