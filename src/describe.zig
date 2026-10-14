@@ -136,18 +136,18 @@ const BuiltinSnapshot = struct {
 };
 
 const builtin_snapshots = [_]BuiltinSnapshot{
-    // labelle-bgfx v0.30.0 backend.manifest.v2.zon
-    .{ .backend = .bgfx, .version = "0.30.0", .capabilities = &.{ .android, .surface_loss, .compressed_textures, .screenshots, .gamepad_polling, .raw_gui_adapter, .wasm } },
+    // labelle-bgfx v0.31.0 backend.manifest.v2.zon
+    .{ .backend = .bgfx, .version = "0.31.0", .capabilities = &.{ .android, .surface_loss, .compressed_textures, .screenshots, .gamepad_polling, .raw_gui_adapter, .wasm } },
     // labelle-wgpu v0.3.0
     .{ .backend = .wgpu, .version = "0.3.0", .capabilities = &.{.compressed_textures} },
     // labelle-null v0.3.0
     .{ .backend = .null, .version = "0.3.0", .capabilities = &.{.headless} },
     // labelle-sdl v0.3.1
     .{ .backend = .sdl, .version = "0.3.1", .capabilities = &.{.gamepad_polling} },
-    // labelle-raylib v0.3.0
-    .{ .backend = .raylib, .version = "0.3.0", .capabilities = &.{ .screenshots, .compressed_textures, .fonts, .gamepad_polling, .wasm, .audio_ogg } },
-    // labelle-sokol v0.8.0
-    .{ .backend = .sokol, .version = "0.8.0", .capabilities = &.{ .screenshots, .compressed_textures, .fonts, .gamepad_polling, .raw_gui_adapter, .surface_loss, .wasm, .android, .ios, .audio_ogg } },
+    // labelle-raylib v0.3.1
+    .{ .backend = .raylib, .version = "0.3.1", .capabilities = &.{ .screenshots, .compressed_textures, .fonts, .gamepad_polling, .wasm, .audio_ogg } },
+    // labelle-sokol v0.8.1
+    .{ .backend = .sokol, .version = "0.8.1", .capabilities = &.{ .screenshots, .compressed_textures, .fonts, .gamepad_polling, .raw_gui_adapter, .surface_loss, .wasm, .android, .ios, .audio_ogg } },
 };
 
 /// The snapshot for `bp` when it is a first-party package at its default
@@ -611,7 +611,7 @@ test "describe: JSON shape (golden)" {
         \\    "name": "raylib",
         \\    "id": "labelle.raylib",
         \\    "repo": "github.com/labelle-toolkit/labelle-raylib",
-        \\    "version": "0.3.0",
+        \\    "version": "0.3.1",
         \\    "local_path": null
         \\  },
         \\  "asset_format": "astc",
@@ -624,7 +624,7 @@ test "describe: JSON shape (golden)" {
     try testing.expectEqualStrings(golden, out.written());
 
     // And the installed, supported form carries `package_dir` and no `reason`.
-    try f.installPackage("plugins/github.com/labelle-toolkit/labelle-raylib/0.3.0", try manifestV2(f.arena(), "labelle.raylib", ".screenshots", loop_desktop));
+    try f.installPackage(raylib_dir, try manifestV2(f.arena(), "labelle.raylib", ".screenshots", loop_desktop));
     const i = try describe(f.arena(), cfg, f.dir, "desktop");
     var out2: std.Io.Writer.Allocating = .init(f.arena());
     try writeJson(&out2.writer, i);
@@ -704,6 +704,7 @@ const acme_dir = "plugins/github.com/acme/labelle-acme/1.0.0";
 const sokol_cfg = ".{ .name = \"g\", .y_axis = .up, .backend = .sokol }";
 const sokol_dir = "plugins/github.com/labelle-toolkit/labelle-sokol/" ++ ProjectConfig.builtinProvider(.sokol).?.version;
 const bgfx_dir = "plugins/github.com/labelle-toolkit/labelle-bgfx/" ++ ProjectConfig.builtinProvider(.bgfx).?.version;
+const raylib_dir = "plugins/github.com/labelle-toolkit/labelle-raylib/" ++ ProjectConfig.builtinProvider(.raylib).?.version;
 
 fn caseManifest(a: std.mem.Allocator, c: Case) ![]const u8 {
     if (c.raw) |r| {
@@ -757,7 +758,7 @@ const cases = [_]Case{
     .{ .name = "entry template missing", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .platforms = ".desktop = .{ .entry = \"t/missing.txt\", .loop_style = .loop, .target = .native, .package = .binary },", .expect = "TemplateNotFound", .expect_id = "acme.acme" },
     .{ .name = "unknown builtin root build dep", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .platforms = ".desktop = .{ .entry = \"t/d.txt\", .loop_style = .loop, .target = .native, .package = .binary, .root_build_deps = .{ .{ .name = \"ndk\", .resolution = .builtin } } },", .expect = "UnknownBuiltinRootDep", .expect_id = "acme.acme" },
     .{ .name = "declared build hook missing", .cfg = acme_cfg, .pkg = acme_dir, .raw = "BUILD_HOOK", .expect = "FileNotFound", .expect_id = "acme.acme" },
-    .{ .name = "version floor (bgfx 0.30.0 on core 1.32.0)", .cfg = ".{ .name = \"g\", .y_axis = .up, .backend = .bgfx, .core_version = \"1.32.0\", .engine_version = \"2.12.2\", .gfx_version = \"1.30.1\" }", .pkg = bgfx_dir, .id = "labelle.bgfx", .expect = "VersionFloorViolation", .expect_id = "labelle.bgfx" },
+    .{ .name = "version floor (default bgfx on core 1.32.0)", .cfg = ".{ .name = \"g\", .y_axis = .up, .backend = .bgfx, .core_version = \"1.32.0\", .engine_version = \"2.12.2\", .gfx_version = \"1.30.1\" }", .pkg = bgfx_dir, .id = "labelle.bgfx", .expect = "VersionFloorViolation", .expect_id = "labelle.bgfx" },
     .{ .name = "entry template is a directory", .cfg = acme_cfg, .pkg = acme_dir, .id = "acme.acme", .platforms = ".desktop = .{ .entry = \"t\", .loop_style = .loop, .target = .native, .package = .binary },", .expect = "TemplateNotFound", .expect_id = "acme.acme" },
     .{ .name = "editor preview via env on wasm, no v2 wasm entry", .cfg = acme_cfg, .target = "wasm", .env = "1", .pkg = acme_dir, .id = "acme.acme", .caps = ".wasm", .expect = "EditorPreviewUnsupportedByBackend", .expect_id = "acme.acme" },
     .{ .name = "editor preview via env is normalized off on desktop", .cfg = acme_cfg, .env = "1", .pkg = acme_dir, .id = "acme.acme", .expect = null, .expect_id = "acme.acme" },
@@ -852,7 +853,7 @@ test "describe: an unknown target still reads the installed manifest for backend
 test "describe: an installed package dir with no manifest keeps capabilities_source unknown" {
     var f = try Fixture.init();
     defer f.deinit();
-    try f.installFile("plugins/github.com/labelle-toolkit/labelle-raylib/0.3.0", null, "");
+    try f.installFile(raylib_dir, null, "");
     const d = try describe(f.arena(), try f.parse(".{ .name = \"g\", .backend = .raylib }"), f.dir, "desktop");
     try testing.expect(!d.supported);
     try testing.expectEqual(CapabilitySource.unknown, d.capabilities_source);
@@ -862,7 +863,7 @@ test "describe: an installed package dir with no manifest keeps capabilities_sou
 test "describe: installed-but-no-manifest human wording follows package_dir, not 'not installed' (#777)" {
     var f = try Fixture.init();
     defer f.deinit();
-    try f.installFile("plugins/github.com/labelle-toolkit/labelle-raylib/0.3.0", null, "");
+    try f.installFile(raylib_dir, null, "");
     const d = try describe(f.arena(), try f.parse(".{ .name = \"g\", .backend = .raylib }"), f.dir, "desktop");
     try testing.expect(d.package_dir != null);
     try testing.expectEqual(CapabilitySource.unknown, d.capabilities_source);

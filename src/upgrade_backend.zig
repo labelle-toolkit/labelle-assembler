@@ -646,16 +646,16 @@ test "upgrade backend: no .backend at all inserts .backend = .bgfx with the pack
     defer ar.deinit();
     const src = ".{ .name = \"g\", .core_version = \"2.1.0\", .engine_version = \"3.4.1\", .gfx_version = \"2.2.0\" }";
     const before = try parse(ar.a(), src);
-    const out = try plan(ar.a(), src, "0.31.0");
+    const out = try plan(ar.a(), src, "0.32.0");
     try testing.expectEqual(Outcome.Kind.rewrite, out.kind);
     try testing.expectEqualStrings(
-        ".{ .name = \"g\", .core_version = \"2.1.0\", .engine_version = \"3.4.1\", .gfx_version = \"2.2.0\", .backend = .bgfx, .backend_package = .{ .name = \"bgfx\", .repo = \"github.com/labelle-toolkit/labelle-bgfx\", .version = \"0.31.0\" } }",
+        ".{ .name = \"g\", .core_version = \"2.1.0\", .engine_version = \"3.4.1\", .gfx_version = \"2.2.0\", .backend = .bgfx, .backend_package = .{ .name = \"bgfx\", .repo = \"github.com/labelle-toolkit/labelle-bgfx\", .version = \"0.32.0\" } }",
         out.content,
     );
     const after = try parse(ar.a(), out.content);
     try testing.expectEqual(config.Backend.bgfx, after.effectiveBackend());
     try testing.expectEqual(before.effectiveGamepad(), after.effectiveGamepad());
-    try testing.expectEqualStrings("0.31.0", after.backend_package.?.version);
+    try testing.expectEqualStrings("0.32.0", after.backend_package.?.version);
 }
 
 test "upgrade backend: an explicit first-party package is bumped in place to the builtin default; only the version bytes change" {
@@ -881,10 +881,10 @@ test "upgrade backend: versions are strict semver — 1.2.3.4, 1.2, v1.2.3 inval
 test "upgrade backend: a no-op judges a pre-release pin already in the file by its MAJOR.MINOR.PATCH" {
     var ar = Arena.init();
     defer ar.deinit();
-    // A hand-edited bgfx 0.31.0-rc.1 (newer than the default, so a bare run
-    // is a no-op) on core 2.0.0. As 0.31.0 it trips bgfx >= 0.26.0's
+    // A hand-edited bgfx 0.32.0-rc.1 (newer than the default, so a bare run
+    // is a no-op) on core 2.0.0. As 0.32.0 it trips bgfx >= 0.26.0's
     // core >= 2.1.0 floor; unnormalised, the floor table would skip it.
-    const src = ".{ .name = \"g\", .backend = .bgfx, .core_version = \"2.0.0\", .engine_version = \"3.0.0\", .gfx_version = \"2.0.0\", .backend_package = .{ .name = \"bgfx\", .repo = \"github.com/labelle-toolkit/labelle-bgfx\", .version = \"0.31.0-rc.1\" } }";
+    const src = ".{ .name = \"g\", .backend = .bgfx, .core_version = \"2.0.0\", .engine_version = \"3.0.0\", .gfx_version = \"2.0.0\", .backend_package = .{ .name = \"bgfx\", .repo = \"github.com/labelle-toolkit/labelle-bgfx\", .version = \"0.32.0-rc.1\" } }";
     const out = try plan(ar.a(), src, null);
     try testing.expectEqual(Outcome.Kind.noop, out.kind);
     try testing.expectEqual(@as(usize, 1), out.warnings.len);
@@ -893,7 +893,7 @@ test "upgrade backend: a no-op judges a pre-release pin already in the file by i
     // Mechanism: the floor table itself judges the raw pin (the same verdict
     // `generate` reaches), quoting it as written.
     const fv = (try version_floors.configBackendCoreFloorViolation(try parse(ar.a(), src))).?;
-    try testing.expectEqualStrings("0.31.0-rc.1", fv.backend_version);
+    try testing.expectEqualStrings("0.32.0-rc.1", fv.backend_version);
 }
 
 test "upgrade backend: .backend sharing a line with a later last field keeps valid separators" {
