@@ -460,22 +460,92 @@ pub const Systems = struct {
     }
 };
 
+// ── Bounded per-component inspector code (labelle-engine#922) ────────
+//
+// The browser and detail windows are instantiated over the game's whole
+// component registry. Written as `inline for` bodies, every component's
+// filter checkbox, membership checks, tag text and detail tree (with its
+// field formatting) was expanded into the two draw functions: ~165 KB and
+// ~85 KB of code in Flying Platform, where LLVM's super-linear passes over
+// them cost compile time and memory. The registry walk now runs as a
+// runtime loop over comptime tables (labels, one `has component` check per
+// type), and each component's detail tree is drawn by its own bounded
+// `noinline` function. The widgets drawn, their order and the labels are
+// unchanged; the `inspector:` tests pin the transcript. Do not turn these
+// back into `inline for` bodies or make the helpers `inline`.
+
+/// The checkbox / tree label for a registry name, built at comptime. The
+/// registry's `names()` slices need not be sentinel-terminated, so the
+/// label gets its own terminated copy; a name that would not fit the
+/// 128-byte label buffer the inspector always used shows as "?".
+fn componentLabel(comptime name: []const u8) [:0]const u8 {
+    return comptime if (name.len < 128) std.fmt.comptimePrint("{s}", .{name}) else "?";
+}
+
+/// The registry's names as a runtime-addressable constant. A registry may
+/// hand back a slice of a comptime `var` (labelle-engine's
+/// `ComponentRegistryWithPlugins.names()` does), which comptime code can
+/// read but a runtime loop cannot.
+fn componentNames(comptime names: []const []const u8) [names.len][]const u8 {
+    comptime var copy: [names.len][]const u8 = undefined;
+    inline for (names, 0..) |name, i| copy[i] = name;
+    return copy;
+}
+
+fn componentLabels(comptime names: []const []const u8) [names.len][:0]const u8 {
+    comptime var labels: [names.len][:0]const u8 = undefined;
+    inline for (names, 0..) |name, i| labels[i] = componentLabel(name);
+    return labels;
+}
+
+/// One "does `entity` carry registry component i" check per component,
+/// so the browser can walk the registry with a runtime loop.
+fn hasComponentTable(
+    comptime Reg: type,
+    comptime Ecs: type,
+    comptime Entity: type,
+) [Reg.names().len]*const fn (*Ecs, Entity) bool {
+    const names = comptime Reg.names();
+    comptime var table: [names.len]*const fn (*Ecs, Entity) bool = undefined;
+    inline for (names, 0..) |name, i| {
+        table[i] = &struct {
+            noinline fn has(ecs: *Ecs, entity: Entity) bool {
+                return Reg.entityHasNamed(ecs, entity, name);
+            }
+        }.has;
+    }
+    return table;
+}
+
+/// Detail window: the tree node for one registry component, if `entity`
+/// has it.
+noinline fn drawComponentNode(
+    comptime T: type,
+    comptime Gui: type,
+    ecs: anytype,
+    entity: anytype,
+    label: [:0]const u8,
+) void {
+    if (ecs.getComponent(entity, T)) |comp| {
+        if (Gui.treeNode(label)) {
+            showStructFields(Gui, comp, T);
+            Gui.treePop();
+        }
+    }
+}
+
 fn drawEntityBrowser(game: anytype, comptime Gui: type) void {
     const Reg = @TypeOf(game.*).ComponentRegistry;
     const comp_names = comptime Reg.names();
+    const labels = comptime componentLabels(comp_names);
+    const name_list = comptime componentNames(comp_names);
+    const Ecs = @TypeOf(game.active_world.ecs_backend);
 
     if (Gui.beginWindow("Entity Browser")) {
         Gui.label("Filter:");
-        inline for (comp_names, 0..) |name, i| {
+        for (&labels, 0..) |name_z, i| {
             if (i < MAX_COMPONENTS) {
                 const prev = component_filters[i];
-                // Copy the component name into a null-terminated
-                // buffer rather than relying on `@ptrCast` on a
-                // `[]const u8` — the registry's `names()` is free
-                // to return slices that aren't sentinel-terminated,
-                // and `[*:0]` reads past the end on those.
-                var name_buf: [128]u8 = undefined;
-                const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch "?";
                 _ = Gui.checkbox(name_z, &component_filters[i]);
                 if (component_filters[i] != prev) state_dirty = true;
                 if ((i + 1) % 4 != 0 and i + 1 < comp_names.len) Gui.sameLine();
@@ -505,11 +575,12 @@ fn drawEntityBrowser(game: anytype, comptime Gui: type) void {
 
                 const entity = result.entity;
                 const pos: *const Position = result.comp_0;
+                const has_component = comptime hasComponentTable(Reg, Ecs, @TypeOf(entity));
 
                 var passes = true;
-                inline for (comp_names, 0..) |name, i| {
+                for (&has_component, 0..) |has, i| {
                     if (i < MAX_COMPONENTS and component_filters[i]) {
-                        if (!Reg.entityHasNamed(&game.active_world.ecs_backend, entity, name)) {
+                        if (!has(&game.active_world.ecs_backend, entity)) {
                             passes = false;
                         }
                     }
@@ -530,8 +601,8 @@ fn drawEntityBrowser(game: anytype, comptime Gui: type) void {
                 var tags_buf: [256]u8 = undefined;
                 var tags_len: usize = 0;
 
-                inline for (comp_names) |name| {
-                    if (Reg.entityHasNamed(&game.active_world.ecs_backend, entity, name)) {
+                for (&has_component, &name_list) |has, name| {
+                    if (has(&game.active_world.ecs_backend, entity)) {
                         if (tags_len + name.len + 1 < tags_buf.len) {
                             @memcpy(tags_buf[tags_len .. tags_len + name.len], name);
                             tags_len += name.len;
@@ -594,17 +665,9 @@ fn drawEntityDetail(game: anytype, comptime Gui: type) void {
             }
         }
 
-        // Each registered component
+        // Each registered component, one bounded helper per type.
         inline for (comp_names) |name| {
-            const T = Reg.getType(name);
-            if (game.active_world.ecs_backend.getComponent(entity, T)) |comp| {
-                var name_buf: [128]u8 = undefined;
-                const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch "?";
-                if (Gui.treeNode(name_z)) {
-                    showStructFields(Gui, comp, T);
-                    Gui.treePop();
-                }
-            }
+            drawComponentNode(Reg.getType(name), Gui, &game.active_world.ecs_backend, entity, comptime componentLabel(name));
         }
     }
     Gui.endWindow();
@@ -1148,10 +1211,11 @@ const InspectorMock = struct {
         };
         pub fn names() []const []const u8 {
             return comptime blk: {
+                // Like labelle-engine's registry: a slice of a comptime
+                // var, readable at comptime only.
                 var arr: [list.len][]const u8 = undefined;
                 for (list, 0..) |e, i| arr[i] = e[0];
-                const out = arr;
-                break :blk &out;
+                break :blk &arr;
             };
         }
         pub fn getType(comptime name: []const u8) type {
