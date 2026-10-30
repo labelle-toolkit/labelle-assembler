@@ -3,7 +3,15 @@
 const std = @import("std");
 const core = @import("labelle-core");
 const engine = @import("labelle-engine");
-const Position = core.Position;
+
+/// The position component the inspector reads. Always `core.Position` in a
+/// real game; the plugin's own tests swap in a stand-in through a
+/// `DebugInspectorPosition` decl on their mock game, because this build has
+/// no `labelle-core` to import. Resolved lazily so the tests never analyse
+/// `core`.
+fn PositionOf(comptime Game: type) type {
+    return if (@hasDecl(Game, "DebugInspectorPosition")) Game.DebugInspectorPosition else core.Position;
+}
 
 var debug_visible: bool = false;
 var show_entities: bool = false;
@@ -487,6 +495,7 @@ fn drawEntityBrowser(game: anytype, comptime Gui: type) void {
             _ = Gui.tableNextColumn();
             Gui.label("");
 
+            const Position = PositionOf(@TypeOf(game.*));
             var iter = game.active_world.ecs_backend.query(.{Position});
             defer deinitIter(&iter, game.allocator);
 
@@ -575,7 +584,7 @@ fn drawEntityDetail(game: anytype, comptime Gui: type) void {
         Gui.separator();
 
         // Position (always show, not in registry)
-        if (game.active_world.ecs_backend.getComponent(entity, Position)) |pos| {
+        if (game.active_world.ecs_backend.getComponent(entity, PositionOf(@TypeOf(game.*)))) |pos| {
             if (Gui.treeNode("Position")) {
                 var buf: [64]u8 = undefined;
                 Gui.label(std.fmt.bufPrintZ(&buf, "x: {d:.2}", .{pos.x}) catch "?");
@@ -1057,4 +1066,388 @@ test "phaseNs tolerates rows without the phase field" {
     const r = Old{ .name = "x", .tick = .{ .last_ns = 42 } };
     try testing.expectEqual(@as(u64, 42), phaseNs(r, "tick"));
     try testing.expectEqual(@as(u64, 0), phaseNs(r, "setup"));
+}
+
+// ── Entity inspector (labelle-engine#922) ───────────────────────────
+//
+// The browser and detail windows are instantiated over the game's whole
+// component registry. These tests drive both against a mock game and a
+// call-recording Gui and pin the exact widget transcript, so a change in
+// how the per-component code is generated cannot change what the
+// inspector draws.
+
+const InspectorMock = struct {
+    const Pos = struct { x: f32 = 0, y: f32 = 0 };
+    const Mood = enum { calm, angry };
+    const Health = struct { hp: f32 = 0, max: u32 = 0, alive: bool = true, _secret: u8 = 7 };
+    const Brain = struct { mood: Mood = .calm, target: ?u32 = null };
+    const Tag = struct {};
+    const LongName = struct { n: i16 = 0 };
+    const long_name = "C" ** 130;
+
+    const max_entities = 64;
+
+    const Ecs = struct {
+        alive: [max_entities]bool = [_]bool{false} ** max_entities,
+        pos: [max_entities]?Pos = [_]?Pos{null} ** max_entities,
+        health: [max_entities]?Health = [_]?Health{null} ** max_entities,
+        brain: [max_entities]?Brain = [_]?Brain{null} ** max_entities,
+        tag: [max_entities]?Tag = [_]?Tag{null} ** max_entities,
+        long: [max_entities]?LongName = [_]?LongName{null} ** max_entities,
+
+        fn slot(self: *Ecs, comptime T: type) *[max_entities]?T {
+            return switch (T) {
+                Pos => &self.pos,
+                Health => &self.health,
+                Brain => &self.brain,
+                Tag => &self.tag,
+                LongName => &self.long,
+                else => @compileError("unknown mock component"),
+            };
+        }
+        pub fn entityExists(self: *Ecs, e: u32) bool {
+            return e < max_entities and self.alive[e];
+        }
+        pub fn getComponent(self: *Ecs, e: u32, comptime T: type) ?*T {
+            if (self.slot(T)[e]) |*c| return c;
+            return null;
+        }
+        pub fn hasComponent(self: *Ecs, e: u32, comptime T: type) bool {
+            return self.slot(T)[e] != null;
+        }
+        pub fn entityCount(self: *Ecs) usize {
+            var n: usize = 0;
+            for (self.alive) |a| n += @intFromBool(a);
+            return n;
+        }
+        const Iter = struct {
+            ecs: *Ecs,
+            next_id: u32 = 0,
+            const Result = struct { entity: u32, comp_0: *Pos };
+            pub fn next(self: *Iter) ?Result {
+                while (self.next_id < max_entities) {
+                    const id = self.next_id;
+                    self.next_id += 1;
+                    if (self.ecs.pos[id]) |*p| return .{ .entity = id, .comp_0 = p };
+                }
+                return null;
+            }
+            pub fn deinit(_: *Iter) void {}
+        };
+        pub fn query(self: *Ecs, comptime _: anytype) Iter {
+            return .{ .ecs = self };
+        }
+    };
+
+    const Reg = struct {
+        const list = .{
+            .{ "Health", Health },
+            .{ "Brain", Brain },
+            .{ "Tag", Tag },
+            .{ long_name, LongName },
+        };
+        pub fn names() []const []const u8 {
+            return comptime blk: {
+                var arr: [list.len][]const u8 = undefined;
+                for (list, 0..) |e, i| arr[i] = e[0];
+                const out = arr;
+                break :blk &out;
+            };
+        }
+        pub fn getType(comptime name: []const u8) type {
+            inline for (list) |e| {
+                if (comptime std.mem.eql(u8, e[0], name)) return e[1];
+            }
+            @compileError("unknown");
+        }
+        pub fn entityHasNamed(ecs: anytype, entity: anytype, comptime name: []const u8) bool {
+            return ecs.hasComponent(entity, getType(name));
+        }
+    };
+
+    const Game = struct {
+        pub const ComponentRegistry = Reg;
+        pub const DebugInspectorPosition = Pos;
+        active_world: struct { ecs_backend: Ecs = .{} } = .{},
+        allocator: std.mem.Allocator = testing.allocator,
+    };
+
+    /// Records every widget call as one line of text, `|`-terminated so
+    /// trailing spaces stay visible.
+    const Gui = struct {
+        var buf: [16384]u8 = undefined;
+        var len: usize = 0;
+        var press_button: ?[]const u8 = null;
+        var check_box: ?[]const u8 = null;
+
+        fn reset() void {
+            len = 0;
+            press_button = null;
+            check_box = null;
+        }
+        fn rec(comptime fmt: []const u8, args: anytype) void {
+            const line = std.fmt.bufPrint(buf[len..], fmt ++ "|\n", args) catch @panic("transcript full");
+            len += line.len;
+        }
+        fn transcript() []const u8 {
+            return buf[0..len];
+        }
+        pub fn beginWindow(t: [*:0]const u8) bool {
+            rec("window {s}", .{t});
+            return true;
+        }
+        pub fn endWindow() void {
+            rec("end window", .{});
+        }
+        pub fn label(t: [*:0]const u8) void {
+            rec("label {s}", .{t});
+        }
+        pub fn button(t: [*:0]const u8) bool {
+            rec("button {s}", .{t});
+            if (press_button) |p| return std.mem.eql(u8, p, std.mem.span(t));
+            return false;
+        }
+        pub fn separator() void {
+            rec("separator", .{});
+        }
+        pub fn sameLine() void {
+            rec("same line", .{});
+        }
+        pub fn checkbox(t: [*:0]const u8, v: *bool) bool {
+            rec("checkbox {s}={}", .{ t, v.* });
+            if (check_box) |c| {
+                if (std.mem.eql(u8, c, std.mem.span(t))) {
+                    v.* = !v.*;
+                    return true;
+                }
+            }
+            return false;
+        }
+        pub fn treeNode(t: [*:0]const u8) bool {
+            rec("tree {s}", .{t});
+            return true;
+        }
+        pub fn treePop() void {
+            rec("tree pop", .{});
+        }
+        pub fn beginTable(t: [*:0]const u8, cols: i32) bool {
+            rec("table {s} {d}", .{ t, cols });
+            return true;
+        }
+        pub fn endTable() void {
+            rec("end table", .{});
+        }
+        pub fn tableNextRow() void {
+            rec("row", .{});
+        }
+        pub fn tableNextColumn() bool {
+            return true;
+        }
+    };
+
+    fn world(game: *Game) void {
+        const ecs = &game.active_world.ecs_backend;
+        for ([_]u32{ 1, 2, 3, 5 }) |e| ecs.alive[e] = true;
+        ecs.pos[1] = .{ .x = 10.4, .y = -3.6 };
+        ecs.health[1] = .{ .hp = 42.125, .max = 100 };
+        ecs.brain[1] = .{ .mood = .angry, .target = 3 };
+        ecs.tag[1] = .{};
+        ecs.pos[2] = .{ .x = 1, .y = 2 };
+        ecs.tag[2] = .{};
+        ecs.long[2] = .{ .n = -4 };
+        ecs.pos[3] = .{ .x = 0.5, .y = 0.5 };
+        ecs.health[3] = .{ .hp = 1, .max = 1, .alive = false };
+        // 5 has no position: never listed by the browser.
+        ecs.brain[5] = .{};
+    }
+};
+
+const inspector_detail_expected =
+    \\window Entity Detail|
+    \\label Entity: 1|
+    \\button Deselect|
+    \\separator|
+    \\tree Position|
+    \\label x: 10.40|
+    \\label y: -3.60|
+    \\tree pop|
+    \\tree Health|
+    \\label hp: 42.125|
+    \\label max: 100|
+    \\label alive: true|
+    \\tree pop|
+    \\tree Brain|
+    \\label mood: angry|
+    \\label target: (?u32)|
+    \\tree pop|
+    \\tree Tag|
+    \\tree pop|
+    \\end window|
+    \\
+;
+
+test "inspector: entity detail draws Position then every registered component in order" {
+    resetModuleState();
+    defer resetModuleState();
+    var game = InspectorMock.Game{};
+    InspectorMock.world(&game);
+    const Gui = InspectorMock.Gui;
+
+    // Nothing selected: draws nothing.
+    selected_entity = null;
+    Gui.reset();
+    drawEntityDetail(&game, Gui);
+    try testing.expectEqualStrings("", Gui.transcript());
+
+    selected_entity = 1;
+    Gui.reset();
+    drawEntityDetail(&game, Gui);
+    try testing.expectEqualStrings(inspector_detail_expected, Gui.transcript());
+    try testing.expectEqual(@as(?u32, 1), selected_entity);
+
+    // A registry name too long for the label buffer is shown as "?".
+    selected_entity = 2;
+    Gui.reset();
+    drawEntityDetail(&game, Gui);
+    try testing.expectEqualStrings(
+        \\window Entity Detail|
+        \\label Entity: 2|
+        \\button Deselect|
+        \\separator|
+        \\tree Position|
+        \\label x: 1.00|
+        \\label y: 2.00|
+        \\tree pop|
+        \\tree Tag|
+        \\tree pop|
+        \\tree ?|
+        \\label n: -4|
+        \\tree pop|
+        \\end window|
+        \\
+    , Gui.transcript());
+
+    // Entity without Position: only its registry components.
+    selected_entity = 5;
+    Gui.reset();
+    drawEntityDetail(&game, Gui);
+    try testing.expectEqualStrings(
+        \\window Entity Detail|
+        \\label Entity: 5|
+        \\button Deselect|
+        \\separator|
+        \\tree Brain|
+        \\label mood: calm|
+        \\label target: (?u32)|
+        \\tree pop|
+        \\end window|
+        \\
+    , Gui.transcript());
+
+    // Deselect clears the selection.
+    selected_entity = 1;
+    Gui.reset();
+    Gui.press_button = "Deselect";
+    drawEntityDetail(&game, Gui);
+    try testing.expectEqual(@as(?u32, null), selected_entity);
+
+    // A dead entity clears the selection without opening the window.
+    selected_entity = 4;
+    Gui.reset();
+    drawEntityDetail(&game, Gui);
+    try testing.expectEqualStrings("", Gui.transcript());
+    try testing.expectEqual(@as(?u32, null), selected_entity);
+}
+
+test "inspector: entity browser lists, tags and filters entities as before" {
+    resetModuleState();
+    defer resetModuleState();
+    var game = InspectorMock.Game{};
+    InspectorMock.world(&game);
+    const Gui = InspectorMock.Gui;
+
+    Gui.reset();
+    drawEntityBrowser(&game, Gui);
+    try testing.expectEqualStrings(
+        \\window Entity Browser|
+        \\label Filter:|
+        \\checkbox Health=false|
+        \\same line|
+        \\checkbox Brain=false|
+        \\same line|
+        \\checkbox Tag=false|
+        \\same line|
+        \\checkbox ?=false|
+        \\separator|
+        \\table entities 4|
+        \\row|
+        \\label ID|
+        \\label Position|
+        \\label Components|
+        \\label |
+        \\row|
+        \\label 1|
+        \\label (10, -4)|
+        \\label Health Brain Tag |
+        \\button Select##1|
+        \\row|
+        \\label 2|
+        \\label (1, 2)|
+        \\label Tag 
+    ++ InspectorMock.long_name ++
+        \\ |
+        \\button Select##2|
+        \\row|
+        \\label 3|
+        \\label (1, 1)|
+        \\label Health |
+        \\button Select##3|
+        \\end table|
+        \\label Total: 4|
+        \\end window|
+        \\
+    , Gui.transcript());
+    try testing.expect(!state_dirty);
+
+    // Ticking a filter marks the state dirty; with Tag + Health required
+    // only entity 1 passes.
+    Gui.reset();
+    Gui.check_box = "Tag";
+    drawEntityBrowser(&game, Gui);
+    try testing.expect(state_dirty);
+    try testing.expect(component_filters[2]);
+    state_dirty = false;
+    component_filters[0] = true;
+    Gui.reset();
+    drawEntityBrowser(&game, Gui);
+    const t = Gui.transcript();
+    try testing.expect(std.mem.indexOf(u8, t, "checkbox Health=true|\n") != null);
+    try testing.expect(std.mem.indexOf(u8, t, "checkbox Tag=true|\n") != null);
+    try testing.expect(std.mem.indexOf(u8, t, "button Select##1|\n") != null);
+    try testing.expect(std.mem.indexOf(u8, t, "Select##2") == null);
+    try testing.expect(std.mem.indexOf(u8, t, "Select##3") == null);
+    try testing.expect(!state_dirty);
+
+    // Select picks the entity for the detail window.
+    selected_entity = null;
+    Gui.reset();
+    Gui.press_button = "Select##1";
+    drawEntityBrowser(&game, Gui);
+    try testing.expectEqual(@as(?u32, 1), selected_entity);
+}
+
+test "inspector: browser stops after 50 rows" {
+    resetModuleState();
+    defer resetModuleState();
+    var game = InspectorMock.Game{};
+    const ecs = &game.active_world.ecs_backend;
+    for (0..60) |i| {
+        ecs.alive[i] = true;
+        ecs.pos[i] = .{};
+    }
+    const Gui = InspectorMock.Gui;
+    Gui.reset();
+    drawEntityBrowser(&game, Gui);
+    try testing.expectEqual(@as(usize, 50), std.mem.count(u8, Gui.transcript(), "button Select##"));
+    try testing.expect(std.mem.indexOf(u8, Gui.transcript(), "label Total: 60|\n") != null);
 }
