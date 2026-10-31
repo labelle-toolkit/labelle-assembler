@@ -213,6 +213,8 @@ pub fn renderPackageV2(
 ///     v2 zon stays byte-identical to the enum path (`build_zig_zon.txt:71`).
 ///   - `.remote`  → the given url+hash, emitted verbatim.
 ///   - `.path`    → a relative/absolute path dependency.
+/// `.lazy = true` on a `.builtin` or `.remote` entry adds `.lazy = true,` to
+/// the emitted entry (labelle-assembler#823; see `RootBuildDep.lazy`).
 /// `dep_emsdk_section` is the caller-supplied pinned emsdk zon text (from
 /// `build_zig_zon.txt`) so this module needn't embed that template.
 pub fn emitRootBuildDepsV2(
@@ -226,15 +228,15 @@ pub fn emitRootBuildDepsV2(
         switch (dep.resolution) {
             .builtin => {
                 if (!std.mem.eql(u8, dep.name, "emsdk")) return error.UnknownBuiltinRootDep;
-                try w.writeAll(dep_emsdk_section);
+                if (dep.lazy) try writeLazySection(dep_emsdk_section, w) else try w.writeAll(dep_emsdk_section);
             },
             // url/hash/path are emitted as ZON string literals: escape their
             // contents (`"` → `\"`, `\` → `\\`) via std.zig.fmtString so a value
             // containing a quote/backslash can't produce malformed ZON. hash is
             // hex (low-risk) but escaped for consistency. #468 finding 2.
             .remote => |r| try w.print(
-                "        .{s} = .{{\n            .url = \"{f}\",\n            .hash = \"{f}\",\n        }},\n",
-                .{ dep.name, std.zig.fmtString(r.url), std.zig.fmtString(r.hash) },
+                "        .{s} = .{{\n            .url = \"{f}\",\n            .hash = \"{f}\",\n{s}        }},\n",
+                .{ dep.name, std.zig.fmtString(r.url), std.zig.fmtString(r.hash), if (dep.lazy) lazy_field else "" },
             ),
             .path => |p| try w.print(
                 "        .{s} = .{{\n            .path = \"{f}\",\n        }},\n",
@@ -242,6 +244,20 @@ pub fn emitRootBuildDepsV2(
             ),
         }
     }
+}
+
+const lazy_field = "            .lazy = true,\n";
+
+/// Write a pinned zon dependency section (`dep_emsdk`: `.name = .{ ...fields...
+/// },` plus trailing blank lines) with `.lazy = true,` added as its last field,
+/// right before the entry's closing `},`. A section without that closing line
+/// is malformed: an error, never an entry silently left eager.
+fn writeLazySection(section: []const u8, w: anytype) !void {
+    const close = "        },";
+    const at = std.mem.lastIndexOf(u8, section, close) orelse return error.MalformedRootDepSection;
+    try w.writeAll(section[0..at]);
+    try w.writeAll(lazy_field);
+    try w.writeAll(section[at..]);
 }
 
 // ============================================================================
@@ -366,6 +382,82 @@ test "emitRootBuildDepsV2: builtin emsdk emits the pinned dep_emsdk section" {
         .platforms = .{ .wasm = e(&.{.{ .name = "mystery", .resolution = .builtin }}) },
     };
     try testing.expectError(error.UnknownBuiltinRootDep, emitRootBuildDepsV2(m3, .wasm, "", &aw3.writer));
+}
+
+test "emitRootBuildDepsV2: `.lazy = true` declares the entry lazy (#823)" {
+    const e = struct {
+        fn make(deps: []const BackendManifestV2.RootBuildDep) BackendManifestV2.PlatformEntry {
+            return .{ .entry = "t.txt", .loop_style = .callback, .target = .{ .triple = "wasm32-emscripten" }, .root_build_deps = deps, .package = .{ .web = .{} } };
+        }
+    }.make;
+    const manifest = struct {
+        fn of(deps: []const BackendManifestV2.RootBuildDep) BackendManifestV2 {
+            return .{ .manifest_version = 2, .dir_name = "bgfx", .dep_name = "labelle_bgfx", .modules = &.{}, .platforms = .{ .wasm = e(deps) } };
+        }
+    }.of;
+    // The real pinned section, as `build_zig_zon.txt` carries it.
+    const tmpl = @embedFile("../../templates/build_zig_zon.txt");
+    const section = @import("../../template.zig").getSection(tmpl, "dep_emsdk").?;
+
+    // builtin emsdk: the pinned section with `.lazy = true,` as its last field.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try emitRootBuildDepsV2(manifest(&.{.{ .name = "emsdk", .resolution = .builtin, .lazy = true }}), .wasm, section, &aw.writer);
+    const lazy_emsdk =
+        "        .emsdk = .{\n" ++
+        "            .url = \"git+https://github.com/emscripten-core/emsdk#4.0.9\",\n" ++
+        "            .hash = \"N-V-__8AAJl1DwBezhYo_VE6f53mPVm00R-Fk28NPW7P14EQ\",\n" ++
+        "            .lazy = true,\n" ++
+        "        },\n";
+    try testing.expect(std.mem.startsWith(u8, aw.written(), lazy_emsdk));
+
+    // The emitted entry is valid ZON that Zig's own manifest parser accepts.
+    const zon = try std.fmt.allocPrintSentinel(testing.allocator, ".{{ .dependencies = .{{\n{s}}} }}", .{aw.written()}, 0);
+    defer testing.allocator.free(zon);
+    var ast = try std.zig.Ast.parse(testing.allocator, zon, .zon);
+    defer ast.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), ast.errors.len);
+
+    // Default (no `.lazy`): byte-identical to before #823.
+    var aw_eager: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw_eager.deinit();
+    try emitRootBuildDepsV2(manifest(&.{.{ .name = "emsdk", .resolution = .builtin }}), .wasm, section, &aw_eager.writer);
+    try testing.expectEqualStrings(section, aw_eager.written());
+
+    // remote + lazy.
+    var aw2: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw2.deinit();
+    try emitRootBuildDepsV2(manifest(&.{.{ .name = "foo", .resolution = .{ .remote = .{ .url = "git+u", .hash = "hh" } }, .lazy = true }}), .wasm, "", &aw2.writer);
+    try testing.expectEqualStrings(
+        "        .foo = .{\n            .url = \"git+u\",\n            .hash = \"hh\",\n            .lazy = true,\n        },\n",
+        aw2.written(),
+    );
+
+    // A section with no closing `},` cannot take the field: error, not eager.
+    var aw3: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw3.deinit();
+    try testing.expectError(error.MalformedRootDepSection, emitRootBuildDepsV2(manifest(&.{.{ .name = "emsdk", .resolution = .builtin, .lazy = true }}), .wasm, "garbage\n", &aw3.writer));
+}
+
+test "parseManifest: `.root_build_deps` `.lazy` is read, and defaults to false (#823)" {
+    const src =
+        \\.{
+        \\    .manifest_version = 2,
+        \\    .dir_name = "bgfx",
+        \\    .dep_name = "labelle_bgfx",
+        \\    .modules = .{},
+        \\    .platforms = .{
+        \\        .wasm = .{ .entry = "t.txt", .loop_style = .callback, .target = .{ .triple = "wasm32-emscripten" },
+        \\            .root_build_deps = .{ .{ .name = "emsdk", .resolution = .builtin, .lazy = true }, .{ .name = "x", .resolution = .{ .path = "p" } } },
+        \\            .package = .{ .web = .{} } },
+        \\    },
+        \\}
+    ;
+    const m = try manifest_v2.parseManifest(testing.allocator, src);
+    defer std.zon.parse.free(testing.allocator, m);
+    const deps = m.platforms.wasm.?.root_build_deps;
+    try testing.expect(deps[0].lazy);
+    try testing.expect(!deps[1].lazy);
 }
 
 test "emitRootBuildDepsV2: url/path with quote+backslash are escaped into valid ZON" {

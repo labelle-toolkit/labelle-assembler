@@ -229,6 +229,19 @@ pub const BackendManifestV2 = struct {
         /// url+hash from an arbitrary name.
         resolution: Resolution,
 
+        /// Declare the dependency `.lazy = true` in the generated
+        /// `build.zig.zon` (labelle-assembler#823), so Zig fetches it only when
+        /// a build script asks for it with `b.lazyDependency`. A backend sets it
+        /// when its hook resolves the dep that way and only when needed, e.g.
+        /// bgfx's wasm `post_wire` never needs the emsdk package when a valid
+        /// `EMSDK` is set. The hook must then never call `b.dependency(name)`:
+        /// Zig panics on that for a lazy entry. Honoured for `.builtin` and
+        /// `.remote`; a `.path` dependency is never fetched, so it is ignored
+        /// there. Default false: the entry stays eager, exactly as before, and
+        /// assemblers older than #823 ignore the field (unknown fields are
+        /// skipped), so a manifest can set it without raising its floor.
+        lazy: bool = false,
+
         pub const Resolution = union(enum) {
             /// url+hash, emitted verbatim into build.zig.zon (as `dep_emsdk` does).
             remote: struct { url: []const u8, hash: []const u8 },

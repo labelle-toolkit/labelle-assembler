@@ -1281,7 +1281,8 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     if (cfg.platform == .wasm) {
         // manifest-v2 wasm: no emsdk-helper import in the generated build.zig — the
         // emcc residual moved into the backend hook's `post_wire`, which resolves
-        // emsdk itself via `b.dependency("emsdk", .{})` (design §2 (c)).
+        // emsdk itself (design §2 (c)): `b.dependency("emsdk", .{})`, or
+        // `b.lazyDependency` when the manifest declares it `.lazy` (#823).
 
         // WASM: build as library, link via emcc
         try tpl.writeSection(build_zig_tmpl, "wasm_exe_start", w);
