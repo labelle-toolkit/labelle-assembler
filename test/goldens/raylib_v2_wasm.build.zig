@@ -149,7 +149,8 @@ fn unifyCoreDiamond(
 /// Preflight (labelle-assembler#492): fail early with an actionable message if
 /// the emsdk package's Emscripten toolchain has not been activated.
 ///
-/// `b.dependency("emsdk", .{})` only fetches the emsdk *launcher* repo; `emcc`
+/// The emsdk package (`b.lazyDependency("emsdk", .{})`) is only the emsdk
+/// *launcher* repo; `emcc`
 /// under `upstream/emscripten/` does not exist until the toolchain is installed
 /// and activated. Without this check the wasm build fails with an opaque
 /// `...upstream/emscripten/emcc file_hash FileNotFound`.
@@ -164,7 +165,11 @@ fn ensureEmsdkActivated(b: *std.Build) void {
             if (std.Io.Dir.cwd().access(io, managed_emcc, .{})) |_| return else |_| {}
         }
     }
-    const emsdk_dep = b.dependency("emsdk", .{});
+    // `lazyDependency`, not `dependency`: the root zon may declare emsdk
+    // lazy (labelle-assembler#823), which `dependency` panics on. On the
+    // first configure it returns null and the build runner fetches the
+    // package and re-runs build(); an eager entry resolves at once.
+    const emsdk_dep = b.lazyDependency("emsdk", .{}) orelse return;
     const root = emsdk_dep.builder.build_root.path orelse return;
     const emcc_path = b.pathJoin(&.{ root, "upstream", "emscripten", "emcc" });
     std.Io.Dir.cwd().access(io, emcc_path, .{}) catch {

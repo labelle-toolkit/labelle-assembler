@@ -79,7 +79,8 @@ pub const helper_fn =
     \\/// Preflight (labelle-assembler#492): fail early with an actionable message if
     \\/// the emsdk package's Emscripten toolchain has not been activated.
     \\///
-    \\/// `b.dependency("emsdk", .{})` only fetches the emsdk *launcher* repo; `emcc`
+    \\/// The emsdk package (`b.lazyDependency("emsdk", .{})`) is only the emsdk
+    \\/// *launcher* repo; `emcc`
     \\/// under `upstream/emscripten/` does not exist until the toolchain is installed
     \\/// and activated. Without this check the wasm build fails with an opaque
     \\/// `...upstream/emscripten/emcc file_hash FileNotFound`.
@@ -94,7 +95,11 @@ pub const helper_fn =
     \\            if (std.Io.Dir.cwd().access(io, managed_emcc, .{})) |_| return else |_| {}
     \\        }
     \\    }
-    \\    const emsdk_dep = b.dependency("emsdk", .{});
+    \\    // `lazyDependency`, not `dependency`: the root zon may declare emsdk
+    \\    // lazy (labelle-assembler#823), which `dependency` panics on. On the
+    \\    // first configure it returns null and the build runner fetches the
+    \\    // package and re-runs build(); an eager entry resolves at once.
+    \\    const emsdk_dep = b.lazyDependency("emsdk", .{}) orelse return;
     \\    const root = emsdk_dep.builder.build_root.path orelse return;
     \\    const emcc_path = b.pathJoin(&.{ root, "upstream", "emscripten", "emcc" });
     \\    std.Io.Dir.cwd().access(io, emcc_path, .{}) catch {
@@ -199,14 +204,22 @@ test "managedToolchainReady: EMSDK set but managed emcc missing ⇒ falls throug
 test "emitted helper honours a managed EMSDK before the zig-pkg check" {
     // The EMSDK branch must appear, look up `EMSDK` from the build graph env, probe
     // the managed `upstream/emscripten/emcc`, and short-circuit — all BEFORE the
-    // zig-pkg `b.dependency("emsdk", .{})` resolution.
+    // zig-pkg `b.lazyDependency("emsdk", .{})` resolution.
     const emsdk_branch = "b.graph.environ_map.get(\"EMSDK\")";
     const managed_probe = "std.Io.Dir.cwd().access(io, managed_emcc, .{})";
     try std.testing.expect(std.mem.indexOf(u8, helper_fn, emsdk_branch) != null);
     try std.testing.expect(std.mem.indexOf(u8, helper_fn, managed_probe) != null);
     const branch_idx = std.mem.indexOf(u8, helper_fn, emsdk_branch).?;
-    const zigpkg_idx = std.mem.indexOf(u8, helper_fn, "const emsdk_dep = b.dependency(\"emsdk\", .{})").?;
+    const zigpkg_idx = std.mem.indexOf(u8, helper_fn, "const emsdk_dep = b.lazyDependency(\"emsdk\", .{}) orelse return").?;
     try std.testing.expect(branch_idx < zigpkg_idx);
+}
+
+test "emitted helper never calls b.dependency on emsdk (lazy-safe, #823)" {
+    // A root zon may declare emsdk `.lazy = true` (a manifest's
+    // `RootBuildDep.lazy`); `b.dependency` panics on a lazy entry, while
+    // `lazyDependency` works for both lazy and eager declarations.
+    try std.testing.expect(std.mem.indexOf(u8, helper_fn, "b.dependency(\"emsdk\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, helper_fn, "b.lazyDependency(\"emsdk\", .{}) orelse return") != null);
 }
 
 test "emitted #492 message is byte-identical (EMSDK-unset path unchanged)" {

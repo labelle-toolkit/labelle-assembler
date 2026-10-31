@@ -480,6 +480,14 @@ pub const BackendManifestV2 = struct {
         /// pinned, or names one of a closed set of assembler-provided built-ins.
         resolution: Resolution,
 
+        /// Added by labelle-assembler#823: emit the entry with `.lazy = true`, so
+        /// Zig fetches it only when a build script asks with `b.lazyDependency`.
+        /// For a hook that needs the dep only sometimes (bgfx's wasm `post_wire`
+        /// needs no emsdk package when a valid `EMSDK` is set). The hook must
+        /// then never call `b.dependency(name)`, which panics on a lazy entry.
+        /// Default false (eager, as before); older assemblers ignore the field.
+        lazy: bool = false,
+
         pub const Resolution = union(enum) {
             /// url+hash, emitted verbatim into build.zig.zon (as `dep_emsdk` does).
             remote: struct { url: []const u8, hash: []const u8 },
