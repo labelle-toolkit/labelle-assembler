@@ -76,6 +76,9 @@ jobs:
       - name: Test
         run: zig build test
 
+      - name: WASM symbol option
+        run: zig build test-wasm-strip
+
       - name: zig-ecs adapter tests
         run: cd ecs/zig-ecs && zig build test
 
