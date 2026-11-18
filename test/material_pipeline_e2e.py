@@ -59,6 +59,19 @@ def build(ok=True, diagnostic=None):
         raise AssertionError(output)
     return output
 
+# Cross-material validation must run before shaderc resolution or compilation.
+fog_json = root / "materials/fog/material.json"
+conflict = json.loads(json.dumps(descriptor))
+conflict["parameters"][0]["count"] = 8
+conflict["parameters"][0]["defaults"] = []
+fog_json.write_text(json.dumps(conflict), encoding="utf-8")
+build(False, "ParameterShapeMismatch")
+conflict["parameters"] = []
+conflict["textures"] = [{"name": "u_tint"}]
+fog_json.write_text(json.dumps(conflict), encoding="utf-8")
+build(False, "ParameterShapeMismatch")
+fog_json.write_text(json.dumps(descriptor), encoding="utf-8")
+
 initial = build()
 assert "tests passed" in initial or "1 pass" in initial, initial
 cached = build()

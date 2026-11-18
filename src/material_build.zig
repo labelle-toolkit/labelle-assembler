@@ -7,6 +7,16 @@ pub const Input = struct { name: []const u8, json: []const u8 };
 /// `bgfx_api` is that toolchain's API: an explicit shaderc override must
 /// report it, or it would emit a container the linked bgfx rejects.
 pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, core: *std.Build.Module, inputs: []const Input, platform: []const u8, glsl_profile: []const u8, bgfx_api: []const u8) *std.Build.Module {
+    // Validate the entire set before resolving shaderc or scheduling compilation.
+    var uniforms = schema.UniformRegistry{ .allocator = b.allocator };
+    defer uniforms.deinit();
+    for (inputs) |input| {
+        const parsed = schema.parse(b.allocator, input.json) catch |err| std.debug.panic("materials/{s}/material.json: {s}", .{ input.name, @errorName(err) });
+        defer parsed.deinit();
+        if (uniforms.check(input.name, parsed.value) catch @panic("OOM")) |msg| {
+            std.debug.panic("{s}", .{msg});
+        }
+    }
     // Always a HOST executable, even for Android, Emscripten and iOS.
     const tool = b.dependency("material_shaderc", .{ .target = b.graph.host, .with_shaderc = true });
     const override = b.option([]const u8, "shaderc", "Override the pinned host shaderc executable") orelse b.graph.environ_map.get("LABELLE_SHADERC");

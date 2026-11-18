@@ -180,6 +180,8 @@ pub fn stage(a: std.mem.Allocator, game_dir: []const u8, target_dir: []const u8,
     // mtl-vs-spv choice waits for `material_build.create`, which checks the
     // same rule (`schema.missingTargetsMessage`) against the real target.
     var missing_targets = false;
+    var uniforms = schema.UniformRegistry{ .allocator = a };
+    defer uniforms.deinit();
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .directory or entry.name[0] == '.') continue;
@@ -206,6 +208,11 @@ pub fn stage(a: std.mem.Allocator, game_dir: []const u8, target_dir: []const u8,
             return err;
         };
         defer parsed.deinit();
+        if (try uniforms.check(entry.name, parsed.value)) |msg| {
+            defer a.free(msg);
+            std.log.err("{s}", .{msg});
+            return error.MaterialUniformShapeMismatch;
+        }
         const fragment = try std.fs.path.join(a, &.{ entry.name, parsed.value.fragment });
         defer a.free(fragment);
         dir.access(io, fragment, .{}) catch |err| {
