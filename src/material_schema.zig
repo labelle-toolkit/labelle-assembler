@@ -99,6 +99,71 @@ pub fn relativePath(path: []const u8) bool {
     while (parts.next()) |p| if (p.len == 0 or std.mem.eql(u8, p, ".") or std.mem.eql(u8, p, "..")) return false;
     return true;
 }
+/// bgfx shares uniforms globally. Own names because parsed JSON is temporary.
+pub const UniformRegistry = struct {
+    const Shape = enum { vec4, mat4, sampler };
+    const Binding = struct { name: []const u8, material: []const u8, shape: Shape, count: u16 };
+    allocator: std.mem.Allocator,
+    bindings: std.ArrayList(Binding) = .empty,
+
+    pub fn deinit(self: *UniformRegistry) void {
+        for (self.bindings.items) |b| {
+            self.allocator.free(b.name);
+            self.allocator.free(b.material);
+        }
+        self.bindings.deinit(self.allocator);
+    }
+
+    fn add(self: *UniformRegistry, material: []const u8, name: []const u8, shape: Shape, count: u16) !?[]const u8 {
+        // Backend-owned uniforms outside the schema's unconditionally reserved set.
+        const reserved = [_]struct { name: []const u8, shape: Shape }{
+            .{ .name = "s_lut", .shape = .sampler },
+            .{ .name = "s_texY", .shape = .sampler },
+            .{ .name = "s_texU", .shape = .sampler },
+            .{ .name = "s_texV", .shape = .sampler },
+            .{ .name = "u_yuvOffsetGain", .shape = .vec4 },
+            .{ .name = "u_yuvCoeffs", .shape = .vec4 },
+            .{ .name = "u_material_color", .shape = .vec4 },
+            .{ .name = "u_material_params", .shape = .vec4 },
+            .{ .name = "u_material_texel", .shape = .vec4 },
+            .{ .name = "u_postfx_params", .shape = .vec4 },
+            .{ .name = "u_postfx_color", .shape = .vec4 },
+            .{ .name = "u_postfx_texel", .shape = .vec4 },
+        };
+        for (reserved) |r| {
+            if (std.mem.eql(u8, name, r.name) and (shape != r.shape or count != 1))
+                return try self.message(material, name, shape, count, "<bgfx backend>", r.shape, 1);
+        }
+        for (self.bindings.items) |old| {
+            if (!std.mem.eql(u8, name, old.name)) continue;
+            if (shape != old.shape or count != old.count)
+                return try self.message(material, name, shape, count, old.material, old.shape, old.count);
+            return null;
+        }
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        const owned_material = try self.allocator.dupe(u8, material);
+        errdefer self.allocator.free(owned_material);
+        try self.bindings.append(self.allocator, .{ .name = owned_name, .material = owned_material, .shape = shape, .count = count });
+        return null;
+    }
+
+    fn message(self: *UniformRegistry, material: []const u8, name: []const u8, shape: Shape, count: u16, old: []const u8, old_shape: Shape, old_count: u16) ![]const u8 {
+        return std.fmt.allocPrint(self.allocator, "materials/{s}: uniform '{s}' is {s}[{d}], but {s}{s} declares it {s}[{d}]; bgfx uniforms are global by name (ParameterShapeMismatch)", .{ material, name, @tagName(shape), count, if (std.mem.startsWith(u8, old, "<")) "" else "materials/", old, @tagName(old_shape), old_count });
+    }
+
+    /// Returns an owned diagnostic on conflict; caller frees it.
+    pub fn check(self: *UniformRegistry, material: []const u8, d: Descriptor) !?[]const u8 {
+        for (d.parameters) |p| {
+            if (try self.add(material, p.name, if (p.kind == .mat4) .mat4 else .vec4, p.count)) |msg| return msg;
+        }
+        for (d.textures) |t| {
+            if (try self.add(material, t.name, .sampler, 1)) |msg| return msg;
+        }
+        return null;
+    }
+};
+
 pub fn parse(a: std.mem.Allocator, json: []const u8) !std.json.Parsed(Descriptor) {
     const parsed = try std.json.parseFromSlice(Descriptor, a, json, .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
@@ -418,4 +483,42 @@ test "required targets: android needs essl AND spv, wasm essl, ios mtl, desktop 
     try std.testing.expect(requiredTargets("desktop", null) == null);
     try std.testing.expect((try missingTargetsMessage(a, "fog", "tests", true, &.{.essl})) == null);
     try std.testing.expectEqualSlices(Target, &.{ .essl, .spv }, requiredTargets("android", null).?);
+}
+
+test "global uniforms compare backend shapes, counts, textures and reserved names" {
+    const a = std.testing.allocator;
+    var registry = UniformRegistry{ .allocator = a };
+    defer registry.deinit();
+    var d = Descriptor{ .version = 1, .fragment = "f.sc", .targets = &.{.spv}, .parameters = &.{.{ .name = "u_fire", .kind = .vec4 }} };
+    try std.testing.expect((try registry.check("fire", d)) == null);
+    inline for (.{ Kind.scalar, Kind.vec2, Kind.vec3, Kind.vec4 }) |kind| {
+        d.parameters = &.{.{ .name = "u_fire", .kind = kind }};
+        try std.testing.expect((try registry.check("shared", d)) == null);
+    }
+    inline for (.{ Kind.vec4, Kind.mat4 }) |kind| {
+        d.parameters = &.{.{ .name = "u_fire", .kind = kind, .count = 8 }};
+        const msg = (try registry.check("burn", d)).?;
+        defer a.free(msg);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "materials/burn") != null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "materials/fire") != null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "vec4[1]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "[8]") != null);
+    }
+    d.parameters = &.{.{ .name = "u_fire", .kind = .mat4 }};
+    const matrix = (try registry.check("matrix", d)).?;
+    defer a.free(matrix);
+    d.parameters = &.{};
+    d.textures = &.{.{ .name = "u_fire" }};
+    const texture = (try registry.check("texture", d)).?;
+    defer a.free(texture);
+    d.textures = &.{.{ .name = "s_noise" }};
+    try std.testing.expect((try registry.check("noise", d)) == null);
+    try std.testing.expect((try registry.check("shared_noise", d)) == null);
+    d.textures = &.{};
+    d.parameters = &.{.{ .name = "s_noise", .kind = .vec4 }};
+    const reverse = (try registry.check("parameter", d)).?;
+    defer a.free(reverse);
+    d.parameters = &.{.{ .name = "u_postfx_params", .kind = .vec4, .count = 2 }};
+    const reserved = (try registry.check("reserved", d)).?;
+    defer a.free(reserved);
 }
