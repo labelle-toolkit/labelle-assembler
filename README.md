@@ -301,3 +301,23 @@ when a version tag is pushed. Binary naming convention:
 - `labelle-assembler-macos-x86_64`
 - `labelle-assembler-linux-aarch64`
 - `labelle-assembler-linux-x86_64`
+
+### WASM compilation symbols
+
+Set `LABELLE_WASM_STRIP=1` when invoking the Labelle CLI to omit debug symbols
+while compiling the WASM game library:
+
+```sh
+LABELLE_WASM_STRIP=1 labelle bundle --platform=wasm --optimize=ReleaseSafe --output dist
+```
+
+The generated build reads this setting at build time, including the web
+provider's threaded build and single-threaded fallback. `1`/`true` omit symbols;
+`0`/`false` explicitly retain them. Unset preserves Zig's existing default.
+Other values fail the build rather than silently changing diagnostics.
+
+This affects the WASM game compilation only: it does not change optimization
+mode, runtime safety checks, compiler parallelism, native host tools, desktop
+or Android symbols. Keep symbols enabled when debugging intermediate objects.
+It can lower compiler memory use and compilation time; measure on your runner
+before changing memory limits. Generated files need not be patched in CI.

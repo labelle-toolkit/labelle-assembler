@@ -56,6 +56,14 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("main.zig"),
             .target = target,
             .optimize = optimize,
+            // Inherited by the web provider's threaded and fallback builds.
+            // Unset preserves Zig's default; this does not change runtime safety.
+            .strip = strip: {
+                const value = b.graph.environ_map.get("LABELLE_WASM_STRIP") orelse break :strip null;
+                if (std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true")) break :strip true;
+                if (std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false")) break :strip false;
+                std.debug.panic("LABELLE_WASM_STRIP must be 1, 0, true or false", .{});
+            },
             .imports = &.{
                 .{ .name = "labelle-core", .module = core_mod },
                 .{ .name = "labelle-gfx", .module = gfx_mod },

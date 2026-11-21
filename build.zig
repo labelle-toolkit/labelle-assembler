@@ -167,6 +167,13 @@ pub fn build(b: *std.Build) void {
     // ── Tests ───────────────────────────────────────────────────────────
     const test_step = b.step("test", "Run assembler tests");
 
+    // Exercise the emitted setting with real WASM objects, including cache reuse.
+    const strip_python = b.option([]const u8, "strip-test-python", "Python executable for WASM symbol tests") orelse "python3";
+    const strip_test = b.addSystemCommand(&.{strip_python});
+    strip_test.addFileArg(b.path("test/wasm_strip_e2e.py"));
+    strip_test.addArgs(&.{ "--zig", b.graph.zig_exe });
+    b.step("test-wasm-strip", "Validate WASM debug symbols and environment option errors").dependOn(&strip_test.step);
+
     // Unit tests from src/
     const src_tests = b.addTest(.{
         .root_module = b.createModule(.{
