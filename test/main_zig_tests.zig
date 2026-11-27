@@ -1825,10 +1825,14 @@ pub const CURSOR_BINDING = struct {
 };
 
 pub const WASM_STD_LOG = struct {
-    test "wasm routes std.log through printf instead of failing debug IO" {
+    fn generateSokol(lifecycle: []const u8) ![]const u8 {
         h.setSokolLifecycle();
         defer h.clearLifecycleOverrides();
-        const source = try SYSTEM_LOCALE.generateMain(.wasm, sokol_alloc_lifecycle);
+        return SYSTEM_LOCALE.generateMain(.wasm, lifecycle);
+    }
+
+    test "wasm routes std.log through printf instead of failing debug IO" {
+        const source = try generateSokol(sokol_alloc_lifecycle);
         defer std.testing.allocator.free(source);
 
         try std.testing.expect(std.mem.indexOf(u8, source, "pub const std_options_debug_io = std.Io.failing;") != null);
@@ -1838,15 +1842,44 @@ pub const WASM_STD_LOG = struct {
         try std.testing.expect(std.mem.indexOf(u8, source, "if (scope != .default)") != null);
         try std.testing.expect(std.mem.indexOf(u8, source, ".drain = wasmLogDrain") != null);
         try std.testing.expect(std.mem.indexOf(u8, source, "writer.flush()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "_ = printf(\"\\\\0\");") != null);
     }
 
-    test "a backend-owned wasm panic and logging configuration stays untouched" {
+    test "backend std_options without panic is preserved without duplicating the logger" {
+        const lifecycle = sokol_alloc_lifecycle ++ "\npub const std_options: std.Options = .{};\n";
+        const source = try generateSokol(lifecycle);
+        defer std.testing.allocator.free(source);
+
+        try std.testing.expect(std.mem.indexOf(u8, source, "pub const std_options: std.Options = .{};") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "pub const std_options: std.Options = .{ .logFn = wasmLog };") == null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "fn wasmLog(") == null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "pub const panic = std.debug.no_panic;") != null);
+    }
+
+    test "backend panic without std_options receives only the logger component" {
         const source = try EDITOR_PREVIEW.genBgfxWasm(false);
         defer std.testing.allocator.free(source);
 
         try std.testing.expect(std.mem.indexOf(u8, source, "pub const std_options_debug_io = std.Io.failing;") != null);
-        try std.testing.expect(std.mem.indexOf(u8, source, "pub const std_options:") == null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "pub const std_options: std.Options = .{ .logFn = wasmLog };") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "pub const panic = std.debug.FullPanic(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "pub const panic = std.debug.no_panic;") == null);
+    }
+
+    test "backend panic and std_options receive neither duplicate component" {
+        const lifecycle = sokol_alloc_lifecycle ++ "\npub const std_options: std.Options = .{};\npub const panic = std.debug.no_panic;\n";
+        const source = try generateSokol(lifecycle);
+        defer std.testing.allocator.free(source);
+
         try std.testing.expect(std.mem.indexOf(u8, source, "fn wasmLog(") == null);
+        const first_options = std.mem.indexOf(u8, source, "pub const std_options:");
+        const last_options = std.mem.lastIndexOf(u8, source, "pub const std_options:");
+        try std.testing.expect(first_options != null);
+        try std.testing.expectEqual(first_options.?, last_options.?);
+        const first_panic = std.mem.indexOf(u8, source, "pub const panic =");
+        const last_panic = std.mem.lastIndexOf(u8, source, "pub const panic =");
+        try std.testing.expect(first_panic != null);
+        try std.testing.expectEqual(first_panic.?, last_panic.?);
     }
 
     test "desktop keeps the default std.log configuration" {

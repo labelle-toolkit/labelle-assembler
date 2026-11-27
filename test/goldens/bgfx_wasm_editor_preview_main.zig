@@ -10,13 +10,56 @@ const LogSink = engine.core.StderrLogSink;
 const EcsBackend = engine.MockEcsBackend(u32);
 const GuiBackend = engine.StubGui;
 
-// Zig 0.16.0 wasm32-emscripten: override the default debug IO so the
-// std.Io.Threaded path (broken posix wrappers on emscripten) is never
-// instantiated. The backend's wasm template supplies its own `pub const
-// panic`, so only this half of the labelle-assembler#141 workaround is
-// emitted here. Fixed upstream in 0.17.0-dev (PR #31850).
-// https://ziggit.dev/t/0-16-0-wasm32-emscripten-fails-to-build-because-of-default-panic-handler-recommended-workaround/15052
+// Zig 0.16.0 wasm32-emscripten: keep std.Io.Threaded (whose emscripten
+// posix wrappers are broken) out of the default debug-io path. Panic and
+// std_options ownership are selected independently below (#141, #834).
+// Fixed upstream in 0.17.0-dev (PR #31850).
 pub const std_options_debug_io = std.Io.failing;
+
+pub const std_options: std.Options = .{ .logFn = wasmLog };
+
+extern "c" fn printf(fmt: [*:0]const u8, ...) c_int;
+
+fn wasmLogChunk(bytes: []const u8) void {
+    if (bytes.len == 0) return;
+    _ = printf("%.*s", @as(c_int, @intCast(bytes.len)), bytes.ptr);
+}
+
+fn wasmLogBytes(bytes: []const u8) void {
+    var rest = bytes;
+    while (std.mem.indexOfScalar(u8, rest, 0)) |nul| {
+        wasmLogChunk(rest[0..nul]);
+        _ = printf("\\0");
+        rest = rest[nul + 1..];
+    }
+    wasmLogChunk(rest);
+}
+
+fn wasmLogDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    wasmLogBytes(w.buffered());
+    w.end = 0;
+    var written: usize = 0;
+    for (data[0 .. data.len - 1]) |bytes| {
+        wasmLogBytes(bytes);
+        written += bytes.len;
+    }
+    const pattern = data[data.len - 1];
+    for (0..splat) |_| wasmLogBytes(pattern);
+    return written + pattern.len * splat;
+}
+
+// std.log's default sink uses the disabled debug IO above. Route it through
+// Emscripten's console-backed printf instead (labelle-assembler#834).
+fn wasmLog(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime fmt: []const u8, args: anytype) void {
+    var buf: [1024]u8 = undefined;
+    var writer: std.Io.Writer = .{ .vtable = &.{ .drain = wasmLogDrain }, .buffer = &buf };
+    writer.writeAll(level.asText()) catch return;
+    if (scope != .default) writer.print("({t})", .{scope}) catch return;
+    writer.writeAll(": ") catch return;
+    writer.print(fmt, args) catch return;
+    writer.writeByte('\n') catch return;
+    writer.flush() catch return;
+}
 
 // --- External backend contract verification (labelle-assembler#386 Phase 6b) ---
 // Assert the fetched out-of-tree backend satisfies labelle-core's render /

@@ -316,13 +316,14 @@ pub fn generateMainZigWithAnimations(
         // site (tests, preview, script-less projects), so those emit
         // byte-identical output.
         .scripting = scripting_splice,
-        // wasm-only: does the backend's lifecycle (wasm) template ship its own
-        // `pub const panic`? If so, the assembler must NOT also emit its
-        // stopgap panic shim (they would duplicate the root decl). Scanned from
-        // the template text, so it's backend-agnostic (bgfx ships one, raylib
-        // does not). Only consulted on wasm.
+        // wasm-only: scan panic and std_options ownership independently. The
+        // assembler supplies whichever components the backend template omits;
+        // treating them as a pair can duplicate std_options (#834 review).
         .wasm_template_provides_panic = cfg.platform == .wasm and
             std.mem.indexOf(u8, lifecycle_tmpl, "pub const panic") != null,
+        .wasm_template_provides_std_options = cfg.platform == .wasm and
+            (std.mem.indexOf(u8, lifecycle_tmpl, "pub const std_options:") != null or
+                std.mem.indexOf(u8, lifecycle_tmpl, "pub const std_options =") != null),
         // ios-only (#774): skip the assembler's SelfInfo override when a
         // template already declares a root `debug`.
     };

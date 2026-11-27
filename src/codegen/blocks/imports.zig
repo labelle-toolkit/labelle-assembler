@@ -39,19 +39,22 @@ pub fn Mixin(comptime Self: type) type {
             const cfg = self.cfg;
             const hook_names = self.hook_names;
             // Zig 0.16 wasm32-emscripten std.Io.Threaded workaround
-            // (labelle-assembler#141). The full shim declares BOTH
-            // `std_options_debug_io` (severs the Threaded path) AND `panic`
-            // (no_panic). When the backend's wasm template already ships its own
-            // `pub const panic` (e.g. bgfx's browser-console handler), emit only
-            // the `std_options_debug_io` half — the `panic` half would duplicate a
-            // root decl, but the debug-io override is still required and is
-            // independent of `panic`. See `Codegen.wasm_template_provides_panic`.
+            // (labelle-assembler#141). Always sever the debug-io Threaded path.
+            // Panic and std_options ownership are independent: supply only the
+            // components omitted by the backend template (#834 review).
             if (cfg.platform == .wasm) {
                 const preview = @import("../preview.zig");
-                try w.writeAll(if (self.wasm_template_provides_panic)
-                    preview.WASM_DEBUG_IO_WORKAROUND
-                else
-                    preview.WASM_PANIC_WORKAROUND);
+                if (self.wasm_template_provides_panic) {
+                    try w.writeAll(if (self.wasm_template_provides_std_options)
+                        preview.WASM_DEBUG_IO_WORKAROUND
+                    else
+                        preview.WASM_DEBUG_IO_AND_LOG_WORKAROUND);
+                } else {
+                    try w.writeAll(if (self.wasm_template_provides_std_options)
+                        preview.WASM_DEBUG_IO_AND_PANIC_WORKAROUND
+                    else
+                        preview.WASM_PANIC_WORKAROUND);
+                }
             }
             // Zig 0.16 iOS link fix (#774): a slot for the root
             // `debug.SelfInfo = void` override. Whether it becomes the
