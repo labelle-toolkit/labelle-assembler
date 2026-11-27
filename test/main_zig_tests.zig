@@ -1845,14 +1845,14 @@ pub const WASM_STD_LOG = struct {
         try std.testing.expect(std.mem.indexOf(u8, source, "_ = printf(\"\\\\0\");") != null);
     }
 
-    test "backend std_options without panic is preserved without duplicating the logger" {
-        const lifecycle = sokol_alloc_lifecycle ++ "\npub const std_options: std.Options = .{};\n";
+    test "backend options without a logger receive the wasm fallback" {
+        const lifecycle = sokol_alloc_lifecycle ++ "\npub const std_options: std.Options = .{ .log_level = .warn };\n";
         const source = try generateSokol(lifecycle);
         defer std.testing.allocator.free(source);
 
-        try std.testing.expect(std.mem.indexOf(u8, source, "pub const std_options: std.Options = .{};") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "labelleWasmLogOptions(.{ .log_level = .warn })") != null);
         try std.testing.expect(std.mem.indexOf(u8, source, "pub const std_options: std.Options = .{ .logFn = wasmLog };") == null);
-        try std.testing.expect(std.mem.indexOf(u8, source, "fn wasmLog(") == null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "fn wasmLog(") != null);
         try std.testing.expect(std.mem.indexOf(u8, source, "pub const panic = std.debug.no_panic;") != null);
     }
 
@@ -1862,16 +1862,16 @@ pub const WASM_STD_LOG = struct {
             sokol_alloc_lifecycle ++ "\npub const std_options\t= std.Options{};\n",
         };
         const declarations = [_][]const u8{
-            "pub const std_options : std.Options = .{};",
-            "pub const std_options\t= std.Options{};",
+            "pub const std_options : std.Options = labelleWasmLogOptions(",
+            "pub const std_options\t= labelleWasmLogOptions(",
         };
         for (lifecycles, declarations) |lifecycle, declaration| {
             const source = try generateSokol(lifecycle);
             defer std.testing.allocator.free(source);
 
             try std.testing.expect(std.mem.indexOf(u8, source, declaration) != null);
-            try std.testing.expect(std.mem.indexOf(u8, source, ".logFn = wasmLog") == null);
-            try std.testing.expect(std.mem.indexOf(u8, source, "fn wasmLog(") == null);
+            try std.testing.expect(std.mem.indexOf(u8, source, "options.logFn == std.log.defaultLog") != null);
+            try std.testing.expect(std.mem.indexOf(u8, source, "fn wasmLog(") != null);
             try std.testing.expect(std.mem.indexOf(u8, source, "pub const panic = std.debug.no_panic;") != null);
         }
     }
@@ -1891,7 +1891,7 @@ pub const WASM_STD_LOG = struct {
         const source = try generateSokol(lifecycle);
         defer std.testing.allocator.free(source);
 
-        try std.testing.expect(std.mem.indexOf(u8, source, "fn wasmLog(") == null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "fn wasmLog(") != null);
         const first_options = std.mem.indexOf(u8, source, "pub const std_options:");
         const last_options = std.mem.lastIndexOf(u8, source, "pub const std_options:");
         try std.testing.expect(first_options != null);
@@ -1900,6 +1900,16 @@ pub const WASM_STD_LOG = struct {
         const last_panic = std.mem.lastIndexOf(u8, source, "pub const panic =");
         try std.testing.expect(first_panic != null);
         try std.testing.expectEqual(first_panic.?, last_panic.?);
+    }
+
+    test "wasm ignores nested and commented options and panic declarations" {
+        const lifecycle = sokol_alloc_lifecycle ++
+            "\n// pub const std_options: std.Options = .{};\n" ++
+            "const Container = struct { pub const panic = undefined; pub const std_options = undefined; };\n";
+        const source = try generateSokol(lifecycle);
+        defer std.testing.allocator.free(source);
+        try std.testing.expect(std.mem.indexOf(u8, source, "pub const std_options: std.Options = .{ .logFn = wasmLog };") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "pub const panic = std.debug.no_panic;") != null);
     }
 
     test "desktop keeps the default std.log configuration" {

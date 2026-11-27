@@ -35,9 +35,6 @@ const editor = @import("preview/editor.zig");
 
 // ── Zig 0.16 wasm32-emscripten workarounds (preview/wasm_workaround.zig) ──
 pub const WASM_PANIC_WORKAROUND = wasm_workaround.WASM_PANIC_WORKAROUND;
-pub const WASM_DEBUG_IO_WORKAROUND = wasm_workaround.WASM_DEBUG_IO_WORKAROUND;
-pub const WASM_DEBUG_IO_AND_PANIC_WORKAROUND = wasm_workaround.WASM_DEBUG_IO_AND_PANIC_WORKAROUND;
-pub const WASM_DEBUG_IO_AND_LOG_WORKAROUND = wasm_workaround.WASM_DEBUG_IO_AND_LOG_WORKAROUND;
 
 // ── Module-scope preview helpers (preview/helpers.zig) ──────────────
 pub const PREVIEW_HELPERS = helpers.PREVIEW_HELPERS;

@@ -173,22 +173,6 @@ fn block(
 
 // ── Template-based generation (engine provides main.zig.template) ────────
 
-/// True when the backend template declares `std_options`. Whitespace between
-/// the declaration name and `:` or `=` is insignificant to Zig, so accept it
-/// here too; checking the separator also avoids matching names with an
-/// `std_options` prefix, such as `std_options_debug_io`.
-fn templateProvidesStdOptions(lifecycle_tmpl: []const u8) bool {
-    const declaration = "pub const std_options";
-    var rest = lifecycle_tmpl;
-    while (std.mem.indexOf(u8, rest, declaration)) |at| {
-        var separator = at + declaration.len;
-        while (separator < rest.len and std.ascii.isWhitespace(rest[separator])) : (separator += 1) {}
-        if (separator < rest.len and (rest[separator] == ':' or rest[separator] == '=')) return true;
-        rest = rest[at + declaration.len ..];
-    }
-    return false;
-}
-
 /// Generate main.zig using the engine's codegen template.
 /// The template uses {{variable}} interpolation and {{#if}}/{{#each}} blocks.
 /// All complex sections are pre-computed into scalar blocks by this function.
@@ -332,13 +316,6 @@ pub fn generateMainZigWithAnimations(
         // site (tests, preview, script-less projects), so those emit
         // byte-identical output.
         .scripting = scripting_splice,
-        // wasm-only: scan panic and std_options ownership independently. The
-        // assembler supplies whichever components the backend template omits;
-        // treating them as a pair can duplicate std_options (#834 review).
-        .wasm_template_provides_panic = cfg.platform == .wasm and
-            std.mem.indexOf(u8, lifecycle_tmpl, "pub const panic") != null,
-        .wasm_template_provides_std_options = cfg.platform == .wasm and
-            templateProvidesStdOptions(lifecycle_tmpl),
         // ios-only (#774): skip the assembler's SelfInfo override when a
         // template already declares a root `debug`.
     };
@@ -610,6 +587,10 @@ pub fn generateMainZigWithAnimations(
     // hard error so no existing game silently flips.
     const y_axis = try cfg.requireYAxis();
     const with_axis = try injectYAxis(allocator, rendered, y_axis);
+    if (cfg.platform == .wasm) {
+        defer allocator.free(with_axis);
+        return @import("preview/wasm_workaround.zig").finalize(allocator, with_axis);
+    }
     if (cfg.platform != .ios) return with_axis;
     // iOS (#774): the SelfInfo override's owner is decided on the FINAL
     // rendered text — `ios_selfinfo.finalize` resolves the slot the hook

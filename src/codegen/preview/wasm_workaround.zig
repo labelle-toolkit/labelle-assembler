@@ -1,6 +1,10 @@
 //! Zig 0.16.0 wasm32-emscripten panic/debug-io workaround snippets
 //! (labelle-assembler#141). Extracted from `preview.zig` (behavior-preserving).
 
+const std = @import("std");
+
+pub const SLOT = "// @labelle-assembler:wasm-workaround-slot@\n";
+
 /// Workaround for Zig 0.16.0 wasm32-emscripten compile failure
 /// (labelle-assembler#141). The default panic handler in 0.16.0
 /// transitively imports `std.Io.Threaded`, whose posix wrappers fail
@@ -33,13 +37,14 @@ pub const WASM_DEBUG_IO_WORKAROUND =
     \\
 ;
 
-/// `std_options.logFn` component, emitted only when the backend template does
-/// not declare its own `std_options`. The sink bypasses the disabled debug IO,
-/// preserves scopes, streams messages of any length, and escapes embedded NUL
-/// bytes so text after them is not discarded (#834).
-pub const WASM_LOG_WORKAROUND =
+const WASM_DEFAULT_OPTIONS =
     \\
     \\pub const std_options: std.Options = .{ .logFn = wasmLog };
+    \\
+;
+
+/// Streams log output through Emscripten even with failing debug I/O.
+const WASM_LOG_IMPLEMENTATION =
     \\
     \\extern "c" fn printf(fmt: [*:0]const u8, ...) c_int;
     \\
@@ -95,10 +100,64 @@ pub const WASM_NO_PANIC_WORKAROUND =
 ;
 
 /// Full shim for a template that owns neither `panic` nor `std_options`.
-pub const WASM_PANIC_WORKAROUND = WASM_DEBUG_IO_WORKAROUND ++ WASM_LOG_WORKAROUND ++ WASM_NO_PANIC_WORKAROUND;
+pub const WASM_PANIC_WORKAROUND = WASM_DEBUG_IO_WORKAROUND ++ WASM_DEFAULT_OPTIONS ++ WASM_LOG_IMPLEMENTATION ++ WASM_NO_PANIC_WORKAROUND;
 
-/// Shim for a template that owns `std_options` but not `panic`.
-pub const WASM_DEBUG_IO_AND_PANIC_WORKAROUND = WASM_DEBUG_IO_WORKAROUND ++ WASM_NO_PANIC_WORKAROUND;
+const WASM_CONFIGURED_OPTIONS =
+    \\
+    \\fn labelleWasmLogOptions(configured: std.Options) std.Options {
+    \\    var options = configured;
+    \\    if (options.logFn == std.log.defaultLog) options.logFn = wasmLog;
+    \\    return options;
+    \\}
+    \\
+;
 
-/// Shim for a template that owns `panic` but not `std_options`.
-pub const WASM_DEBUG_IO_AND_LOG_WORKAROUND = WASM_DEBUG_IO_WORKAROUND ++ WASM_LOG_WORKAROUND;
+/// Detect declarations in the rendered root, including declarations from the
+/// engine template. Wrap only the initializer to preserve backend options and
+/// references to the original declaration.
+pub fn finalize(a: std.mem.Allocator, source: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, source, SLOT) == null) return a.dupe(u8, source);
+    const z = try a.dupeZ(u8, source);
+    defer a.free(z);
+    var ast = try std.zig.Ast.parse(a, z, .zig);
+    defer ast.deinit(a);
+    var has_panic = false;
+    var has_debug_io = false;
+    var configured: ?[]const u8 = null;
+    defer if (configured) |bytes| a.free(bytes);
+    for (ast.rootDecls()) |node| {
+        const decl = ast.fullVarDecl(node) orelse continue;
+        const name = ast.tokenSlice(decl.ast.mut_token + 1);
+        if (isName(name, "panic")) has_panic = true;
+        if (isName(name, "std_options_debug_io")) has_debug_io = true;
+        if (!isName(name, "std_options")) continue;
+        if (configured != null) return error.DuplicateWasmStdOptions;
+        const init = decl.ast.init_node.unwrap() orelse continue;
+        const begin = ast.tokenStart(ast.firstToken(init));
+        const last = ast.lastToken(init);
+        const end = ast.tokenStart(last) + ast.tokenSlice(last).len;
+        configured = try std.mem.concat(a, u8, &.{
+            source[0..begin],
+            "labelleWasmLogOptions(",
+            source[begin..end],
+            ")",
+            source[end..],
+        });
+    }
+    const input = configured orelse source;
+    const at = std.mem.indexOf(u8, input, SLOT).?;
+    return std.mem.concat(a, u8, &.{
+        input[0..at],
+        if (has_debug_io) "" else WASM_DEBUG_IO_WORKAROUND,
+        if (configured == null) WASM_DEFAULT_OPTIONS else WASM_CONFIGURED_OPTIONS,
+        WASM_LOG_IMPLEMENTATION,
+        if (has_panic) "" else WASM_NO_PANIC_WORKAROUND,
+        input[at + SLOT.len ..],
+    });
+}
+
+fn isName(token: []const u8, name: []const u8) bool {
+    return std.mem.eql(u8, token, name) or
+        (token.len == name.len + 3 and std.mem.startsWith(u8, token, "@\"") and
+            token[token.len - 1] == '"' and std.mem.eql(u8, token[2 .. token.len - 1], name));
+}

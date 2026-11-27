@@ -38,23 +38,8 @@ pub fn Mixin(comptime Self: type) type {
         pub fn writeHookImportsBlock(self: *Self, w: anytype, ident_buf: *[256]u8) !void {
             const cfg = self.cfg;
             const hook_names = self.hook_names;
-            // Zig 0.16 wasm32-emscripten std.Io.Threaded workaround
-            // (labelle-assembler#141). Always sever the debug-io Threaded path.
-            // Panic and std_options ownership are independent: supply only the
-            // components omitted by the backend template (#834 review).
             if (cfg.platform == .wasm) {
-                const preview = @import("../preview.zig");
-                if (self.wasm_template_provides_panic) {
-                    try w.writeAll(if (self.wasm_template_provides_std_options)
-                        preview.WASM_DEBUG_IO_WORKAROUND
-                    else
-                        preview.WASM_DEBUG_IO_AND_LOG_WORKAROUND);
-                } else {
-                    try w.writeAll(if (self.wasm_template_provides_std_options)
-                        preview.WASM_DEBUG_IO_AND_PANIC_WORKAROUND
-                    else
-                        preview.WASM_PANIC_WORKAROUND);
-                }
+                try w.writeAll(@import("../preview/wasm_workaround.zig").SLOT);
             }
             // Zig 0.16 iOS link fix (#774): a slot for the root
             // `debug.SelfInfo = void` override. Whether it becomes the

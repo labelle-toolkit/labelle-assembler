@@ -173,14 +173,6 @@ pub const Codegen = struct {
     // as `loop_style_override`. Null keeps the enum-predicate shape.
     lifecycle_override: ?manifest_v2.BackendManifestV2.PlatformEntry.Lifecycle = null,
 
-    // wasm-only: root declarations owned by the backend's `templates/wasm.txt`.
-    // The assembler always supplies the debug-io override, then independently
-    // supplies no_panic and/or the #834 printf log sink only when the template
-    // omits that declaration. Scanning the loaded template keeps this
-    // backend-agnostic and prevents duplicate root declarations (#141, #834).
-    wasm_template_provides_panic: bool = false,
-    wasm_template_provides_std_options: bool = false,
-
     // ── Mixin types ──────────────────────────────────────────────────
     const AssetWiringMixin = asset_wiring.Mixin(Self);
     const SceneManifestsMixin = scene_manifests_block.Mixin(Self);
