@@ -177,7 +177,8 @@ pub const Codegen = struct {
     // `pub const panic` (and typically `std_options`) — e.g. bgfx routes panics
     // to the browser console via `emscripten_console_log`. The assembler emits a
     // stopgap `WASM_PANIC_WORKAROUND` (`std_options_debug_io` + `panic =
-    // no_panic`) at the top of every wasm main to dodge the Zig 0.16
+    // no_panic`, plus the #834 `std_options.logFn` printf sink) at the top of
+    // every wasm main to dodge the Zig 0.16
     // std.Io.Threaded emscripten regression (labelle-assembler#141), but that
     // collides with a template that already declares `pub const panic` (a
     // duplicate root decl → compile error). When this is set the assembler skips

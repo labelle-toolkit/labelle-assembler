@@ -37,8 +37,9 @@
 ///   PR #31850 (Zig upstream)
 ///
 /// Emitted only when `cfg.platform == .wasm`; lands near the top of
-/// the generated `main.zig` so the two `pub const` decls are at
-/// module root (Zig looks up these override names there).
+/// the generated `main.zig` so the overrides are at module root (Zig
+/// looks up these names there). The log sink bypasses the disabled debug
+/// IO, preserving scopes and streaming messages of any length (#834).
 pub const WASM_PANIC_WORKAROUND =
     \\
     \\// Zig 0.16.0 wasm32-emscripten: override the default panic handler to
@@ -47,7 +48,41 @@ pub const WASM_PANIC_WORKAROUND =
     \\// once labelle-toolkit moves off 0.16.
     \\// https://ziggit.dev/t/0-16-0-wasm32-emscripten-fails-to-build-because-of-default-panic-handler-recommended-workaround/15052
     \\pub const std_options_debug_io = std.Io.failing;
+    \\pub const std_options: std.Options = .{ .logFn = wasmLog };
     \\pub const panic = std.debug.no_panic;
+    \\
+    \\extern "c" fn printf(fmt: [*:0]const u8, ...) c_int;
+    \\
+    \\fn wasmLogBytes(bytes: []const u8) void {
+    \\    if (bytes.len == 0) return;
+    \\    _ = printf("%.*s", @as(c_int, @intCast(bytes.len)), bytes.ptr);
+    \\}
+    \\
+    \\fn wasmLogDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    \\    wasmLogBytes(w.buffered());
+    \\    w.end = 0;
+    \\    var written: usize = 0;
+    \\    for (data[0 .. data.len - 1]) |bytes| {
+    \\        wasmLogBytes(bytes);
+    \\        written += bytes.len;
+    \\    }
+    \\    const pattern = data[data.len - 1];
+    \\    for (0..splat) |_| wasmLogBytes(pattern);
+    \\    return written + pattern.len * splat;
+    \\}
+    \\
+    \\// std.log's default sink uses the disabled debug IO above. Route it through
+    \\// Emscripten's console-backed printf instead (labelle-assembler#834).
+    \\fn wasmLog(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime fmt: []const u8, args: anytype) void {
+    \\    var buf: [1024]u8 = undefined;
+    \\    var writer: std.Io.Writer = .{ .vtable = &.{ .drain = wasmLogDrain }, .buffer = &buf };
+    \\    writer.writeAll(level.asText()) catch return;
+    \\    if (scope != .default) writer.print("({t})", .{scope}) catch return;
+    \\    writer.writeAll(": ") catch return;
+    \\    writer.print(fmt, args) catch return;
+    \\    writer.writeByte('\n') catch return;
+    \\    writer.flush() catch return;
+    \\}
     \\
 ;
 

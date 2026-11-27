@@ -1823,3 +1823,37 @@ pub const CURSOR_BINDING = struct {
         try verify(source);
     }
 };
+
+pub const WASM_STD_LOG = struct {
+    test "wasm routes std.log through printf instead of failing debug IO" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
+        const source = try SYSTEM_LOCALE.generateMain(.wasm, sokol_alloc_lifecycle);
+        defer std.testing.allocator.free(source);
+
+        try std.testing.expect(std.mem.indexOf(u8, source, "pub const std_options_debug_io = std.Io.failing;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "pub const std_options: std.Options = .{ .logFn = wasmLog };") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "extern \"c\" fn printf") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "fn wasmLog(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "if (scope != .default)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, ".drain = wasmLogDrain") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "writer.flush()") != null);
+    }
+
+    test "a backend-owned wasm panic and logging configuration stays untouched" {
+        const source = try EDITOR_PREVIEW.genBgfxWasm(false);
+        defer std.testing.allocator.free(source);
+
+        try std.testing.expect(std.mem.indexOf(u8, source, "pub const std_options_debug_io = std.Io.failing;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "pub const std_options:") == null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "fn wasmLog(") == null);
+    }
+
+    test "desktop keeps the default std.log configuration" {
+        const source = try SYSTEM_LOCALE.generateMain(.desktop, raylib_lifecycle);
+        defer std.testing.allocator.free(source);
+
+        try std.testing.expect(std.mem.indexOf(u8, source, "pub const std_options:") == null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "fn wasmLog(") == null);
+    }
+};

@@ -30,8 +30,8 @@ pub fn Mixin(comptime Self: type) type {
         ///
         /// The wasm32-emscripten panic-handler override
         /// (labelle-assembler#141) is emitted at the top of this block so
-        /// the two `pub const` root declarations land near
-        /// `const std = @import("std")` in the generated `main.zig`. They
+        /// its root declarations land near `const std = @import("std")`
+        /// in the generated `main.zig`. They
         /// MUST appear at module root for Zig to honor them, and this
         /// block is rendered right after the stdlib imports in
         /// `labelle-engine/codegen/main.zig.template`.
