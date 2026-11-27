@@ -30,28 +30,16 @@ pub fn Mixin(comptime Self: type) type {
         ///
         /// The wasm32-emscripten panic-handler override
         /// (labelle-assembler#141) is emitted at the top of this block so
-        /// the two `pub const` root declarations land near
-        /// `const std = @import("std")` in the generated `main.zig`. They
+        /// its root declarations land near `const std = @import("std")`
+        /// in the generated `main.zig`. They
         /// MUST appear at module root for Zig to honor them, and this
         /// block is rendered right after the stdlib imports in
         /// `labelle-engine/codegen/main.zig.template`.
         pub fn writeHookImportsBlock(self: *Self, w: anytype, ident_buf: *[256]u8) !void {
             const cfg = self.cfg;
             const hook_names = self.hook_names;
-            // Zig 0.16 wasm32-emscripten std.Io.Threaded workaround
-            // (labelle-assembler#141). The full shim declares BOTH
-            // `std_options_debug_io` (severs the Threaded path) AND `panic`
-            // (no_panic). When the backend's wasm template already ships its own
-            // `pub const panic` (e.g. bgfx's browser-console handler), emit only
-            // the `std_options_debug_io` half — the `panic` half would duplicate a
-            // root decl, but the debug-io override is still required and is
-            // independent of `panic`. See `Codegen.wasm_template_provides_panic`.
             if (cfg.platform == .wasm) {
-                const preview = @import("../preview.zig");
-                try w.writeAll(if (self.wasm_template_provides_panic)
-                    preview.WASM_DEBUG_IO_WORKAROUND
-                else
-                    preview.WASM_PANIC_WORKAROUND);
+                try w.writeAll(@import("../preview/wasm_workaround.zig").SLOT);
             }
             // Zig 0.16 iOS link fix (#774): a slot for the root
             // `debug.SelfInfo = void` override. Whether it becomes the

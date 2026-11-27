@@ -316,13 +316,6 @@ pub fn generateMainZigWithAnimations(
         // site (tests, preview, script-less projects), so those emit
         // byte-identical output.
         .scripting = scripting_splice,
-        // wasm-only: does the backend's lifecycle (wasm) template ship its own
-        // `pub const panic`? If so, the assembler must NOT also emit its
-        // stopgap panic shim (they would duplicate the root decl). Scanned from
-        // the template text, so it's backend-agnostic (bgfx ships one, raylib
-        // does not). Only consulted on wasm.
-        .wasm_template_provides_panic = cfg.platform == .wasm and
-            std.mem.indexOf(u8, lifecycle_tmpl, "pub const panic") != null,
         // ios-only (#774): skip the assembler's SelfInfo override when a
         // template already declares a root `debug`.
     };
@@ -594,6 +587,10 @@ pub fn generateMainZigWithAnimations(
     // hard error so no existing game silently flips.
     const y_axis = try cfg.requireYAxis();
     const with_axis = try injectYAxis(allocator, rendered, y_axis);
+    if (cfg.platform == .wasm) {
+        defer allocator.free(with_axis);
+        return @import("preview/wasm_workaround.zig").finalize(allocator, with_axis);
+    }
     if (cfg.platform != .ios) return with_axis;
     // iOS (#774): the SelfInfo override's owner is decided on the FINAL
     // rendered text — `ios_selfinfo.finalize` resolves the slot the hook
