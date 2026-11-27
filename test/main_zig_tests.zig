@@ -1856,6 +1856,26 @@ pub const WASM_STD_LOG = struct {
         try std.testing.expect(std.mem.indexOf(u8, source, "pub const panic = std.debug.no_panic;") != null);
     }
 
+    test "backend std_options permits whitespace before declaration separators" {
+        const lifecycles = [_][]const u8{
+            sokol_alloc_lifecycle ++ "\npub const std_options : std.Options = .{};\n",
+            sokol_alloc_lifecycle ++ "\npub const std_options\t= std.Options{};\n",
+        };
+        const declarations = [_][]const u8{
+            "pub const std_options : std.Options = .{};",
+            "pub const std_options\t= std.Options{};",
+        };
+        for (lifecycles, declarations) |lifecycle, declaration| {
+            const source = try generateSokol(lifecycle);
+            defer std.testing.allocator.free(source);
+
+            try std.testing.expect(std.mem.indexOf(u8, source, declaration) != null);
+            try std.testing.expect(std.mem.indexOf(u8, source, ".logFn = wasmLog") == null);
+            try std.testing.expect(std.mem.indexOf(u8, source, "fn wasmLog(") == null);
+            try std.testing.expect(std.mem.indexOf(u8, source, "pub const panic = std.debug.no_panic;") != null);
+        }
+    }
+
     test "backend panic without std_options receives only the logger component" {
         const source = try EDITOR_PREVIEW.genBgfxWasm(false);
         defer std.testing.allocator.free(source);

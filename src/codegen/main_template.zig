@@ -173,6 +173,22 @@ fn block(
 
 // ── Template-based generation (engine provides main.zig.template) ────────
 
+/// True when the backend template declares `std_options`. Whitespace between
+/// the declaration name and `:` or `=` is insignificant to Zig, so accept it
+/// here too; checking the separator also avoids matching names with an
+/// `std_options` prefix, such as `std_options_debug_io`.
+fn templateProvidesStdOptions(lifecycle_tmpl: []const u8) bool {
+    const declaration = "pub const std_options";
+    var rest = lifecycle_tmpl;
+    while (std.mem.indexOf(u8, rest, declaration)) |at| {
+        var separator = at + declaration.len;
+        while (separator < rest.len and std.ascii.isWhitespace(rest[separator])) : (separator += 1) {}
+        if (separator < rest.len and (rest[separator] == ':' or rest[separator] == '=')) return true;
+        rest = rest[at + declaration.len ..];
+    }
+    return false;
+}
+
 /// Generate main.zig using the engine's codegen template.
 /// The template uses {{variable}} interpolation and {{#if}}/{{#each}} blocks.
 /// All complex sections are pre-computed into scalar blocks by this function.
@@ -322,8 +338,7 @@ pub fn generateMainZigWithAnimations(
         .wasm_template_provides_panic = cfg.platform == .wasm and
             std.mem.indexOf(u8, lifecycle_tmpl, "pub const panic") != null,
         .wasm_template_provides_std_options = cfg.platform == .wasm and
-            (std.mem.indexOf(u8, lifecycle_tmpl, "pub const std_options:") != null or
-                std.mem.indexOf(u8, lifecycle_tmpl, "pub const std_options =") != null),
+            templateProvidesStdOptions(lifecycle_tmpl),
         // ios-only (#774): skip the assembler's SelfInfo override when a
         // template already declares a root `debug`.
     };
